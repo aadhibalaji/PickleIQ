@@ -9,12 +9,15 @@ left->right = 3,4 (singles: 1 near, 2 far).
 from __future__ import annotations
 
 import logging
+import shutil
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 
 from . import court
-from ..config import POSE_MODEL
+from .exclusions import in_excluded
+from ..config import DATA_DIR, POSE_MODEL
 from .device import ultralytics_device
 
 log = logging.getLogger("cv.players")
@@ -31,6 +34,44 @@ def _build_model(name: str):
     from ultralytics import YOLO
 
     return YOLO(name)
+
+
+# imgsz -> exported OpenVINO model dir (or None if OV/GPU is unavailable). The
+# export is size-specific (static input shape) and cached to disk, so it runs at
+# most once per size ever, and the in-process dict avoids re-checking each window.
+_OV_CACHE: dict[int, str | None] = {}
+
+
+def _openvino_pose_dir(imgsz: int) -> str | None:
+    """Export yolo11n-pose to OpenVINO FP16 at `imgsz` (once, cached under
+    data/models/pose) and return the model dir — this is what lets pose run on the
+    Intel Arc GPU, which ultralytics' torch path can't drive (device='xpu' throws
+    inside .track(), so it silently falls back to CPU at ~6x the latency). Returns
+    None when OpenVINO isn't installed or the export fails, so the caller keeps the
+    torch model."""
+    if imgsz in _OV_CACHE:
+        return _OV_CACHE[imgsz]
+    result: str | None = None
+    try:
+        import openvino  # noqa: F401  (presence check)
+        from ultralytics import YOLO
+
+        # Leaf dir MUST keep the '_openvino_model' suffix — that's how ultralytics
+        # recognises the format; the image size is encoded in the parent instead.
+        dst = DATA_DIR / "models" / "pose" / str(imgsz) / f"{Path(POSE_MODEL).stem}_openvino_model"
+        if not (dst / "metadata.yaml").exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            src = Path(YOLO(POSE_MODEL).export(format="openvino", imgsz=imgsz, half=True))
+            if src.resolve() != dst.resolve():
+                if dst.exists():
+                    shutil.rmtree(dst)
+                shutil.move(str(src), str(dst))
+        result = str(dst)
+        log.info("pose: using OpenVINO model %s on the Intel Arc GPU", dst.name)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("OpenVINO pose unavailable (%s) — falling back to torch/CPU", exc)
+    _OV_CACHE[imgsz] = result
+    return result
 
 
 @dataclass
@@ -61,7 +102,6 @@ class PoseTracker:
                  conf: float = 0.25, imgsz: int = 640,
                  model_name: str | None = None):
         self.H = H
-        self._device = ultralytics_device()
         self._device_ok = True
         self.numbers: dict[int, int] = {}  # track_id -> official number
         self._track_sequence = track_sequence
@@ -69,8 +109,18 @@ class PoseTracker:
         self._imgsz = int(imgsz)
         self._started = False
         self._syn = -1  # synthetic ids for detections ByteTrack hasn't confirmed
-        # Own model instance -> own ByteTrack state (see _build_model).
-        self._model = _build_model(model_name or POSE_MODEL)
+        # Prefer the OpenVINO GPU model (~6x faster on the Arc iGPU); fall back to
+        # the torch weights if OpenVINO/GPU isn't available. Either way this is a
+        # FRESH per-tracker instance -> own ByteTrack state (see _build_model).
+        # ByteTrack itself runs in python, so .track() works on both backends.
+        ov_dir = _openvino_pose_dir(self._imgsz) if model_name is None else None
+        if ov_dir:
+            from ultralytics import YOLO
+            self._model = YOLO(ov_dir)
+            self._device = "intel:gpu"
+        else:
+            self._model = _build_model(model_name or POSE_MODEL)
+            self._device = ultralytics_device()
 
     def update(self, frame: np.ndarray) -> list[PlayerObs]:
         model = self._model
@@ -107,8 +157,15 @@ class PoseTracker:
             ids = np.array([self._syn - i for i in range(len(boxes))], dtype=int)
             self._syn -= len(boxes)
         kpts = r.keypoints.xy.cpu().numpy() if r.keypoints is not None else None
+        h_px, w_px = frame.shape[:2]
         for i, tid in enumerate(ids):
             x1, y1, x2, y2 = boxes[i].tolist()
+            # Drop detections in the fixed camera's exclusion zones (neighbouring
+            # courts / spectators / fence-line people in the background corners).
+            # Box centre is the test point — stable, and always well clear of the
+            # zones for real on-court players (see cv/exclusions.py).
+            if in_excluded((x1 + x2) / 2, (y1 + y2) / 2, w_px, h_px):
+                continue
             # Ground contact: mean of ankle keypoints when confident, else
             # bottom-centre of the box.
             foot = ((x1 + x2) / 2, y2)
@@ -131,6 +188,19 @@ class PoseTracker:
                 number=self.numbers.get(int(tid)),
             ))
         return out
+
+    def new_sequence(self) -> None:
+        """Start a fresh tracking sequence for the next Pass 2 window WITHOUT
+        rebuilding the model. The next update() re-inits ByteTrack via
+        persist=False (see update), exactly as a brand-new instance would, so
+        IDs/numbers don't leak between windows — but the OpenVINO-compiled model
+        is kept, avoiding a ~5 s GPU recompile per window. The isolation that the
+        per-instance-model rule protects is still intact: each run owns its own
+        PoseTracker; nothing is shared across passes/jobs (that sharing was the
+        old mid-clip wedging bug), only across one run's sequential windows."""
+        self._started = False
+        self._syn = -1
+        self.numbers = {}
 
     def assign_numbers_at_serve(self, obs: list[PlayerObs]) -> None:
         """Call once per rally at the serve frame. Overwrites the mapping so

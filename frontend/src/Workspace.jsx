@@ -19,6 +19,8 @@ export default function Workspace({ videoId, onBack }) {
   const [courtLines, setCourtLines] = useState(null)
   const [clickMode, setClickMode] = useState(null) // {type:'calib', name, onPick}
   const [flash, setFlash] = useState('')
+  const [overlayNonce, setOverlayNonce] = useState(0) // bumps overlay refetch while processing
+  const wasActiveRef = useRef(false)
   const playerRef = useRef(null)
 
   const loadRallies = useCallback(() => {
@@ -48,7 +50,10 @@ export default function Workspace({ videoId, onBack }) {
       api.getVideo(videoId).then((v) => {
         setVideo(v)
         const active = v.jobs?.some((j) => j.status === 'queued' || j.status === 'running')
-        if (active) loadRallies()
+        // While a pass is running (and for one tick after it finishes) refetch
+        // rallies + overlays: Pass 2 writes overlays per window as it goes.
+        if (active || wasActiveRef.current) { loadRallies(); setOverlayNonce((n) => n + 1) }
+        wasActiveRef.current = active
       }).catch(() => {})
     }, 3000)
     return () => clearInterval(t)
@@ -137,6 +142,7 @@ export default function Workspace({ videoId, onBack }) {
         clickMode={clickMode}
         onCanvasClick={onCanvasClick}
         onFrame={setFrame}
+        overlayNonce={overlayNonce}
       />
       <div style={{ marginTop: 8 }}>
         <Timeline frameCount={video.frame_count || 1} frame={frame} tracks={tracks} onSeek={seek} />

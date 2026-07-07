@@ -23,6 +23,7 @@ import math
 import numpy as np
 
 from .. import db
+from ..config import PASS2_BALL_ENABLED
 from ..jobs import JobHandle
 from . import overlays
 from . import court
@@ -110,7 +111,11 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
         we = min(last_frame, e + min(pad, max(0, right_gap // 2)))
         windows.append((ws, we, s, e))
 
-    tracknet = TrackNetBall()
+    # Ball detection/tracking is a switchable stage. OFF right now (PASS2_BALL=0)
+    # so Pass 2 is player-detection only — faster, and safe because the ball
+    # outputs are display-only and drive no rally boundaries. All the ball setup
+    # and per-frame/per-window ball work below is gated on this flag.
+    detect_ball = PASS2_BALL_ENABLED
 
     overlays.clear(video_id, source)
     # Pass 2 no longer emits its own rally boundaries — clear any stale ones so
@@ -118,50 +123,58 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
     with db.connect() as con:
         con.execute("DELETE FROM rally_labels WHERE video_id=? AND source=?", (video_id, source))
 
-    # User spot-corrections override the tracker at those frames (clip-local).
-    with db.connect() as con:
-        corr_rows = con.execute(
-            "SELECT frame, x, y FROM ball_corrections WHERE video_id=?", (video_id,)
-        ).fetchall()
-        trk = con.execute("SELECT payload FROM ball_tracks WHERE video_id=?",
-                          (video_id,)).fetchone()
-    corrections = {r["frame"]: (r["x"], r["y"]) for r in corr_rows}
-    # Dense per-frame ball track from an EXTERNAL tracker (MTI / temporal
-    # integration, uploaded via POST /videos/{id}/ball_track). Preferred over
-    # the classical detector; manual corrections still win over it. Values are
-    # [x, y, diameter|null, confidence] in full-res pixels.
-    ext_track = {int(k): v for k, v in db.loads(trk["payload"], {}).items()} if trk else {}
-    if ext_track:
-        log.info("pass2 %s: using external ball track (%d frames)", video_id, len(ext_track))
+    tracknet = TrackNetBall() if detect_ball else None
+    corrections: dict[int, tuple[float, float]] = {}
+    ext_track: dict[int, list] = {}
+    if detect_ball:
+        # User spot-corrections override the tracker at those frames (clip-local).
+        with db.connect() as con:
+            corr_rows = con.execute(
+                "SELECT frame, x, y FROM ball_corrections WHERE video_id=?", (video_id,)
+            ).fetchall()
+            trk = con.execute("SELECT payload FROM ball_tracks WHERE video_id=?",
+                              (video_id,)).fetchone()
+        corrections = {r["frame"]: (r["x"], r["y"]) for r in corr_rows}
+        # Dense per-frame ball track from an EXTERNAL tracker (MTI / temporal
+        # integration, uploaded via POST /videos/{id}/ball_track). Preferred over
+        # the classical detector; manual corrections still win over it. Values are
+        # [x, y, diameter|null, confidence] in full-res pixels.
+        ext_track = {int(k): v for k, v in db.loads(trk["payload"], {}).items()} if trk else {}
+        if ext_track:
+            log.info("pass2 %s: using external ball track (%d frames)", video_id, len(ext_track))
 
     total_frames = sum(we - ws + 1 for ws, we, _, _ in windows) or 1
     done_frames = 0
 
+    # One PoseTracker for the whole run: track_sequence=True (consecutive frames),
+    # higher imgsz for far-side players, OpenVINO on the Arc GPU. new_sequence()
+    # resets ByteTrack per window WITHOUT recompiling the model (~5 s each on GPU);
+    # a fresh instance per window would isolate the same way but pay that recompile.
+    pose = PoseTracker(H, track_sequence=True,
+                       conf=float(params.get("pose_conf", 0.25)),
+                       imgsz=int(params.get("pose_imgsz", 1920)))
     for wi, (ws, we, _raw_ws, _raw_we) in enumerate(windows):
-        # Fresh PoseTracker per window: track_sequence=True (consecutive frames)
-        # with a first-frame tracker reset, higher imgsz for far-side players.
-        pose = PoseTracker(H, track_sequence=True,
-                           conf=float(params.get("pose_conf", 0.25)),
-                           imgsz=int(params.get("pose_imgsz", 1280)))
-        fallback = MotionBallDetector(
-            min_area=2.0, max_area=600.0,
-            sat_min=float(params.get("ball_sat_min", 0.0)),
-            val_min=float(params.get("ball_val_min", 0.0)),
-            hue_lo=float(params.get("ball_hue_lo", 0.0)),
-            hue_hi=float(params.get("ball_hue_hi", 180.0)))
-        # Motion-primary ball selection (see ball_track.py): the raw detector is
-        # left PERMISSIVE (no player-box exclusion) so a ball passing over/leaving
-        # a player still reaches the selector, which then keeps it only if it fits
-        # a plausible ball trajectory and rejects slow foot/shoe blobs.
-        selector = TrajectoryBallSelector(
-            fps,
-            gate_px=float(params.get("ball_gate_px", 45.0)),
-            accel_px=float(params.get("ball_accel_px", 6.0)),
-            foot_px=float(params.get("ball_foot_suppress_px", 35.0)),
-            hit_speed_px=float(params.get("ball_hit_speed_px", 18.0)),
-            acq_px=float(params.get("ball_acq_px", 90.0)),
-            seed_min_px=float(params.get("ball_seed_min_px", 4.0)),
-        )
+        pose.new_sequence()
+        if detect_ball:
+            fallback = MotionBallDetector(
+                min_area=2.0, max_area=600.0,
+                sat_min=float(params.get("ball_sat_min", 0.0)),
+                val_min=float(params.get("ball_val_min", 0.0)),
+                hue_lo=float(params.get("ball_hue_lo", 0.0)),
+                hue_hi=float(params.get("ball_hue_hi", 180.0)))
+            # Motion-primary ball selection (see ball_track.py): the raw detector is
+            # left PERMISSIVE (no player-box exclusion) so a ball passing over/leaving
+            # a player still reaches the selector, which then keeps it only if it fits
+            # a plausible ball trajectory and rejects slow foot/shoe blobs.
+            selector = TrajectoryBallSelector(
+                fps,
+                gate_px=float(params.get("ball_gate_px", 45.0)),
+                accel_px=float(params.get("ball_accel_px", 6.0)),
+                foot_px=float(params.get("ball_foot_suppress_px", 35.0)),
+                hit_speed_px=float(params.get("ball_hit_speed_px", 18.0)),
+                acq_px=float(params.get("ball_acq_px", 90.0)),
+                seed_min_px=float(params.get("ball_seed_min_px", 4.0)),
+            )
         # Serve-start gate: proper serve-receive (server + diagonal receiver both
         # behind their baselines) when require_serve_receive is on, else the
         # looser 'one up, rest back' check. NOTE this is stricter and depends on
@@ -197,38 +210,41 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
 
             # ---- ball observation ----------------------------------------
             # Priority: manual correction > external track > TrackNet > classical.
+            # Disabled while focusing on player detection (PASS2_BALL=0): Pass 2's
+            # ball outputs are display-only and feed no rally boundaries.
             det = None
-            if f in corrections:
-                x, y = corrections[f]
-                det = (x, y, None, 1.0)
-            elif f in ext_track:
-                ex = ext_track[f]
-                det = (ex[0], ex[1], ex[2], ex[3] if ex[3] is not None else 0.9)
-            elif tracknet.available:
-                frame_buf.append(frame)
-                if len(frame_buf) > 3:
-                    frame_buf.pop(0)
-                if len(frame_buf) == 3:
-                    r = tracknet.infer_triplet(frame_buf)
-                    if r:
-                        det = r
-            else:
-                # Permissive detector (no box exclusion) + trajectory selector.
-                cands = [cd for cd in fallback.update(frame)
-                         if _in_court_region(H, cd.x, cd.y)]
-                boxes = [o.box for o in obs]
-                feet = _foot_points(obs)
-                c = selector.select(f, cands, boxes, feet)
-                if c:
-                    det = (c.x, c.y, c.diameter_px, c.score)
-            if det:
-                ball_obs.append((f, det[0], det[1], det[2]))
-                # The classical path updates the selector inside select(); for
-                # any other source seed the trajectory history so continuity
-                # holds if ball sources mix mid-window.
-                classical = not (f in corrections or f in ext_track or tracknet.available)
-                if not classical:
-                    selector.seed(f, det[0], det[1])
+            if detect_ball:
+                if f in corrections:
+                    x, y = corrections[f]
+                    det = (x, y, None, 1.0)
+                elif f in ext_track:
+                    ex = ext_track[f]
+                    det = (ex[0], ex[1], ex[2], ex[3] if ex[3] is not None else 0.9)
+                elif tracknet.available:
+                    frame_buf.append(frame)
+                    if len(frame_buf) > 3:
+                        frame_buf.pop(0)
+                    if len(frame_buf) == 3:
+                        r = tracknet.infer_triplet(frame_buf)
+                        if r:
+                            det = r
+                else:
+                    # Permissive detector (no box exclusion) + trajectory selector.
+                    cands = [cd for cd in fallback.update(frame)
+                             if _in_court_region(H, cd.x, cd.y)]
+                    boxes = [o.box for o in obs]
+                    feet = _foot_points(obs)
+                    c = selector.select(f, cands, boxes, feet)
+                    if c:
+                        det = (c.x, c.y, c.diameter_px, c.score)
+                if det:
+                    ball_obs.append((f, det[0], det[1], det[2]))
+                    # The classical path updates the selector inside select(); for
+                    # any other source seed the trajectory history so continuity
+                    # holds if ball sources mix mid-window.
+                    classical = not (f in corrections or f in ext_track or tracknet.available)
+                    if not classical:
+                        selector.seed(f, det[0], det[1])
 
             entries[f] = {
                 "f": f,
@@ -259,25 +275,27 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
         # per-frame detection overlay: smooth the ball track, reconstruct its
         # court position + height, and mark bounce/hit events for display. The
         # rally-decision code (rally_logic.detect_rallies, learned start/end
-        # offsets, serve-vs-pass rejection) is deliberately not called.
-        track = smooth_track(ball_obs, max_gap=int(fps * 0.4),
-                             gate2=float(params.get("ball_kalman_gate2", 13.8)))
-        world = reconstruct_world(track, cam)
-        for w in world:  # feature trace: attach reconstruction to entries
-            e = entries.get(w.frame)
-            if e is not None:
-                e["world"] = [round(w.court_x, 2), round(w.court_y, 2),
-                              None if math.isnan(w.height) else round(w.height, 3)]
-                e["obs"] = w.observed
-        # Bounce/hit markers are kept purely as visual annotations (model=None:
-        # the trained rally_end model no longer drives anything in this pass).
-        events = detect_events(world, players_by_frame, params, fps,
-                               model=None, entries=entries)
-        for ev in events:
-            e = entries.get(ev.frame)
-            if e is not None:
-                e["evt"] = {"kind": ev.kind, "in": ev.in_court, "side": ev.side,
-                            "cx": round(ev.court_x, 2), "cy": round(ev.court_y, 2)}
+        # offsets, serve-vs-pass rejection) is deliberately not called. Skipped
+        # entirely when ball detection is off (PASS2_BALL=0).
+        if detect_ball:
+            track = smooth_track(ball_obs, max_gap=int(fps * 0.4),
+                                 gate2=float(params.get("ball_kalman_gate2", 13.8)))
+            world = reconstruct_world(track, cam)
+            for w in world:  # feature trace: attach reconstruction to entries
+                e = entries.get(w.frame)
+                if e is not None:
+                    e["world"] = [round(w.court_x, 2), round(w.court_y, 2),
+                                  None if math.isnan(w.height) else round(w.height, 3)]
+                    e["obs"] = w.observed
+            # Bounce/hit markers are kept purely as visual annotations (model=None:
+            # the trained rally_end model no longer drives anything in this pass).
+            events = detect_events(world, players_by_frame, params, fps,
+                                   model=None, entries=entries)
+            for ev in events:
+                e = entries.get(ev.frame)
+                if e is not None:
+                    e["evt"] = {"kind": ev.kind, "in": ev.in_court, "side": ev.side,
+                                "cx": round(ev.court_x, 2), "cy": round(ev.court_y, 2)}
         overlays.write_entries(video_id, source, list(entries.values()))
 
     handle.update(progress=1.0,

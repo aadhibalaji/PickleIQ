@@ -31,10 +31,15 @@ DEFAULTS: dict[str, Any] = {
                                    # instead of the hysteresis flip (~cross_window+off later)
     # ---- Pose detection (players) -----------------------------------------
     "pose_conf": 0.25,             # YOLO-pose confidence floor (lower = catch far players)
-    "pose_imgsz": 1280,            # Pass 2 pose inference size. MEASURED on clip #1:
-                                   # 960 finds 0 far players (and dropped ALL players at
-                                   # frame 3000); 1280 recovers them. yolo11s/m give no
-                                   # extra far recall at 2-4x the cost, so nano@1280 wins.
+    "pose_imgsz": 1920,            # Pass 2 pose inference size. Runs on the Arc GPU via
+                                   # OpenVINO (see players._openvino_pose_dir), which makes
+                                   # a big input cheap. MEASURED on "First 3 mins" (GPU):
+                                   # far-player recall 1280->35%, 1536->87%, 1920->100% at
+                                   # 43/55/74 ms/frame (vs 193 ms for the OLD torch-on-CPU
+                                   # path at 1280/35%). The 2nd far player in doubles is
+                                   # OCCLUDED in this axial view (rear hides behind front) —
+                                   # nano@2560 and yolo11s@1920 both still find 0, so it's a
+                                   # camera-geometry limit, not resolution; 1920 is the knee.
     "p1_pose_imgsz": 1280,         # Pass 1 pose size (sparse spot checks; can be large)
     # ---- Pass 2 ball trajectory selection ---------------------------------
     "ball_gate_px": 45.0,          # residual radius around the velocity prediction

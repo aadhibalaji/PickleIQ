@@ -67,7 +67,9 @@ def get_video(video_id: str):
     for j in db.rows_to_dicts(jobs):
         j["queue_ahead"] = positions.get(j["id"]) if j["status"] == "queued" else None
         out_jobs.append(j)
-    return {**dict(row), "jobs": out_jobs}
+    # Normalized player-detection exclusion polygons so the overlay can draw them.
+    from ..cv.exclusions import zones_as_lists
+    return {**dict(row), "jobs": out_jobs, "exclusion_zones": zones_as_lists()}
 
 
 @router.post("/videos/{video_id}/reprocess")

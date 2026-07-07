@@ -19,15 +19,15 @@ lessons globally** so every future clip starts from an improved baseline.
 ```powershell
 # 1. Configure (one time)
 copy .env.example .env        # then paste your Anthropic API key into .env
+npm install                   # one time, at the repo root (installs concurrently)
 
-# 2. Backend (deps already installed into backend\.venv)
-cd backend
-.venv\Scripts\python -m uvicorn app.main:app --port 8420
-
-# 3. Frontend (second terminal)
-cd frontend
-npm run dev                   # http://localhost:5173
+# 2. Run everything (backend :8420 + frontend :5173) in one terminal
+npm run dev                   # open http://localhost:5173
 ```
+
+`npm run dev` launches the FastAPI backend (from `backend\.venv`) and the Vite
+frontend together. To run them separately: `npm run dev:backend` and
+`npm run dev:frontend`.
 
 Production-ish alternative: `npm run build` once, then the backend serves the
 built frontend itself at http://127.0.0.1:8420.

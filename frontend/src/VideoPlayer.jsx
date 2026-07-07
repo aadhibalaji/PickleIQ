@@ -14,7 +14,7 @@ const SKELETON = [
 // Renders the ORIGINAL video with all annotation drawn from stored metadata
 // onto a canvas overlay — the video file is never edited.
 const VideoPlayer = forwardRef(function VideoPlayer(
-  { videoId, meta, overlaySource, courtLines, clickMode, onCanvasClick, onFrame },
+  { videoId, meta, overlaySource, courtLines, clickMode, onCanvasClick, onFrame, overlayNonce },
   ref,
 ) {
   const videoRef = useRef(null)
@@ -27,6 +27,7 @@ const VideoPlayer = forwardRef(function VideoPlayer(
   const stateRef = useRef({ frame: 0, overlaySource, courtLines })
   stateRef.current.overlaySource = overlaySource
   stateRef.current.courtLines = courtLines
+  stateRef.current.exclusionZones = meta.exclusion_zones
 
   useImperativeHandle(ref, () => ({
     seekFrame: (f) => {
@@ -94,6 +95,29 @@ const VideoPlayer = forwardRef(function VideoPlayer(
       }
     }
     if (!src) return
+
+    // Player-detection exclusion zones (normalized polygons from the fixed
+    // camera): detections whose box centre lands here are dropped by the
+    // backend. Drawn semi-transparent red + outline so they're visible on the
+    // video AND in black-background mode.
+    const zones = stateRef.current.exclusionZones
+    if (zones) {
+      for (const poly of zones) {
+        if (!poly?.length) continue
+        g.beginPath()
+        poly.forEach(([nx, ny], i) => {
+          const x = nx * cv.width, y = ny * cv.height
+          if (i === 0) g.moveTo(x, y); else g.lineTo(x, y)
+        })
+        g.closePath()
+        g.fillStyle = 'rgba(229,45,45,0.22)'
+        g.fill()
+        g.strokeStyle = 'rgba(229,45,45,0.9)'
+        g.lineWidth = 3
+        g.stroke()
+      }
+    }
+
     const c = cacheRef.current[src]
     if (!c) return
 
@@ -216,6 +240,15 @@ const VideoPlayer = forwardRef(function VideoPlayer(
 
   // Invalidate the cache when the source's results are regenerated.
   useEffect(() => { cacheRef.current = {} }, [videoId])
+
+  // Pass 2 writes overlays one window at a time as it runs, so a chunk fetched
+  // before its window finished was cached EMPTY and would otherwise never
+  // refetch (symptom: players show for the first rally but not later ones while
+  // processing). When overlayNonce bumps (parent polls it while a job is active),
+  // drop the 'fetched' marks so chunks refetch; keep byFrame so nothing flickers.
+  useEffect(() => {
+    for (const src in cacheRef.current) cacheRef.current[src].fetched.clear()
+  }, [overlayNonce])
 
   // Fullscreen the WRAPPER (video + canvas together), not the raw <video> —
   // otherwise the browser's native fullscreen shows only the video and the
