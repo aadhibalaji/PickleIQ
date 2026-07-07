@@ -28,6 +28,7 @@ from ..jobs import JobHandle
 from . import overlays
 from . import court
 from .ball_coarse import MotionBallDetector
+from .ball_filter import BallFrameFilter, classify_arc_events, refine_track
 from .ball_track import TrajectoryBallSelector
 from .ball_tracknet import TrackNetBall
 from .bounce import detect_events, reconstruct_world
@@ -116,6 +117,11 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
     # outputs are display-only and drive no rally boundaries. All the ball setup
     # and per-frame/per-window ball work below is gated on this flag.
     detect_ball = PASS2_BALL_ENABLED
+    # Phase-1 semantic filtering layer (ball_filter.py) on top of whichever
+    # ball source runs: velocity gate + player-box motion logic per frame,
+    # then per-window arc RANSAC + hit/bounce classification. ON by default;
+    # ball_filter_enabled=0 falls back to the previous heuristic unchanged.
+    filter_on = detect_ball and params.get("ball_filter_enabled", 1.0) > 0.5
 
     overlays.clear(video_id, source)
     # Pass 2 no longer emits its own rally boundaries — clear any stale ones so
@@ -175,6 +181,14 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                 acq_px=float(params.get("ball_acq_px", 90.0)),
                 seed_min_px=float(params.get("ball_seed_min_px", 4.0)),
             )
+            frame_filter = BallFrameFilter(
+                H, fps,
+                max_speed_mph=float(params.get("ball_max_speed_mph", 65.0)),
+                headroom=float(params.get("ball_speed_headroom", 1.6)),
+                persist_frames=int(params.get("ball_box_persist_frames", 3)),
+                persist_match_px=float(params.get("ball_box_persist_px", 12.0)),
+                foot_zone_frac=float(params.get("ball_foot_zone_frac", 0.25)),
+            ) if filter_on else None
         # Serve-start gate: proper serve-receive (server + diagonal receiver both
         # behind their baselines) when require_serve_receive is on, else the
         # looser 'one up, rest back' check. NOTE this is stricter and depends on
@@ -186,6 +200,7 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
             serve_ok = is_serve_formation
         ball_obs: list[tuple[int, float, float, float | None]] = []
         players_by_frame: dict[int, list[tuple[float, float]]] = {}
+        boxes_by_frame: dict[int, list[tuple[float, float, float, float]]] = {}
         player_speed: dict[int, float] = {}     # frame -> mean player speed m/s
         serve_frames: list[int] = []
         prev_courts: dict[int, tuple[float, float]] = {}
@@ -196,12 +211,18 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
             obs = pose.update(frame)
             courts = [o.court_xy for o in obs if o.court_xy]
             players_by_frame[f] = courts
+            if detect_ball:
+                boxes_by_frame[f] = [o.box for o in obs]
+            # Key speed continuity on the stable identity slot (falls back to the
+            # ByteTrack id) so an id-switch doesn't register as a teleport.
+            def _key(o):
+                return o.slot if o.slot is not None else o.track_id
             speeds = []
             for o in obs:
-                if o.court_xy and o.track_id in prev_courts:
-                    px, py = prev_courts[o.track_id]
+                if o.court_xy and _key(o) in prev_courts:
+                    px, py = prev_courts[_key(o)]
                     speeds.append(math.hypot(o.court_xy[0] - px, o.court_xy[1] - py) * fps)
-            prev_courts = {o.track_id: o.court_xy for o in obs if o.court_xy}
+            prev_courts = {_key(o): o.court_xy for o in obs if o.court_xy}
             player_speed[f] = float(np.mean(speeds)) if speeds else 0.0
 
             if f % max(1, int(fps * 0.5)) == 0 and serve_ok(obs):
@@ -232,6 +253,11 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                     # Permissive detector (no box exclusion) + trajectory selector.
                     cands = [cd for cd in fallback.update(frame)
                              if _in_court_region(H, cd.x, cd.y)]
+                    if frame_filter is not None:
+                        # Stage 1-2 of the filtering layer: velocity gate +
+                        # player-box motion logic (foot zone / persistent blobs).
+                        cands = frame_filter.filter(
+                            f, cands, [(_key(o), o.box) for o in obs])
                     boxes = [o.box for o in obs]
                     feet = _foot_points(obs)
                     c = selector.select(f, cands, boxes, feet)
@@ -239,6 +265,10 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                         det = (c.x, c.y, c.diameter_px, c.score)
                 if det:
                     ball_obs.append((f, det[0], det[1], det[2]))
+                    if frame_filter is not None:
+                        # Whatever source produced the position, it is the
+                        # velocity-gate reference for the next frames.
+                        frame_filter.confirm(f, det[0], det[1])
                     # The classical path updates the selector inside select(); for
                     # any other source seed the trajectory history so continuity
                     # holds if ball sources mix mid-window.
@@ -249,7 +279,7 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
             entries[f] = {
                 "f": f,
                 "players": [
-                    {"id": o.track_id, "num": o.number,
+                    {"id": o.slot if o.slot is not None else o.track_id, "num": o.number,
                      "box": [round(v, 1) for v in o.box],
                      "cxy": [round(o.court_xy[0], 2), round(o.court_xy[1], 2)] if o.court_xy else None,
                      "team": o.team,
@@ -278,6 +308,48 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
         # offsets, serve-vs-pass rejection) is deliberately not called. Skipped
         # entirely when ball detection is off (PASS2_BALL=0).
         if detect_ball:
+            # Stage 3-4 of the filtering layer (batch, per window): per-shot arc
+            # RANSAC that drops off-arc outliers and fills missed frames along
+            # the fit, then hit/bounce classification from arc junctions +
+            # player boxes. Replaces the height-heuristic events when on.
+            arc_events = None
+            if filter_on and ball_obs:
+                refined = refine_track(
+                    ball_obs,
+                    split_deg=float(params.get("ball_arc_split_deg", 55.0)),
+                    min_speed_px=float(params.get("ball_arc_min_speed_px", 1.5)),
+                    gap_frames=int(params.get("ball_arc_gap_frames", 10)),
+                    tol_px=float(params.get("ball_arc_tol_px", 6.0)),
+                    min_arc_pts=int(params.get("ball_arc_min_pts", 4)),
+                    join_gap=int(params.get("ball_arc_join_gap_frames", 8)))
+                kept = {p.frame for p in refined.points}
+                for bf, _, _, _ in ball_obs:      # picks the fits rejected
+                    if bf not in kept and bf in entries:
+                        entries[bf].pop("ball", None)
+                for p in refined.interpolated:    # fit-filled misses
+                    e = entries.get(p.frame)
+                    if e is not None:
+                        e["ball"] = [round(p.x, 1), round(p.y, 1),
+                                     round(p.diameter_px, 1) if p.diameter_px else None,
+                                     0.0]
+                        e["interp"] = True
+                ball_obs = [(p.frame, p.x, p.y, p.diameter_px)
+                            for p in refined.points]
+                arc_events = classify_arc_events(
+                    refined.arcs, boxes_by_frame,
+                    join_gap=int(params.get("ball_arc_join_gap_frames", 8)),
+                    min_angle_deg=float(params.get("ball_event_min_angle_deg", 25.0)),
+                    adjacent_frac=float(params.get("ball_hit_adjacent_frac", 0.30)))
+                if frame_filter is not None:
+                    st = frame_filter.stats
+                    log.info(
+                        "pass2 %s w%d ball filter: %d/%d cands rejected "
+                        "(vel %d, foot %d, persist %d); %d arcs, %d outliers, "
+                        "%d noise pts, %d interpolated, %d events",
+                        video_id, wi + 1, st.total(), st.seen, st.velocity,
+                        st.foot_zone, st.persistent, len(refined.arcs),
+                        refined.n_outliers, refined.n_fragments,
+                        len(refined.interpolated), len(arc_events))
             track = smooth_track(ball_obs, max_gap=int(fps * 0.4),
                                  gate2=float(params.get("ball_kalman_gate2", 13.8)))
             world = reconstruct_world(track, cam)
@@ -287,15 +359,37 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                     e["world"] = [round(w.court_x, 2), round(w.court_y, 2),
                                   None if math.isnan(w.height) else round(w.height, 3)]
                     e["obs"] = w.observed
-            # Bounce/hit markers are kept purely as visual annotations (model=None:
-            # the trained rally_end model no longer drives anything in this pass).
-            events = detect_events(world, players_by_frame, params, fps,
-                                   model=None, entries=entries)
-            for ev in events:
-                e = entries.get(ev.frame)
-                if e is not None:
-                    e["evt"] = {"kind": ev.kind, "in": ev.in_court, "side": ev.side,
-                                "cx": round(ev.court_x, 2), "cy": round(ev.court_y, 2)}
+            if arc_events is not None:
+                # Filtering layer ON: events come from arc junctions + player
+                # boxes (plan stage 4). Court position prefers the smoothed
+                # world track at the event frame; else project the junction
+                # point through the homography (exact for bounces — on floor).
+                wbf = {w.frame: w for w in world}
+                for ev in arc_events:
+                    e = entries.get(ev.frame)
+                    if e is None:
+                        continue
+                    w = wbf.get(ev.frame)
+                    if w is not None:
+                        ecx, ecy = w.court_x, w.court_y
+                    else:
+                        cxy = court.img_to_court(H, np.array([[ev.x, ev.y]]))[0]
+                        ecx, ecy = float(cxy[0]), float(cxy[1])
+                    e["evt"] = {"kind": ev.kind,
+                                "in": bool(court.in_court(np.array([[ecx, ecy]]))[0]),
+                                "side": court.side_of_net(ecy),
+                                "cx": round(ecx, 2), "cy": round(ecy, 2)}
+            else:
+                # Legacy heuristic (ball_filter_enabled=0): height-reversal
+                # bounce/hit detection. Kept purely as visual annotations
+                # (model=None: no trained model drives anything in this pass).
+                events = detect_events(world, players_by_frame, params, fps,
+                                       model=None, entries=entries)
+                for ev in events:
+                    e = entries.get(ev.frame)
+                    if e is not None:
+                        e["evt"] = {"kind": ev.kind, "in": ev.in_court, "side": ev.side,
+                                    "cx": round(ev.court_x, 2), "cy": round(ev.court_y, 2)}
         overlays.write_entries(video_id, source, list(entries.values()))
 
     handle.update(progress=1.0,

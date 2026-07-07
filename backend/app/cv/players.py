@@ -17,6 +17,7 @@ import numpy as np
 
 from . import court
 from .exclusions import in_excluded
+from .identity import PlayerIdentityTracker
 from ..config import DATA_DIR, POSE_MODEL
 from .device import ultralytics_device
 
@@ -83,6 +84,7 @@ class PlayerObs:
     keypoints: list[list[float]] = field(default_factory=list)
     team: str | None = None                 # 'near' | 'far'
     number: int | None = None
+    slot: int | None = None                 # persistent match-stable identity id
 
 
 class PoseTracker:
@@ -103,11 +105,15 @@ class PoseTracker:
                  model_name: str | None = None):
         self.H = H
         self._device_ok = True
-        self.numbers: dict[int, int] = {}  # track_id -> official number
+        # Official numbers now ride on match-stable identity slots (see identity.py),
+        # not on the fragile ByteTrack track_id — that is what stopped the numbers
+        # switching whenever a track_id churned on a crossing/occlusion/dropout.
+        self.identity = PlayerIdentityTracker()
         self._track_sequence = track_sequence
         self._conf = float(conf)
         self._imgsz = int(imgsz)
         self._started = False
+        self._frame_no = 0  # monotonic frame counter for the identity tracker
         self._syn = -1  # synthetic ids for detections ByteTrack hasn't confirmed
         # Prefer the OpenVINO GPU model (~6x faster on the Arc iGPU); fall back to
         # the torch weights if OpenVINO/GPU isn't available. Either way this is a
@@ -185,8 +191,14 @@ class PoseTracker:
                 track_id=int(tid), box=(x1, y1, x2, y2), foot_xy=foot,
                 court_xy=court_xy, team=team,
                 keypoints=kpts[i].tolist() if kpts is not None else [],
-                number=self.numbers.get(int(tid)),
             ))
+        # Match-stable identity: assign each detection to a persistent per-team
+        # slot (appearance + court position) and stamp its slot + official number.
+        # Only for consecutive-frame Pass 2 sequences; Pass 1 spot checks are
+        # sparse and never use numbers, so we skip the work there.
+        if self._track_sequence:
+            self.identity.assign(frame, out, self._frame_no)
+            self._frame_no += 1
         return out
 
     def new_sequence(self) -> None:
@@ -200,19 +212,16 @@ class PoseTracker:
         old mid-clip wedging bug), only across one run's sequential windows."""
         self._started = False
         self._syn = -1
-        self.numbers = {}
+        # Identity slots PERSIST across windows so a player keeps the same number
+        # for the whole match; we only forget last positions (they walk around
+        # between rallies) so the window re-acquires on appearance. See identity.py.
+        self.identity.new_window()
 
     def assign_numbers_at_serve(self, obs: list[PlayerObs]) -> None:
-        """Call once per rally at the serve frame. Overwrites the mapping so
-        IDs that got swapped mid-rally are re-anchored every serve."""
-        placed = [o for o in obs if o.court_xy is not None]
-        near = sorted([o for o in placed if o.team == "near"], key=lambda o: o.court_xy[0])
-        far = sorted([o for o in placed if o.team == "far"], key=lambda o: o.court_xy[0])
-        n = 1
-        for o in near + far:
-            self.numbers[o.track_id] = n
-            o.number = n
-            n += 1
+        """Call once per rally at the serve frame. Re-anchors the official
+        left->right numbering onto the persistent identity slots, so a number
+        that drifted mid-rally is corrected and then rides with the right body."""
+        self.identity.assign_numbers_at_serve(obs)
 
 
 def is_serve_formation(obs: list[PlayerObs]) -> bool:

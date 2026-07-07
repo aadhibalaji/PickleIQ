@@ -59,6 +59,22 @@ DEFAULTS: dict[str, Any] = {
     "ball_kalman_gate2": 13.8,     # Mahalanobis^2 gate: a measurement further than this
                                    # from the Kalman prediction is a physically-irregular
                                    # jump (foot/noise) and is rejected, not smoothed in
+    # ---- Pass 2 ball filtering layer (cv/ball_filter.py) -------------------
+    "ball_filter_enabled": 1.0,    # 0 = fall back to the pre-filter heuristic path
+    "ball_max_speed_mph": 65.0,    # generous max pickleball speed for the velocity gate
+    "ball_speed_headroom": 1.6,    # gate slack (ball height/perspective aren't modelled)
+    "ball_box_persist_frames": 3,  # frames at the same box-relative spot = shoe/hat/paddle
+    "ball_box_persist_px": 12.0,   # box-relative match radius for that persistence check
+    "ball_foot_zone_frac": 0.25,   # bottom fraction of a player box = feet, always reject
+    "ball_arc_split_deg": 55.0,    # direction change that splits the track into arcs
+    "ball_arc_min_speed_px": 1.5,  # min px/frame both sides of a split must move
+    "ball_arc_gap_frames": 10,     # time gap that always splits arcs
+    "ball_arc_tol_px": 6.0,        # RANSAC inlier tolerance around the arc fit
+    "ball_arc_min_pts": 4,         # arcs smaller than this are fragments (noise unless
+                                   # temporally adjacent to a real arc)
+    "ball_arc_join_gap_frames": 8, # max junction gap for events / fragment continuity
+    "ball_event_min_angle_deg": 25.0,  # junction turns shallower than this = same shot
+    "ball_hit_adjacent_frac": 0.30,    # box expansion for 'at/near a player' = hit
     # ---- Rally start: serve-receive formation ------------------------------
     "require_serve_receive": 1.0,  # 1 = a rally may only start from a proper serve-receive
                                    # formation (server + diagonal receiver both behind their
@@ -103,6 +119,14 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "ball_hue_lo": (0.0, 180.0), "ball_hue_hi": (0.0, 180.0),
     "ball_foot_suppress_px": (10.0, 80.0), "ball_hit_speed_px": (6.0, 50.0),
     "ball_kalman_gate2": (5.0, 60.0),
+    "ball_filter_enabled": (0.0, 1.0),
+    "ball_max_speed_mph": (30.0, 120.0), "ball_speed_headroom": (1.0, 3.0),
+    "ball_box_persist_frames": (2, 10), "ball_box_persist_px": (4.0, 40.0),
+    "ball_foot_zone_frac": (0.0, 0.5),
+    "ball_arc_split_deg": (20.0, 90.0), "ball_arc_min_speed_px": (0.5, 10.0),
+    "ball_arc_gap_frames": (3, 30), "ball_arc_tol_px": (2.0, 20.0),
+    "ball_arc_min_pts": (3, 10), "ball_arc_join_gap_frames": (2, 20),
+    "ball_event_min_angle_deg": (10.0, 90.0), "ball_hit_adjacent_frac": (0.0, 1.0),
     "require_serve_receive": (0.0, 1.0), "serve_baseline_margin_m": (0.0, 2.0),
     "bounce_max_height_m": (0.05, 0.5), "hit_min_height_m": (0.2, 1.2),
     "player_radius_m": (0.5, 2.5), "min_event_gap_s": (0.05, 0.5),
