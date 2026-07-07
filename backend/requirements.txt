@@ -1,0 +1,19 @@
+# Install into a Python 3.12 venv (NOT 3.14 — torch/ultralytics support):
+#   py -3.12 -m venv .venv
+#   .venv\Scripts\pip install -r requirements.txt
+#
+# torch/torchvision come from the Intel XPU wheel index so inference can run
+# on the Intel Arc GPU (falls back to CPU automatically if unavailable).
+--extra-index-url https://download.pytorch.org/whl/xpu
+torch
+torchvision
+
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv
+numpy
+opencv-python
+ultralytics          # YOLO11-pose + ByteTrack (weights auto-download)
+lapx                 # assignment solver used by the tracker
+anthropic            # discrepancy-analysis report only

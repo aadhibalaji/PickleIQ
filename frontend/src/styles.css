@@ -1,0 +1,85 @@
+:root {
+  color-scheme: dark;
+  --bg: #101418;
+  --panel: #1a2027;
+  --panel2: #232b34;
+  --border: #33404d;
+  --text: #e8edf2;
+  --muted: #93a4b5;
+  --accent: #4cc38a;
+  --accent2: #58a6ff;
+  --warn: #e5a53a;
+  --danger: #e5534b;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.45 system-ui, "Segoe UI", sans-serif;
+}
+#root { max-width: 1400px; margin: 0 auto; padding: 16px; }
+h1 { font-size: 20px; margin: 0 0 12px; }
+h2 { font-size: 15px; margin: 16px 0 8px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
+button {
+  background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 13px;
+}
+button:hover:not(:disabled) { border-color: var(--accent2); }
+button:disabled { opacity: 0.45; cursor: default; }
+button.primary { background: #1f6f4a; border-color: #2c9e69; }
+button.blue { background: #1b4b7c; border-color: #2f6fae; }
+button.danger { background: #6e2a26; border-color: #a43e38; }
+input, select, textarea {
+  background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+  border-radius: 6px; padding: 6px 8px; font-size: 13px;
+}
+textarea { width: 100%; min-height: 60px; resize: vertical; }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px; margin-bottom: 12px; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.spread { justify-content: space-between; }
+.muted { color: var(--muted); font-size: 12px; }
+.tabs { display: flex; gap: 4px; margin: 12px 0 0; }
+.tabs button { border-radius: 8px 8px 0 0; border-bottom: none; padding: 8px 18px; }
+.tabs button.active { background: var(--panel); border-color: var(--border); color: var(--accent); font-weight: 600; }
+.tabbody { border: 1px solid var(--border); border-radius: 0 10px 10px 10px; background: var(--panel); padding: 14px; }
+.videowrap { position: relative; background: #000; border-radius: 8px; overflow: hidden; width: fit-content; max-width: 100%; margin: 0 auto; }
+.videowrap video { display: block; max-height: 46vh; width: auto; max-width: 100%; }
+/* left/top (not inset:0) so the JS layoutCanvas width/height/left/top wins
+   cleanly instead of being over-constrained by right/bottom. */
+.videowrap canvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; }
+.videowrap.clickable canvas { pointer-events: auto; cursor: crosshair; }
+.videowrap.novideo video { visibility: hidden; }   /* overlay-on-black toggle */
+.videowrap .vpbtns { position: absolute; top: 8px; right: 8px; z-index: 3; display: flex; gap: 6px; }
+.videowrap .fsbtn { width: 32px; height: 32px; padding: 0; display: flex; align-items: center;
+  justify-content: center; border-radius: 6px; background: rgba(0,0,0,0.55); color: #fff;
+  border: 1px solid rgba(255,255,255,0.25); font-size: 15px; line-height: 1; cursor: pointer; }
+.videowrap .fsbtn:hover { background: rgba(0,0,0,0.85); }
+/* Fullscreen: fill the screen on black. The video is object-fit:contain and the
+   overlay canvas is positioned in JS (layoutCanvas) to match the video's
+   letterboxed content box exactly, so court lines + players stay aligned. */
+.videowrap:fullscreen { position: fixed; inset: 0; margin: 0; width: 100vw; height: 100vh;
+  border-radius: 0; background: #000; }
+.videowrap:fullscreen video { width: 100%; height: 100%; object-fit: contain; }
+.videowrap:fullscreen::backdrop { background: #000; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { border: 1px solid var(--border); padding: 5px 8px; text-align: left; }
+th { background: var(--panel2); color: var(--muted); }
+.pill { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; border: 1px solid var(--border); }
+.pill.human { color: #4cc38a; border-color: #2c9e69; }
+.pill.pass1 { color: #e5a53a; border-color: #b07f2a; }
+.pill.pass2 { color: #58a6ff; border-color: #2f6fae; }
+.pill.drift { color: var(--warn); }
+.pill.missed, .pill.extra { color: var(--danger); }
+.mdreport { background: var(--panel2); border-radius: 8px; padding: 12px; white-space: pre-wrap; font-size: 13px; max-height: 480px; overflow: auto; }
+.timeline { user-select: none; }
+.error { color: var(--danger); font-size: 13px; }
+progress { width: 200px; }
+kbd { background: var(--panel2); border: 1px solid var(--border); border-radius: 4px; padding: 0 5px; font-size: 11px; }
+.loadingbar { position: relative; height: 8px; border-radius: 999px; background: var(--panel2); overflow: hidden; flex: 1; min-width: 220px; }
+.loadingbar::after {
+  content: ''; position: absolute; top: 0; bottom: 0; width: 35%;
+  border-radius: 999px; background: linear-gradient(90deg, transparent, var(--accent2), transparent);
+  animation: slide 1.3s ease-in-out infinite;
+}
+@keyframes slide { from { left: -35%; } to { left: 100%; } }
