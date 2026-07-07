@@ -42,10 +42,17 @@ def iter_frames(
     end_frame: int | None = None,
     step: int = 1,
     scale: float = 1.0,
-) -> Iterator[tuple[int, np.ndarray]]:
+    with_full: bool = False,
+) -> Iterator[tuple]:
     """Yield (frame_index, BGR frame). `step` subsamples temporally (Pass 1),
     `scale` subsamples spatially. Sequential grab/retrieve — no per-frame
-    seeking, which is slow and inaccurate on long GOP videos."""
+    seeking, which is slow and inaccurate on long GOP videos.
+
+    `with_full=True` additionally yields the FULL-resolution frame as a third
+    element: (idx, scaled, full). Decode cost is unchanged (retrieve already
+    returns full-res); this lets Pass 1 run cheap motion/ball detection on the
+    downscaled frame while feeding pose the full-res frame so small far-side
+    players are still detectable."""
     cap = cv2.VideoCapture(path)
     try:
         if start_frame:
@@ -58,12 +65,13 @@ def iter_frames(
             if not ok:
                 break
             if (idx - start_frame) % step == 0:
-                ok, frame = cap.retrieve()
+                ok, full = cap.retrieve()
                 if not ok:
                     break
+                frame = full
                 if scale != 1.0:
-                    frame = cv2.resize(frame, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-                yield idx, frame
+                    frame = cv2.resize(full, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+                yield (idx, frame, full) if with_full else (idx, frame)
             idx += 1
     finally:
         cap.release()

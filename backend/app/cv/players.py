@@ -9,28 +9,28 @@ left->right = 3,4 (singles: 1 near, 2 far).
 from __future__ import annotations
 
 import logging
-import threading
 from dataclasses import dataclass, field
 
 import numpy as np
 
 from . import court
+from ..config import POSE_MODEL
 from .device import ultralytics_device
 
 log = logging.getLogger("cv.players")
 
-_model_lock = threading.Lock()
-_model = None
 
+def _build_model(name: str):
+    """Construct a FRESH YOLO-pose model. Each PoseTracker gets its own instance
+    (not a shared singleton): ByteTrack state lives on the model's predictor, so
+    two trackers sharing one model object would corrupt each other's track state
+    — the failure mode that once wedged tracking mid-clip and made detection stop
+    returning players. Per-instance models make that class of bug impossible even
+    when passes/windows/jobs overlap. Ultralytics caches the weights file on
+    disk, so re-loads are cheap after the first (auto-)download."""
+    from ultralytics import YOLO
 
-def _get_model():
-    global _model
-    with _model_lock:
-        if _model is None:
-            from ultralytics import YOLO
-
-            _model = YOLO("yolo11n-pose.pt")  # auto-downloads official weights
-        return _model
+    return YOLO(name)
 
 
 @dataclass
@@ -45,18 +45,41 @@ class PlayerObs:
 
 
 class PoseTracker:
-    """Stateful per-clip tracker. Call update() with frames in order."""
+    """Stateful per-sequence tracker. Call update() with frames in order.
 
-    def __init__(self, H: np.ndarray | None):
+    `track_sequence=True` (Pass 2): frames are consecutive, so ByteTrack runs
+    and gives stable IDs for player-number assignment. The tracker is RESET on
+    the first frame of this instance (persist=False) so the module-global model
+    never leaks ByteTrack state across windows/passes — that leak wedged
+    tracking mid-clip and made detection stop returning players.
+
+    `track_sequence=False` (Pass 1 spot checks, ~2 s apart): ByteTrack cannot
+    associate across such gaps, so we reset every call and only use detections
+    + court positions (IDs are irrelevant to the serve-formation check)."""
+
+    def __init__(self, H: np.ndarray | None, track_sequence: bool = True,
+                 conf: float = 0.25, imgsz: int = 640,
+                 model_name: str | None = None):
         self.H = H
         self._device = ultralytics_device()
         self._device_ok = True
         self.numbers: dict[int, int] = {}  # track_id -> official number
+        self._track_sequence = track_sequence
+        self._conf = float(conf)
+        self._imgsz = int(imgsz)
+        self._started = False
+        self._syn = -1  # synthetic ids for detections ByteTrack hasn't confirmed
+        # Own model instance -> own ByteTrack state (see _build_model).
+        self._model = _build_model(model_name or POSE_MODEL)
 
     def update(self, frame: np.ndarray) -> list[PlayerObs]:
-        model = _get_model()
-        kwargs = dict(persist=True, tracker="bytetrack.yaml", classes=[0],
-                      conf=0.3, verbose=False)
+        model = self._model
+        # persist=False on the first frame re-inits ByteTrack for THIS sequence;
+        # Pass 1 keeps resetting (sparse), Pass 2 then persists for stable IDs.
+        persist = self._track_sequence and self._started
+        self._started = True
+        kwargs = dict(persist=persist, tracker="bytetrack.yaml", classes=[0],
+                      conf=self._conf, imgsz=self._imgsz, verbose=False)
         try:
             res = model.track(frame, device=self._device if self._device_ok else "cpu", **kwargs)
         except Exception:
@@ -68,10 +91,21 @@ class PoseTracker:
                 raise
         out: list[PlayerObs] = []
         r = res[0]
-        if r.boxes is None or r.boxes.id is None:
+        if r.boxes is None or len(r.boxes) == 0:
             return out
         boxes = r.boxes.xyxy.cpu().numpy()
-        ids = r.boxes.id.cpu().numpy().astype(int)
+        if r.boxes.id is not None:
+            ids = r.boxes.id.cpu().numpy().astype(int)
+        else:
+            # ByteTrack returns id=None for tentative (unconfirmed) tracks and
+            # whenever it loses lock. The old code returned [] here, silently
+            # discarding perfectly visible players — that is the root cause of
+            # 'far side players never detected' (sparse Pass 1 spot checks never
+            # confirm a track) and 'detection stopped at ~frame 2900' (the shared
+            # tracker wedged and stopped confirming for the rest of the clip).
+            # Keep the detections; give them synthetic negative ids.
+            ids = np.array([self._syn - i for i in range(len(boxes))], dtype=int)
+            self._syn -= len(boxes)
         kpts = r.keypoints.xy.cpu().numpy() if r.keypoints is not None else None
         for i, tid in enumerate(ids):
             x1, y1, x2, y2 = boxes[i].tolist()
@@ -134,3 +168,30 @@ def is_serve_formation(obs: list[PlayerObs]) -> bool:
         return deep >= 1 and up <= 1 and max(depths) > 3.0
 
     return side_ok(near, True) and side_ok(far, False)
+
+
+def is_serve_receive_formation(obs: list[PlayerObs], behind_m: float = 0.75) -> bool:
+    """Stricter serve-start gate: a genuine serve-receive shape must exist —
+    a SERVER standing behind one baseline and the DIAGONAL (cross-court)
+    RECEIVER standing behind the opposite baseline. In pickleball the serve is
+    always struck from behind the baseline into the diagonally opposite service
+    court, so this pair is the defining signature of a point about to start and
+    rejects mid-point / between-point stances that the looser 'one up, rest
+    back' check lets through.
+
+    `behind_m` = metres inside a baseline still counted as 'behind' it (players
+    toe the line, and the far foot point is noisy). Returns True as soon as one
+    valid server+diagonal-receiver pair is found."""
+    placed = [o for o in obs if o.court_xy is not None]
+    near_deep = [o for o in placed if o.team == "near" and o.court_xy[1] > court.COURT_L - behind_m]
+    far_deep = [o for o in placed if o.team == "far" and o.court_xy[1] < behind_m]
+    if not near_deep or not far_deep:
+        return False
+    mid = court.COURT_W / 2.0
+    # Server and receiver must sit on OPPOSITE halves of the centre line — that
+    # is what makes it a cross-court (diagonal) serve rather than straight-ahead.
+    for s in near_deep:
+        for r in far_deep:
+            if (s.court_xy[0] - mid) * (r.court_xy[0] - mid) < 0:
+                return True
+    return False

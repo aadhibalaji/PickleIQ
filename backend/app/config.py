@@ -25,6 +25,11 @@ ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5")
 ANTHROPIC_REPORT_MODEL = os.getenv("ANTHROPIC_REPORT_MODEL", "claude-haiku-4-5-20251001")
 
 CV_DEVICE = os.getenv("CV_DEVICE", "auto")
+# YOLO-pose weights for player detection/tracking. Nano is the default: MEASURED
+# on clip #1 that yolo11s/m give no extra far-side recall at 2-4x the cost (see
+# learning/params.py pose_imgsz note). Override to try a heavier model without a
+# code change, e.g. POSE_MODEL=yolo11s-pose.pt.
+POSE_MODEL = os.getenv("POSE_MODEL", "yolo11n-pose.pt")
 TRACKNET_WEIGHTS = os.getenv("TRACKNET_WEIGHTS", "")
 # TrackNet inference is ~5x slower per Pass 2 frame, and the pretrained
 # tennis/badminton weights do NOT transfer well to this fixed down-the-line

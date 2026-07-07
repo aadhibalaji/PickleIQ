@@ -47,52 +47,56 @@ def detect_debug(video_id: str):
     pass1 = [r for r in rows if r["source"] == "pass1"]
     pass2 = [r for r in rows if r["source"] == "pass2"]
 
-    # Reconstruct the merged windows Pass 2 actually used, straight from its
-    # stored meta (ws/we) — no need to duplicate the window-merge logic.
-    merged = []
-    for r in pass2:
-        m = db.loads(r["meta"], {})
-        ws, we = m.get("ws"), m.get("we")
-        if ws is None or we is None:
-            continue
+    # Pass 1 is now the sole source of rally boundaries — compare human labels
+    # against the Pass 1 windows. Each Pass 1 window that covers >1 human rally
+    # is an under-segmentation (bridged rallies); it's an accepted trade-off of
+    # the loosened, recall-favouring gate, but surface it so it's visible.
+    windows = []
+    for r in pass1:
+        ws, we = r["start_frame"], r["end_frame"]
         covered = [i for i, h in enumerate(human) if min(h.end, we) - max(h.start, ws) > 0]
-        merged.append({"ws": ws, "we": we,
-                       "start_source": m.get("start_source"),
-                       "end_source": m.get("end_source"),
-                       "human_covered": len(covered), "human_idx": covered})
+        windows.append({"ws": ws, "we": we,
+                        "human_covered": len(covered), "human_idx": covered})
 
-    ai = [Rally(r["start_frame"], r["end_frame"]) for r in pass2]
+    ai = [Rally(r["start_frame"], r["end_frame"]) for r in pass1]
     summary = compare(human, ai, fps)["summary"] if human else None
 
     hints: list[str] = []
     if H is None:
-        hints.append("No calibration — Pass 2 cannot run (it needs a homography). "
-                     "Calibrate the court corners, then Reprocess.")
+        hints.append("No calibration — Pass 1's primary net-crossing gate is disabled "
+                     "(motion fallback only) and Pass 2 cannot run. Calibrate the court "
+                     "corners, then Reprocess.")
     if pass2_job and pass2_job["status"] == "error":
         hints.append(f"Latest Pass 2 job errored: {pass2_job['message']}")
-    bridged = [w for w in merged if w["human_covered"] > 1]
+    bridged = [w for w in windows if w["human_covered"] > 1]
     if bridged:
         hints.append(
-            f"{len(bridged)} merged window(s) each cover >1 human rally — adjacent "
-            "rallies bridged into one candidate. Lower p1_merge_gap_s / p1_cross_window_s, "
-            "or enable multi-rally Pass 2 (A5).")
-    if not pass2:
-        hints.append("No Pass 2 rallies yet — run or await processing.")
+            f"{len(bridged)} Pass 1 window(s) each cover >1 human rally — adjacent "
+            "rallies bridged into one loose window. Expected with the recall-favouring "
+            "gate; lower p1_merge_gap_s / p1_pad_s / p1_cross_window_s to split them.")
+    if not pass1:
+        hints.append("No Pass 1 rallies yet — run or await processing.")
 
     return {
         "calibration": {"present": H is not None, "calibration_id": cal_id},
         "pass2_job": dict(pass2_job) if pass2_job else None,
         "counts": {"pass1_windows": len(pass1), "pass2_rallies": len(pass2),
                    "human": len(human)},
-        "merged_windows": merged,
+        "merged_windows": windows,
         "comparison": summary,
         "hints": hints,
     }
 
 
 class ReportRequest(BaseModel):
-    ai_source: str = "pass2"
-    apply_deterministic_updates: bool = True
+    # Pass 1 is now the sole source of rally boundaries (Pass 2 only refines the
+    # detection overlay), so the report compares human labels against 'pass1'.
+    ai_source: str = "pass1"
+    # Rally-boundary value learning is paused: the deterministic start/end offset
+    # updates are no longer applied anywhere (Pass 2 doesn't refine boundaries),
+    # so we don't auto-mutate the learned params from a report. Reports are
+    # informational for now. Flip back to True to resume offset learning.
+    apply_deterministic_updates: bool = False
 
 
 @router.post("/videos/{video_id}/report")

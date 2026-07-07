@@ -26,9 +26,24 @@ def smooth_track(
     dt: float = 1.0,
     process_noise: float = 1.0,
     meas_noise: float = 4.0,
+    gate2: float = 0.0,
+    max_reject: int = 3,
 ) -> list[TrackPoint]:
     """obs: sorted (frame, x, y, diameter_px|None). Gaps <= max_gap frames are
-    bridged by prediction; larger gaps split the output (track restarts)."""
+    bridged by prediction; larger gaps split the output (track restarts).
+
+    Outlier rejection (gate2 > 0): each measurement's innovation is scored by
+    Mahalanobis^2 distance from the Kalman prediction. A ball obeys smooth
+    physics, so a measurement that lands far outside the predicted uncertainty
+    (a foot/noise blob, or a mis-association) is REJECTED — the filter predicts
+    through it (unobserved point) instead of being yanked off the trajectory.
+    This is the 'remove irregular ball patterns' filter.
+
+    Real hits/bounces are genuine sharp maneuvers, not noise, so they must NOT
+    be permanently suppressed: after `max_reject` CONSECUTIVE rejects the motion
+    model is deemed wrong (a real direction change) and the filter restarts on
+    the newest measurement. One-off outliers are dropped; sustained new
+    trajectories are re-acquired."""
     if not obs:
         return []
     # State [x, y, vx, vy, ax, ay]
@@ -45,6 +60,7 @@ def smooth_track(
     P = np.eye(6) * 100.0
     out.append(TrackPoint(obs[0][0], x[0], x[1], 0.0, 0.0, True, obs[0][3]))
     prev_frame = obs[0][0]
+    reject_run = 0
 
     for frame, mx, my, diam in obs[1:]:
         gap = frame - prev_frame
@@ -54,6 +70,7 @@ def smooth_track(
             P = np.eye(6) * 100.0
             out.append(TrackPoint(frame, mx, my, 0.0, 0.0, True, diam))
             prev_frame = frame
+            reject_run = 0
             continue
         for step in range(gap):
             x = F @ x
@@ -61,10 +78,28 @@ def smooth_track(
             f_i = prev_frame + step + 1
             if f_i < frame:
                 out.append(TrackPoint(f_i, x[0], x[1], x[2], x[3], False))
-        # Measurement update at `frame`.
+        # Innovation at `frame`.
         y_res = np.array([mx, my]) - Hm @ x
         S = Hm @ P @ Hm.T + Rm
-        K = P @ Hm.T @ np.linalg.inv(S)
+        Sinv = np.linalg.inv(S)
+        if gate2 > 0.0 and float(y_res @ Sinv @ y_res) > gate2:
+            reject_run += 1
+            if reject_run >= max_reject:
+                # Sustained deviation = a real maneuver (hit/bounce), not noise.
+                # Re-acquire the ball at the current measurement.
+                x = np.array([mx, my, 0, 0, 0, 0], dtype=float)
+                P = np.eye(6) * 100.0
+                out.append(TrackPoint(frame, mx, my, 0.0, 0.0, True, diam))
+                prev_frame = frame
+                reject_run = 0
+                continue
+            # Outlier: predict through it (do not let it pull the estimate).
+            out.append(TrackPoint(frame, x[0], x[1], x[2], x[3], False))
+            prev_frame = frame
+            continue
+        # Accepted measurement update.
+        reject_run = 0
+        K = P @ Hm.T @ Sinv
         x = x + K @ y_res
         P = (np.eye(6) - K @ Hm) @ P
         out.append(TrackPoint(frame, x[0], x[1], x[2], x[3], True, diam))

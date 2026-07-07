@@ -232,12 +232,20 @@ const VideoPlayer = forwardRef(function VideoPlayer(
   }
 
   const handleClick = (e) => {
-    if (!clickMode || !onCanvasClick) return
-    const cv = canvasRef.current
-    const rect = cv.getBoundingClientRect()
-    const x = ((e.clientX - rect.left) / rect.width) * cv.width
-    const y = ((e.clientY - rect.top) / rect.height) * cv.height
-    onCanvasClick(x, y)
+    if (clickMode && onCanvasClick) {
+      const cv = canvasRef.current
+      const rect = cv.getBoundingClientRect()
+      const x = ((e.clientX - rect.left) / rect.width) * cv.width
+      const y = ((e.clientY - rect.top) / rect.height) * cv.height
+      onCanvasClick(x, y)
+      return
+    }
+    // Black-background mode hides the native <video> controls, so a click on the
+    // overlay is the only way to pause/play — toggle it here.
+    if (!showVideo) {
+      const v = videoRef.current
+      if (v) v.paused ? v.play() : v.pause()
+    }
   }
 
   return (

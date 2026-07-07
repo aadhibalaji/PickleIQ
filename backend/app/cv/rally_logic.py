@@ -36,6 +36,8 @@ class RallyDecision:
     confirmed: bool = False
     notes: list[str] = field(default_factory=list)
     start_source: str = ""             # 'serve' | 'fast_ball' | 'coarse_gate'
+    end_estimate: int | None = None    # best end guess when no terminal event fired
+    end_estimate_source: str = ""      # 'last_cross' | 'player_reset'
 
 
 def _dist_outside_court(x: float, y: float) -> float:
@@ -241,6 +243,31 @@ def detect_end(
                 return d
 
     # --- no terminal event found ------------------------------------------
+    # The far-side terminal bounce is the least reliable signal in the system,
+    # so ~all rallies reach here and Pass 2 otherwise falls back to the padded
+    # Pass 1 window edge — which trails the true end by several seconds. Produce
+    # a much closer estimate WITHOUT needing the far ball:
+    #   1. last net crossing — in pickleball the point ends just after the last
+    #      shot goes over the net; that crossing rides on the near-side ball,
+    #      which tracks well (unlike the far-side terminal bounce). End ~= last
+    #      crossing + the ball's short flight-to-land time.
+    #   2. player reset — if no crossing was tracked, the last frame players were
+    #      at rally intensity, + a short settle, marks the point breaking up.
+    # This is only a boundary ESTIMATE (end_source stays non-terminal), so the
+    # honest 'no terminal event' semantics are preserved for the learning harness.
+    last_cross = _last_net_crossing(world, start_frame)
+    if last_cross is not None:
+        decision.end_estimate = int(min(last_cross + int(fps * 0.6),
+                                        world[-1].frame if world else last_cross))
+        decision.end_estimate_source = "last_cross"
+    else:
+        active = [f for f, s in player_motion.items()
+                  if f > start_frame + min_len and s > active_th]
+        if active:
+            decision.end_estimate = int(min(max(active) + int(fps * 0.3),
+                                            world[-1].frame if world else max(active)))
+            decision.end_estimate_source = "player_reset"
+
     # Track dropout with players still moving = tracking gap, never an end.
     if world:
         tail = world[-int(fps):]
@@ -249,6 +276,29 @@ def detect_end(
         if tail_unobserved and recent_speed and float(np.mean(recent_speed)) > active_th:
             decision.notes.append("ball track dropout while players active — tracking gap, no end declared")
     return decision
+
+
+def _last_net_crossing(world: list[BallWorld], start_frame: int,
+                       band: float = 0.5) -> int | None:
+    """Frame of the LAST clean net crossing after start_frame (hysteresis `band`
+    metres to ignore jitter at the net), or None if the ball never crossed. The
+    point ends just after the last shot goes over, so this + flight time is a
+    good end estimate that doesn't depend on the far-side terminal bounce."""
+    committed = None
+    last = None
+    for w in world:
+        if w.frame < start_frame or not w.observed:
+            continue
+        dy = w.court_y - court.NET_Y
+        if abs(dy) < band:
+            continue
+        side = 1 if dy > 0 else -1
+        if committed is None:
+            committed = side
+        elif side != committed:
+            last = w.frame
+            committed = side
+    return last
 
 
 def _was_played(world: list[BallWorld], start_frame: int, band: float = 0.5) -> bool:

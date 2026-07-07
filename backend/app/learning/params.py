@@ -27,6 +27,38 @@ DEFAULTS: dict[str, Any] = {
     "p1_cross_window_s": 2.0,      # net-cross recency that keeps the calibrated gate open
     "p1_min_rally_s": 2.0,         # discard blips shorter than a real rally
     "p1_spot_check_s": 2.0,        # serve-formation pose spot-check interval
+    "p1_end_settle_s": 0.6,        # rally end = last net crossing + this settle (flight-to-land)
+                                   # instead of the hysteresis flip (~cross_window+off later)
+    # ---- Pose detection (players) -----------------------------------------
+    "pose_conf": 0.25,             # YOLO-pose confidence floor (lower = catch far players)
+    "pose_imgsz": 1280,            # Pass 2 pose inference size. MEASURED on clip #1:
+                                   # 960 finds 0 far players (and dropped ALL players at
+                                   # frame 3000); 1280 recovers them. yolo11s/m give no
+                                   # extra far recall at 2-4x the cost, so nano@1280 wins.
+    "p1_pose_imgsz": 1280,         # Pass 1 pose size (sparse spot checks; can be large)
+    # ---- Pass 2 ball trajectory selection ---------------------------------
+    "ball_gate_px": 45.0,          # residual radius around the velocity prediction
+    "ball_accel_px": 6.0,          # extra gate radius per frame^2 of track gap
+    "ball_acq_px": 90.0,           # acquisition radius while ball velocity is unknown
+    "ball_seed_min_px": 4.0,       # min px/frame a cold-start candidate must MOVE before it
+                                   # can seed a track (rejects stationary shoe/short blobs)
+    "ball_foot_suppress_px": 35.0, # radius around foot keypoints to suppress blobs
+    "ball_hit_speed_px": 18.0,     # px/frame a near-player blob must move to count as a hit
+    # Classical-fallback appearance gate (OpenCV HSV; H 0-180, S/V 0-255). OFF by
+    # default (sat/val floors 0, full hue range) because ball colour varies per
+    # clip — set once you know the ball colour to cheaply drop off-colour blobs.
+    "ball_sat_min": 0.0,           # min mean saturation of a ball blob
+    "ball_val_min": 0.0,           # min mean brightness/value of a ball blob
+    "ball_hue_lo": 0.0,            # ball hue window low (may exceed hi to wrap the red seam)
+    "ball_hue_hi": 180.0,          # ball hue window high
+    "ball_kalman_gate2": 13.8,     # Mahalanobis^2 gate: a measurement further than this
+                                   # from the Kalman prediction is a physically-irregular
+                                   # jump (foot/noise) and is rejected, not smoothed in
+    # ---- Rally start: serve-receive formation ------------------------------
+    "require_serve_receive": 1.0,  # 1 = a rally may only start from a proper serve-receive
+                                   # formation (server + diagonal receiver both behind their
+                                   # baselines); 0 = looser 'one up rest back' check
+    "serve_baseline_margin_m": 0.75,  # metres inside a baseline still counted as 'behind' it
     # ---- Pass 2 ball/bounce ------------------------------------------------
     "bounce_max_height_m": 0.20,
     "hit_min_height_m": 0.45,
@@ -58,6 +90,15 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "p1_on_s": (0.2, 3.0), "p1_off_s": (0.5, 6.0), "p1_pad_s": (0.5, 3.0),
     "p1_merge_gap_s": (0.0, 2.0), "p1_cross_window_s": (0.5, 4.0),
     "p1_min_rally_s": (1.0, 5.0), "p1_spot_check_s": (0.5, 5.0),
+    "p1_end_settle_s": (0.0, 2.5),
+    "pose_conf": (0.05, 0.6), "pose_imgsz": (640, 1920), "p1_pose_imgsz": (640, 1920),
+    "ball_gate_px": (15.0, 120.0), "ball_accel_px": (0.0, 30.0),
+    "ball_acq_px": (40.0, 200.0), "ball_seed_min_px": (1.0, 20.0),
+    "ball_sat_min": (0.0, 255.0), "ball_val_min": (0.0, 255.0),
+    "ball_hue_lo": (0.0, 180.0), "ball_hue_hi": (0.0, 180.0),
+    "ball_foot_suppress_px": (10.0, 80.0), "ball_hit_speed_px": (6.0, 50.0),
+    "ball_kalman_gate2": (5.0, 60.0),
+    "require_serve_receive": (0.0, 1.0), "serve_baseline_margin_m": (0.0, 2.0),
     "bounce_max_height_m": (0.05, 0.5), "hit_min_height_m": (0.2, 1.2),
     "player_radius_m": (0.5, 2.5), "min_event_gap_s": (0.05, 0.5),
     "net_fail_height_m": (0.6, 1.3), "out_max_dist_m": (0.3, 4.0),

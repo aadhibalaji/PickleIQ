@@ -4,6 +4,17 @@ Pickleball rally detection. Two-pass CV pipeline. This document reflects the
 **current** state of the code (post the detection-quality + learning-loop work).
 Hand this to another agent as the source of truth for how detection works.
 
+> **Current focus (2026-07-07): detection accuracy, not rally segmentation.**
+> **Pass 1 is the SOLE source of rally start/end** — it emits generous,
+> recall-favouring windows (padded + merged). **Pass 2 no longer computes rally
+> boundaries**; it only produces the accurate per-frame player/ball detection
+> overlay *inside* each Pass 1 window. The rally-decision code (`rally_logic`,
+> terminal-event end detection, learned start/end offsets, serve-vs-pass
+> rejection, the trained `rally_end`/`serve_start` model hooks) is left in the
+> tree but **not called** — it can be switched back on later. The report /
+> auto-learn boundary-offset loop is correspondingly **paused** (the offsets are
+> applied nowhere, so reports are informational and don't auto-mutate params).
+
 ## Orchestration
 - `backend/app/pipeline.py` runs everything. On upload / reprocess it loads the
   latest global `LearnedParams` (`learning/params.py`) **and** the effective
@@ -21,8 +32,17 @@ Hand this to another agent as the source of truth for how detection works.
 
 **Goal:** cheaply answer "is a rally roughly happening here?" over 100% of the
 footage. Runs at low resolution (`p1_scale`=0.4) and reduced frame rate
-(`p1_frame_step`=3). Output = candidate `(start,end)` windows → `rally_labels
-source='pass1'`.
+(`p1_frame_step`=3). Output = the **authoritative** rally `(start,end)` windows
+→ `rally_labels source='pass1'`.
+
+**Boundaries (loosened for recall).** Pass 1 is now the sole boundary source, so
+`close_rally` pads each raw window by `p1_pad_s` per side and **merges** it into
+the previous window when the padded windows touch (within `p1_merge_gap_s`).
+Windows shorter than `p1_min_rally_s` (on their *raw* length) are still dropped
+as blips. Net effect: generous windows that fully contain each rally, at the
+cost of loose edges and occasional under-segmentation (two close rallies bridged
+into one) — an accepted trade-off while the focus is detection, not
+segmentation. (This folds the old Pass-2 pad+merge step into Pass 1.)
 
 **Signals**
 1. **Net crossings (PRIMARY, needs calibration).** A fast, ball-sized, size-
@@ -53,18 +73,25 @@ learned gate classifier (`backend/scripts/train_gate.py`).
 
 ---
 
-## PASS 2 — precise boundaries + events (`backend/app/cv/pass2.py :: run_pass2`)
+## PASS 2 — detection / visualization only (`backend/app/cv/pass2.py :: run_pass2`)
 
-**Goal:** inside each padded candidate window only (~20% of frames), at full
-frame rate, find precise rally start/end and the terminal event. Output =
-`rally_labels source='pass2'` + a rich per-frame `pass2` overlay.
+**Goal:** inside each Pass 1 rally window only (~20% of frames), at full frame
+rate, produce an **accurate per-frame detection overlay** of player location and
+ball position. **Pass 2 emits NO `rally_labels`** — it clears any stale
+`source='pass2'` rows and writes only the rich per-frame `pass2` overlay. Rally
+start/end come entirely from Pass 1.
 
-**Window building (fixed).** Merge consecutive Pass 1 windows only when the
-**raw** gap ≤ `p1_merge_gap_s`, THEN pad by `p1_pad_s`, clamping the pad to at
-most half the gap to each neighbour so two padded windows can never bridge two
-separate rallies. Raw (unpadded) bounds are carried through for honest fallback
-+ the validation harness. *(This was the key fix: padding used to happen before
-merging, collapsing adjacent rallies into one.)*
+**Window building.** Pass 2 still reconstructs the region to process by merging
+consecutive Pass 1 windows (raw gap ≤ `p1_merge_gap_s`) and padding by
+`p1_pad_s` — but this only defines *where detection runs*, not any boundary
+output. (Pass 1 already pads/merges its emitted windows; this is just the
+processing extent.)
+
+**What was removed / disabled here:** `rally_logic.detect_rallies`,
+terminal-event end detection, `start_offset_frames`/`end_offset_frames`,
+serve-vs-pass rejection, and the `model_registry` live-bundle load. `detect_events`
+still runs but with `model=None`, producing bounce/hit markers **purely as
+overlay annotations**.
 
 **Per-frame, per window:**
 - **Players:** `PoseTracker` (YOLO11-pose + ByteTrack) → court positions +
@@ -74,53 +101,36 @@ merging, collapsing adjacent rallies into one.)*
   2. **TrackNet** triplet **if `TRACKNET_ENABLED` + weights present** — *currently
      OFF by default* (pretrained tennis weights don't transfer to this
      down-the-line view without fine-tuning; ~5× slower, no gain measured);
-  3. **classical `MotionBallDetector`** fallback (3-frame differencing + blob
-     geometry) with TWO filters: **player-box exclusion** (full box + outward
-     margins — kills shoe/paddle false positives) and **court-region filter**
-     (`_in_court_region` — rejects blobs whose plane-projection is > ~2.5 m/3 m
-     outside the court, i.e. neighbouring courts / spectators).
-- **Kalman smoothing** (`smooth_track`, `max_gap` ≈ 0.4 s) bridges short gaps.
+  3. **classical `MotionBallDetector`** run **PERMISSIVE** (no player-box
+     exclusion) + a **`TrajectoryBallSelector`** (`ball_track.py`): the selector
+     scores each raw blob by fit to the recent ball trajectory and applies the
+     velocity-aware foot/shoe suppression (a blob on a foot is kept only if it
+     moves ≥ `ball_hit_speed_px`). The **court-region filter** (`_in_court_region`
+     — rejects plane-projections > ~2.5 m/3 m outside the court) still applies.
+- **Kalman smoothing** (`smooth_track`, `max_gap` ≈ 0.4 s, `ball_kalman_gate2`
+  outlier rejection) bridges short gaps and rejects physically-irregular jumps.
 - **3D reconstruction** (`reconstruct_world`): apparent ball diameter → height
   above the court plane; homography → court x/y. **This size→depth step is the
   system's biggest noise source for the far-baseline ball** (few px wide).
+- **Player numbering:** a serve-formation spot-check still calls
+  `assign_numbers_at_serve` so players get stable 1–4 numbers in the overlay
+  (visualization only — it drives no rally decision).
 
-**Events** (`bounce.py :: detect_events`): candidates = local **height minima**
-near the court plane (bounce) + sharp court-depth-velocity reversals (hit).
-Classification: reversal at surface level away from a player → **bounce**; at
-height or at a player → **hit**; a gravity check rejects noise minima.
-**Phantom-out guard:** an out-of-court bounce is only emitted if it's a **real
-(observed), height-known** detection landing within `out_max_dist_m` of a line —
-otherwise it's boundary noise and is discarded (this killed the false "bounce
-OUT" markers). A trained **rally_end model** (model registry) overrides the
-heuristic when a version is promoted to `live`.
+**Bounce/hit markers** (`bounce.py :: detect_events`, `model=None`): local
+**height minima** near the court plane (bounce) + sharp court-depth-velocity
+reversals (hit), with the phantom-out guard (an out-of-court bounce is emitted
+only for a **real, height-known** detection within `out_max_dist_m` of a line).
+These are written to the overlay **purely as visual annotations** — they no
+longer drive any rally end. The trained `rally_end` model is **not** loaded.
 
-**Rally decisions** (`rally_logic.py :: detect_rallies`) — **multi-rally**: loops
-`serve → terminal end → next serve` within a window, so it emits >1 rally if
-Pass 1 under-segmented. The first rally may fall back to the window edge; every
-**subsequent** rally requires a confirmed serve-formation (not just a fast ball),
-so dead time never becomes a phantom rally.
-- **Serve start** (`_find_start`): first fast ball motion (`serve_speed_mps`)
-  originating **behind a baseline** (`serve_behind_margin_m`) with a serve-
-  formation sighting within `serve_formation_lookback_s`. `start_source` is
-  reported honestly as `serve` / `fast_ball` / `coarse_gate`. Hook for a trained
-  `serve_start` model is threaded (not yet trained).
-- **Rally end** (`detect_end`): terminal event = ball becomes unplayable —
-  **bounce_out** (guarded by `out_max_dist_m` + observed + height_known),
-  **double_bounce**, or **net_fail**. Each candidate end is confirmed/vetoed by
-  `confirmed_by_players` (if players are still moving fast within
-  `confirm_window_s`, veto). No terminal event → **coarse_gate** fallback (raw
-  window edge). *(On the current footage most ends fall back to coarse_gate —
-  the far-ball problem; the trained rally_end model is the intended fix.)*
-- **Serve-vs-pass rejection** (`p2_reject_passes`): a coarse-gate candidate that
-  was **not returned** — no second net crossing AND no hit after the serve — is
-  dropped as a between-point **pass**, not a serve.
-- **Learned offset corrections:** `start_offset_frames` / `end_offset_frames`
-  are added to the output boundaries (clipped to the window).
+**No rally decisions.** `rally_logic.detect_rallies`, `detect_start`/`detect_end`,
+serve-vs-pass rejection, and the `start_offset_frames`/`end_offset_frames`
+corrections are **not called** (the code remains in the tree, disabled). Pass 2
+writes no `rally_labels`.
 
-**Output meta** per pass2 rally: `end_event`, `confirmed`, `start_source`,
-`end_source`, `raw_start`/`raw_end`/`ws`/`we`, `code_version`. Per-frame trace
-(players, ball, world x/y/height, pspeed, events) → `pass2` overlay, which feeds
-discrepancy reports and model training.
+**Output** per window: the per-frame `pass2` overlay only (players, ball, world
+x/y/height, pspeed, bounce/hit events). This still feeds discrepancy-report
+feature traces and future model training; it just carries no boundary decision.
 
 ---
 
@@ -133,10 +143,14 @@ discrepancy reports and model training.
     p1_merge_gap_s, p1_cross_window_s, p1_min_rally_s, p1_spot_check_s`
   - Pass 2 ball/bounce: `bounce_max_height_m, hit_min_height_m, player_radius_m,
     min_event_gap_s, net_fail_height_m, out_max_dist_m`
-  - Rally start/end: `serve_speed_mps, serve_behind_margin_m,
+  - Rally start/end **(currently INERT — the rally-decision code that reads
+    these isn't called):** `serve_speed_mps, serve_behind_margin_m,
     serve_formation_lookback_s, confirm_window_s, player_active_mps,
     p2_reject_passes`
-  - Learned boundary bias: `start_offset_frames, end_offset_frames`
+  - Learned boundary bias **(currently INERT — applied nowhere while Pass 2 does
+    not refine boundaries):** `start_offset_frames, end_offset_frames`
+  - **Active recall levers now:** `p1_pad_s`, `p1_merge_gap_s`, `p1_min_rally_s`,
+    `p1_cross_window_s` shape how loose/generous the Pass 1 windows are.
 - **`rally_end` model** (BounceGRU) — model registry (`learning/model_registry.py`),
   shadow→live; used by `detect_events` when promoted. Trained by
   `backend/scripts/train_bounce.py`. Cold-start guard: needs ≥3 labeled clips to

@@ -12,11 +12,14 @@ columns), which unlocks ball height reconstruction from apparent size.
 """
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 
 import cv2
 import numpy as np
+
+log = logging.getLogger("cv.court")
 
 COURT_W = 6.096       # metres (20 ft)
 COURT_L = 13.4112     # metres (44 ft)
@@ -117,7 +120,18 @@ class CameraModel:
             if v > 0:
                 f_sq.append(v)
         # Fallback: a generic ~60 deg horizontal FOV if constraints degenerate.
-        f = math.sqrt(np.mean(f_sq)) if f_sq else img_w * 0.9
+        if f_sq:
+            f = math.sqrt(np.mean(f_sq))
+        else:
+            f = img_w * 0.9
+            # Both orthogonality constraints degenerated (near fronto-parallel or
+            # ill-conditioned corner clicks). The focal is a guess, so any ball
+            # HEIGHT reconstructed from apparent size will be systematically off —
+            # surface it rather than fail silently.
+            log.warning(
+                "court focal self-calibration degenerate; using fallback f=%.1f px "
+                "(img_w=%d) — ball height reconstruction will be unreliable. "
+                "Re-check the clicked court corners.", f, img_w)
 
         K = np.array([[f, 0, cx], [0, f, cy], [0, 0, 1.0]])
         Kinv = np.linalg.inv(K)
