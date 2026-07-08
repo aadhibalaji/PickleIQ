@@ -20,6 +20,12 @@ export default function Workspace({ videoId, onBack }) {
   const [clickMode, setClickMode] = useState(null) // {type:'calib', name, onPick}
   const [flash, setFlash] = useState('')
   const [overlayNonce, setOverlayNonce] = useState(0) // bumps overlay refetch while processing
+  // Ground-truth marking mode (ball events). gt.step drives the keyboard state
+  // machine: idle -> type (B/H/N after a click) -> inout (bounce confirm), or
+  // edit (an existing mark was clicked).
+  const [gtMode, setGtMode] = useState(false)
+  const [marks, setMarks] = useState([])
+  const [gt, setGt] = useState({ step: 'idle', pending: null, choice: 'in', sel: null })
   const wasActiveRef = useRef(false)
   const playerRef = useRef(null)
 
@@ -62,9 +68,117 @@ export default function Workspace({ videoId, onBack }) {
   const seek = (f) => playerRef.current?.seekFrame(f)
   const note = (msg) => { setFlash(msg); setTimeout(() => setFlash(''), 2500) }
 
+  // ---- ground-truth marking -------------------------------------------------
+  const loadMarks = useCallback(() => {
+    api.listBallCorrections(videoId).then(setMarks).catch(() => {})
+  }, [videoId])
+  useEffect(() => { loadMarks() }, [loadMarks])
+
+  const gtReset = () => setGt({ step: 'idle', pending: null, choice: 'in', sel: null })
+
+  const saveMark = useCallback((eventType, inOut) => {
+    setGt((g) => {
+      if (!g.pending) return g
+      // No flash note on success — the new diamond, list row, and count are
+      // the confirmation; a popup on every mark shifts the layout mid-flow.
+      api.addBallCorrection(videoId, {
+        frame: g.pending.frame, x: g.pending.x, y: g.pending.y,
+        event_type: eventType, in_out: inOut || null,
+      }).then(loadMarks)
+        .catch((e) => note(`save failed: ${e.message}`))
+      return { step: 'idle', pending: null, choice: 'in', sel: null }
+    })
+  }, [videoId, loadMarks])
+
+  const editMark = useCallback((patch) => {
+    setGt((g) => {
+      if (!g.sel) return g
+      api.updateBallCorrection(g.sel.id, patch)
+        .then(loadMarks)
+        .catch((e) => note(`edit failed: ${e.message}`))
+      return { ...g, step: 'idle', sel: null }
+    })
+  }, [loadMarks])
+
   const onCanvasClick = async (x, y) => {
+    if (gtMode) {
+      playerRef.current?.video()?.pause()
+      const f = playerRef.current?.currentFrame() ?? frame
+      // Click on an existing mark (same-ish frame, close in px) selects it.
+      const hit = marks.find((m) => Math.abs(m.frame - f) <= 2
+        && Math.hypot(m.x - x, m.y - y) < 16)
+      if (gt.step === 'edit' && gt.sel && !hit) {
+        // Click while a mark is selected = move it here (to the current frame).
+        editMark({ x, y, frame: f })
+        return
+      }
+      if (hit) {
+        setGt({ step: 'edit', pending: null, choice: hit.in_out || 'in', sel: hit })
+        return
+      }
+      const pending = { frame: f, x, y, proj: null }
+      setGt({ step: 'type', pending, choice: 'in', sel: null })
+      // In/out suggestion fetched in the background so it's ready by the time
+      // B is pressed; bounces are rare enough that a race just means the
+      // prompt shows "…" for a beat.
+      api.projectPoint(videoId, x, y).then((p) => {
+        setGt((g) => (g.pending?.frame === f && g.pending?.x === x
+          ? { ...g, pending: { ...g.pending, proj: p.calibrated ? p : null },
+              choice: p.calibrated ? p.suggested : 'in' }
+          : g))
+      }).catch(() => {})
+      return
+    }
     if (clickMode?.type === 'calib') clickMode.onPick?.(x, y)
   }
+
+  // Keyboard: frame stepping + the mark state machine. Active only in marking
+  // mode and never while typing in a form field.
+  useEffect(() => {
+    if (!gtMode) return undefined
+    const onKey = (e) => {
+      const t = e.target
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
+      const step = (d) => {
+        e.preventDefault()
+        const v = playerRef.current?.video()
+        if (v) v.pause()
+        const f = Math.max(0, (playerRef.current?.currentFrame() ?? 0) + d)
+        playerRef.current?.seekFrame(f)
+      }
+      if (e.key === 'ArrowLeft') return step(e.shiftKey ? -10 : -1)
+      if (e.key === 'ArrowRight') return step(e.shiftKey ? 10 : 1)
+      const k = e.key.toLowerCase()
+      if (e.key === 'Escape') { e.preventDefault(); gtReset(); return }
+      if (gt.step === 'type') {
+        if (k === 'b') {
+          e.preventDefault()
+          setGt((g) => ({ ...g, step: 'inout', choice: g.pending?.proj?.suggested || 'in' }))
+        } else if (k === 'h') { e.preventDefault(); saveMark('hit') }
+        else if (k === 'n') { e.preventDefault(); saveMark('position') }
+      } else if (gt.step === 'inout') {
+        if (e.key === 'Enter') { e.preventDefault(); saveMark('bounce', gt.choice) }
+        else if (k === 'x') {
+          e.preventDefault()
+          setGt((g) => ({ ...g, choice: g.choice === 'in' ? 'out' : 'in' }))
+        }
+      } else if (gt.step === 'edit' && gt.sel) {
+        if (k === 'b') { e.preventDefault(); editMark({ event_type: 'bounce' }) }
+        else if (k === 'h') { e.preventDefault(); editMark({ event_type: 'hit' }) }
+        else if (k === 'n') { e.preventDefault(); editMark({ event_type: 'position' }) }
+        else if (k === 'x' && gt.sel.event_type === 'bounce') {
+          e.preventDefault()
+          editMark({ in_out: gt.sel.in_out === 'in' ? 'out' : 'in' })
+        } else if (k === 'd' || e.key === 'Delete') {
+          e.preventDefault()
+          api.deleteBallCorrection(gt.sel.id).then(loadMarks)
+          gtReset()
+        }
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [gtMode, gt, saveMark, editMark, loadMarks, videoId])
 
   if (!video) return <div className="muted">Loading…</div>
 
@@ -94,8 +208,16 @@ export default function Workspace({ videoId, onBack }) {
           <button onClick={onBack}>← Clips</button>
           <h1 style={{ margin: 0 }}>{video.filename}</h1>
         </div>
-        <div className="muted">
-          {video.fps?.toFixed(2)} fps · {video.frame_count} frames · params v{video.learned_params_version ?? '—'}
+        <div className="row">
+          <span className="muted">
+            {video.fps?.toFixed(2)} fps · {video.frame_count} frames · params v{video.learned_params_version ?? '—'}
+          </span>
+          <button className={gtMode ? 'active' : ''}
+                  style={gtMode ? { borderColor: '#c3ce4a', color: '#c3ce4a' } : undefined}
+                  onClick={() => { setGtMode((m) => !m); gtReset(); playerRef.current?.video()?.pause() }}
+                  title="Mark ball ground truth: click the ball, then B/H/N. Arrows step frames.">
+            {gtMode ? '✓ Marking ground truth' : '🎯 Mark ground truth'}
+          </button>
         </div>
       </div>
 
@@ -139,14 +261,24 @@ export default function Workspace({ videoId, onBack }) {
         meta={video}
         overlaySource={overlaySource}
         courtLines={courtLines}
-        clickMode={clickMode}
+        clickMode={gtMode ? { type: 'gt' } : clickMode}
         onCanvasClick={onCanvasClick}
         onFrame={setFrame}
         overlayNonce={overlayNonce}
+        gtMarks={gtMode ? marks : null}
+        pendingMark={gt.pending}
+        selectedMarkId={gt.sel?.id}
       />
       <div style={{ marginTop: 8 }}>
-        <Timeline frameCount={video.frame_count || 1} frame={frame} tracks={tracks} onSeek={seek} />
+        <Timeline frameCount={video.frame_count || 1} frame={frame} tracks={tracks}
+                  marks={gtMode ? marks : null} onSeek={seek} />
       </div>
+
+      {gtMode && (
+        <GroundTruthPanel gt={gt} marks={marks} frame={frame} fps={video.fps || 30}
+                          onSeek={seek}
+                          onDelete={(id) => api.deleteBallCorrection(id).then(loadMarks)} />
+      )}
 
       <div className="tabs">
         {TABS.map(([id, label]) => (
@@ -213,6 +345,73 @@ function PassTab({ source, rallies, fps, onSeek }) {
           {rallies.length === 0 && <tr><td colSpan="5" className="muted">No rallies yet.</td></tr>}
         </tbody>
       </table>
+    </div>
+  )
+}
+
+// Prompt bar + mark list for ground-truth marking mode. The prompt mirrors the
+// keyboard state machine in Workspace so the next keypress is always spelled
+// out on screen.
+function GroundTruthPanel({ gt, marks, frame, fps, onSeek, onDelete }) {
+  let prompt
+  if (gt.step === 'type') {
+    prompt = <b>B = bounce · H = hit · N = ball position only · Esc = cancel</b>
+  } else if (gt.step === 'inout') {
+    const p = gt.pending?.proj
+    prompt = (
+      <b>
+        Bounce — homography says {p ? p.suggested.toUpperCase() : '…'}
+        {p ? ` (${p.line_dist_m}m from nearest line)` : ''} → saving as{' '}
+        <span style={{ color: gt.choice === 'in' ? '#00e5ff' : '#ff5470' }}>
+          {gt.choice.toUpperCase()}
+        </span>
+        {' '}· Enter = save · X = flip · Esc = cancel
+      </b>
+    )
+  } else if (gt.step === 'edit' && gt.sel) {
+    prompt = (
+      <b>
+        Editing {gt.sel.event_type} @ f{gt.sel.frame} — B/H/N = retype
+        {gt.sel.event_type === 'bounce' ? ' · X = flip in/out' : ''} · click = move here ·
+        D = delete · Esc = done
+      </b>
+    )
+  } else {
+    prompt = <span>Click the ball to mark it · ←/→ = ±1 frame · Shift+←/→ = ±10 · click a diamond to edit</span>
+  }
+  const disagreements = marks.filter((m) => m.disagree).length
+  return (
+    <div className="panel" style={{ padding: 10, borderColor: '#c3ce4a' }}>
+      <div className="row spread">
+        <div>{prompt}</div>
+        <div className="muted">
+          {marks.length} mark{marks.length === 1 ? '' : 's'} on this clip
+          {disagreements > 0 && ` · ${disagreements} in/out disagreement${disagreements === 1 ? '' : 's'} ⚠`}
+        </div>
+      </div>
+      {marks.length > 0 && (
+        <table style={{ marginTop: 8, width: '100%' }}>
+          <thead>
+            <tr><th>Frame</th><th>Type</th><th>In/out</th><th>Court (m)</th><th></th><th></th></tr>
+          </thead>
+          <tbody>
+            {marks.map((m) => (
+              <tr key={m.id} style={m.frame === frame ? { background: '#1c2530' } : undefined}>
+                <td>{fmt(m.frame, fps)}</td>
+                <td>{m.event_type}</td>
+                <td>
+                  {m.event_type === 'bounce'
+                    ? <>{m.in_out}{m.disagree ? <span title={`homography suggested ${m.in_out_suggested}`}> ⚠</span> : ''}</>
+                    : '—'}
+                </td>
+                <td>{m.court_x != null ? `${m.court_x.toFixed(2)}, ${m.court_y.toFixed(2)}` : '—'}</td>
+                <td><button onClick={() => onSeek(m.frame)}>▶</button></td>
+                <td><button className="danger" onClick={() => onDelete(m.id)}>✕</button></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
     </div>
   )
 }

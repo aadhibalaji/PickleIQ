@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import math
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -263,6 +264,15 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                     c = selector.select(f, cands, boxes, feet)
                     if c:
                         det = (c.x, c.y, c.diameter_px, c.score)
+                # The filtering layer applies to ANY detector: external/TrackNet
+                # dets pass the same stage 1-2 gates the classical candidates
+                # did above. Manual corrections stay authoritative.
+                if (det is not None and frame_filter is not None
+                        and f not in corrections
+                        and (f in ext_track or tracknet.available)):
+                    cand = SimpleNamespace(x=det[0], y=det[1])
+                    if not frame_filter.filter(f, [cand], [(_key(o), o.box) for o in obs]):
+                        det = None
                 if det:
                     ball_obs.append((f, det[0], det[1], det[2]))
                     if frame_filter is not None:
@@ -321,7 +331,10 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                     gap_frames=int(params.get("ball_arc_gap_frames", 10)),
                     tol_px=float(params.get("ball_arc_tol_px", 6.0)),
                     min_arc_pts=int(params.get("ball_arc_min_pts", 4)),
-                    join_gap=int(params.get("ball_arc_join_gap_frames", 8)))
+                    join_gap=int(params.get("ball_arc_join_gap_frames", 8)),
+                    split_dv_px=float(params.get("ball_arc_split_dv_px", 4.0)),
+                    claim_tol_mult=float(params.get("ball_arc_claim_tol_mult", 2.5)),
+                    max_interp_gap=int(params.get("ball_arc_max_interp_gap", 6)))
                 kept = {p.frame for p in refined.points}
                 for bf, _, _, _ in ball_obs:      # picks the fits rejected
                     if bf not in kept and bf in entries:
@@ -339,7 +352,13 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                     refined.arcs, boxes_by_frame,
                     join_gap=int(params.get("ball_arc_join_gap_frames", 8)),
                     min_angle_deg=float(params.get("ball_event_min_angle_deg", 25.0)),
-                    adjacent_frac=float(params.get("ball_hit_adjacent_frac", 0.30)))
+                    adjacent_frac=float(params.get("ball_hit_adjacent_frac", 0.30)),
+                    vertex_min_px=float(params.get("ball_bounce_vertex_min_px", 4.0)),
+                    plausibility=params.get("ball_bounce_plausibility", 1.0) > 0.5,
+                    vy_frames=int(params.get("ball_bounce_vy_frames", 3)),
+                    vy_min_px=float(params.get("ball_bounce_vy_min_px", 0.5)),
+                    vy_trust_span=int(params.get("ball_bounce_vy_trust_span", 7)),
+                    merge_frames=int(params.get("ball_bounce_merge_frames", 6)))
                 if frame_filter is not None:
                     st = frame_filter.stats
                     log.info(

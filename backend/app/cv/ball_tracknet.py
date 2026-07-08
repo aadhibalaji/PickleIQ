@@ -138,52 +138,108 @@ def load_state(path: Path):
     return { (k[7:] if k.startswith("module.") else k): v for k, v in state.items() }
 
 
+def _openvino_infer(weights: Path):
+    """Convert the torch model to OpenVINO FP16 (once, IR cached next to the
+    weights) and compile it for the Intel Arc GPU — same playbook as pose
+    (players._openvino_pose_dir): torch can't drive the Arc from ultralytics
+    and eager torch-XPU runs this U-Net at ~110 ms/frame; OpenVINO is the
+    production path. Returns infer(x: np.ndarray (1,9,H,W)) -> logits
+    (3,H,W), or None when OpenVINO/GPU is unavailable."""
+    try:
+        import openvino as ov
+
+        core = ov.Core()
+        if not any(d.startswith("GPU") for d in core.available_devices):
+            log.info("OpenVINO present but no GPU device — torch path")
+            return None
+        ir = weights.parent / "tracknet_ov" / (weights.stem.split(".")[0] + ".xml")
+        if not ir.exists():
+            import torch
+
+            model = _build_model()
+            model.load_state_dict(load_state(weights))
+            model.eval()
+            ir.parent.mkdir(parents=True, exist_ok=True)
+            ovm = ov.convert_model(
+                model, example_input=torch.zeros(1, 9, INPUT_H, INPUT_W))
+            ov.save_model(ovm, str(ir))  # FP16 compression by default
+        compiled = core.compile_model(str(ir), "GPU")
+        out_port = compiled.output(0)
+
+        def infer(x: np.ndarray) -> np.ndarray:
+            return compiled({0: x})[out_port][0]
+
+        log.info("TrackNet on OpenVINO GPU (%s)", ir.name)
+        return infer
+    except Exception as exc:  # noqa: BLE001
+        log.warning("OpenVINO TrackNet unavailable (%s) — torch path", exc)
+        return None
+
+
 class TrackNetBall:
     """Sliding 3-frame inference. Returns (x, y, diameter_px, confidence) in
-    ORIGINAL frame pixels, or None per frame when below threshold."""
+    ORIGINAL frame pixels, or None per frame when below threshold.
 
-    def __init__(self, conf_threshold: float = 0.5):
+    `weights` overrides the configured path (used by the eval harness to test
+    a checkpoint regardless of TRACKNET_ENABLED/TRACKNET_WEIGHTS)."""
+
+    def __init__(self, conf_threshold: float = 0.5, weights: Path | str | None = None):
         self.conf_threshold = conf_threshold
         self.model = None
-        path = weights_path()
-        self.available = path is not None
+        self._ov = None
+        self.last_peak: tuple[float, float, float] | None = None  # (x, y, conf) raw argmax
+        path = Path(weights) if weights else weights_path()
+        self.available = path is not None and Path(path).exists()
         if not self.available:
             log.warning(
                 "no TrackNet weights (run backend/scripts/get_tracknet_weights.py "
                 "or set TRACKNET_WEIGHTS) — Pass 2 uses the classical fallback "
                 "ball detector")
             return
-        import torch
+        self._ov = _openvino_infer(Path(path))
+        if self._ov is None:
+            import torch
 
-        self.device = torch_device()
-        self.model = _build_model()
-        self.model.load_state_dict(load_state(path))
-        self.model.eval()
-        try:
-            self.model.to(self.device)
-        except Exception:  # noqa: BLE001 — XPU op gaps etc.
-            log.warning("TrackNet failed to move to %s, using CPU", self.device)
-            self.device = "cpu"
-            self.model.to("cpu")
-        log.info("TrackNet weights loaded from %s (device=%s)", path, self.device)
+            self.device = torch_device()
+            self.model = _build_model()
+            self.model.load_state_dict(load_state(path))
+            self.model.eval()
+            try:
+                self.model.to(self.device)
+            except Exception:  # noqa: BLE001 — XPU op gaps etc.
+                log.warning("TrackNet failed to move to %s, using CPU", self.device)
+                self.device = "cpu"
+                self.model.to("cpu")
+        log.info("TrackNet weights loaded from %s (%s)", path,
+                 "openvino-gpu" if self._ov else f"torch-{self.device}")
 
     def infer_triplet(self, frames_bgr: list[np.ndarray]) -> tuple[float, float, float, float] | None:
         """frames_bgr: 3 consecutive frames, OLDEST FIRST; the prediction is
         read from the last output heatmap (the newest frame)."""
         import cv2
-        import torch
 
-        assert self.model is not None and len(frames_bgr) == 3
+        assert self.available and len(frames_bgr) == 3
         h0, w0 = frames_bgr[0].shape[:2]
         stack = []
         for f in frames_bgr:
             r = cv2.resize(f, (INPUT_W, INPUT_H))
             stack.append(cv2.cvtColor(r, cv2.COLOR_BGR2RGB))
         x = np.concatenate(stack, axis=2).astype(np.float32) / 255.0
-        x = torch.from_numpy(x).permute(2, 0, 1).unsqueeze(0).to(self.device)
-        with torch.no_grad():
-            hm = torch.sigmoid(self.model(x))[0, -1].float().cpu().numpy()
+        x = np.ascontiguousarray(x.transpose(2, 0, 1))[None]
+        if self._ov is not None:
+            logits = self._ov(x)[-1]
+            hm = 1.0 / (1.0 + np.exp(-logits.astype(np.float32)))
+        else:
+            import torch
+
+            with torch.no_grad():
+                xt = torch.from_numpy(x).to(self.device)
+                hm = torch.sigmoid(self.model(xt))[0, -1].float().cpu().numpy()
         conf = float(hm.max())
+        yy0, xx0 = np.unravel_index(int(hm.argmax()), hm.shape)
+        # Raw peak regardless of threshold — diagnostics read this to tell a
+        # true detector miss from a sub-threshold detection.
+        self.last_peak = (float(xx0) * w0 / INPUT_W, float(yy0) * h0 / INPUT_H, conf)
         if conf < self.conf_threshold:
             return None
         yy, xx = np.unravel_index(int(hm.argmax()), hm.shape)

@@ -185,11 +185,63 @@ def project_court(cal_id: str):
 
 
 # ------------------------------------------------------ ball corrections ---
+# ball_corrections doubles as the GROUND-TRUTH mark store for ball events
+# (event_type 'bounce' | 'hit' | 'position'; legacy rows with NULL event_type
+# are plain position marks). Court projection and the homography's in/out
+# suggestion are computed HERE at save time — one source of truth — and the
+# human's final call is stored next to the suggestion, with a disagree flag
+# when they differ (those flag calibration error near lines).
+
+_EVENT_TYPES = ("bounce", "hit", "position")
+
+
+def _project_point(video_id: str, x: float, y: float) -> dict | None:
+    """Court-plane projection + in/out suggestion for an image point.
+    Returns None when the clip has no calibration."""
+    from ..pipeline import effective_calibration
+    H, _cam, _ = effective_calibration(video_id)
+    if H is None:
+        return None
+    cxy = court.img_to_court(H, np.array([[float(x), float(y)]]))[0]
+    cx, cy = float(cxy[0]), float(cxy[1])
+    inside = bool(court.in_court(np.array([[cx, cy]]))[0])
+    if inside:  # distance to the NEAREST line (how marginal the call is)
+        dist = min(cx, court.COURT_W - cx, cy, court.COURT_L - cy)
+    else:
+        dx = max(0.0, -cx, cx - court.COURT_W)
+        dy = max(0.0, -cy, cy - court.COURT_L)
+        dist = (dx * dx + dy * dy) ** 0.5
+    return {"court_x": round(cx, 3), "court_y": round(cy, 3),
+            "suggested": "in" if inside else "out",
+            "line_dist_m": round(dist, 3)}
+
+
+def _gt_fields(video_id: str, body) -> tuple:
+    """(court_x, court_y, in_out, in_out_suggested, disagree) for a mark."""
+    proj = _project_point(video_id, body.x, body.y)
+    suggested = proj["suggested"] if proj else None
+    in_out = body.in_out if body.event_type == "bounce" else None
+    disagree = int(bool(in_out and suggested and in_out != suggested))
+    return (proj["court_x"] if proj else None, proj["court_y"] if proj else None,
+            in_out, suggested if body.event_type == "bounce" else None, disagree)
+
+
 class BallCorrectionIn(BaseModel):
     frame: int
     x: float
     y: float
+    event_type: str = "position"   # 'bounce' | 'hit' | 'position'
+    in_out: str | None = None      # human call, bounces only ('in' | 'out')
     scope: str = "clip_local"  # spot-corrections are clip-local by design
+
+
+@router.get("/videos/{video_id}/project_point")
+def project_point(video_id: str, x: float, y: float):
+    """Live in/out suggestion for the marking UI (before the mark is saved)."""
+    proj = _project_point(video_id, x, y)
+    if proj is None:
+        return {"calibrated": False}
+    return {"calibrated": True, **proj}
 
 
 @router.get("/videos/{video_id}/ball_corrections")
@@ -198,19 +250,84 @@ def list_ball_corrections(video_id: str):
         rows = con.execute(
             "SELECT * FROM ball_corrections WHERE video_id=? ORDER BY frame", (video_id,)
         ).fetchall()
-    return db.rows_to_dicts(rows)
+    out = db.rows_to_dicts(rows)
+    for r in out:  # legacy rows predate event_type — they are position marks
+        if not r.get("event_type"):
+            r["event_type"] = "position"
+    return out
 
 
 @router.post("/videos/{video_id}/ball_corrections")
 def add_ball_correction(video_id: str, body: BallCorrectionIn):
+    if body.event_type not in _EVENT_TYPES:
+        raise HTTPException(400, f"event_type must be one of {_EVENT_TYPES}")
+    if body.event_type == "bounce" and body.in_out not in ("in", "out"):
+        raise HTTPException(400, "a bounce mark needs in_out ('in' or 'out')")
+    court_x, court_y, in_out, suggested, disagree = _gt_fields(video_id, body)
     cid = db.new_id()
+    try:
+        with db.connect() as con:
+            con.execute(
+                "INSERT INTO ball_corrections (id, video_id, frame, x, y, scope,"
+                " created_at, event_type, court_x, court_y, in_out,"
+                " in_out_suggested, disagree) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (cid, video_id, body.frame, body.x, body.y, body.scope, db.now(),
+                 body.event_type, court_x, court_y, in_out, suggested, disagree),
+            )
+    except Exception as exc:  # pre-migration schema: fail with instructions
+        if "no column" in str(exc) or "has no column" in str(exc):
+            raise HTTPException(
+                400, "ball_corrections is missing the ground-truth columns — "
+                     "apply the schema migration (see db.py migration notes) "
+                     "before using the marking tool") from exc
+        raise
+    return {"id": cid, "event_type": body.event_type, "court_x": court_x,
+            "court_y": court_y, "in_out": in_out, "in_out_suggested": suggested,
+            "disagree": disagree}
+
+
+class BallCorrectionUpdate(BaseModel):
+    x: float | None = None
+    y: float | None = None
+    frame: int | None = None
+    event_type: str | None = None
+    in_out: str | None = None
+
+
+@router.put("/ball_corrections/{correction_id}")
+def update_ball_correction(correction_id: str, body: BallCorrectionUpdate):
+    """Edit a mark in place; court projection / suggestion / disagree are
+    recomputed from the (possibly moved) pixel position."""
+    with db.connect() as con:
+        row = con.execute("SELECT * FROM ball_corrections WHERE id=?",
+                          (correction_id,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "mark not found")
+    merged = BallCorrectionIn(
+        frame=body.frame if body.frame is not None else row["frame"],
+        x=body.x if body.x is not None else row["x"],
+        y=body.y if body.y is not None else row["y"],
+        event_type=body.event_type or (row["event_type"] if "event_type" in row.keys()
+                                       and row["event_type"] else "position"),
+        in_out=body.in_out if body.in_out is not None
+        else (row["in_out"] if "in_out" in row.keys() else None),
+    )
+    if merged.event_type not in _EVENT_TYPES:
+        raise HTTPException(400, f"event_type must be one of {_EVENT_TYPES}")
+    court_x, court_y, in_out, suggested, disagree = _gt_fields(row["video_id"], merged)
+    if merged.event_type == "bounce" and in_out not in ("in", "out"):
+        in_out = suggested  # retyped to bounce without a call: default to suggestion
+        disagree = 0
     with db.connect() as con:
         con.execute(
-            "INSERT INTO ball_corrections (id, video_id, frame, x, y, scope, created_at)"
-            " VALUES (?,?,?,?,?,?,?)",
-            (cid, video_id, body.frame, body.x, body.y, body.scope, db.now()),
+            "UPDATE ball_corrections SET frame=?, x=?, y=?, event_type=?,"
+            " court_x=?, court_y=?, in_out=?, in_out_suggested=?, disagree=?"
+            " WHERE id=?",
+            (merged.frame, merged.x, merged.y, merged.event_type, court_x,
+             court_y, in_out, suggested, disagree, correction_id),
         )
-    return {"id": cid}
+    return {"id": correction_id, "event_type": merged.event_type,
+            "in_out": in_out, "in_out_suggested": suggested, "disagree": disagree}
 
 
 @router.delete("/ball_corrections/{correction_id}")

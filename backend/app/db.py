@@ -167,6 +167,16 @@ CREATE TABLE IF NOT EXISTS model_registry (
 _ADDED_COLUMNS = [
     ("videos", "last_labels_hash", "TEXT"),
     ("videos", "model_versions", "TEXT"),
+    # Ground-truth ball-event marks (viewer marking mode). NULL event_type =
+    # legacy row = plain position mark. in_out is the human's call on a bounce;
+    # in_out_suggested is what the homography said at save time; disagree=1
+    # rows flag likely calibration error near lines.
+    ("ball_corrections", "event_type", "TEXT"),
+    ("ball_corrections", "court_x", "REAL"),
+    ("ball_corrections", "court_y", "REAL"),
+    ("ball_corrections", "in_out", "TEXT"),
+    ("ball_corrections", "in_out_suggested", "TEXT"),
+    ("ball_corrections", "disagree", "INTEGER DEFAULT 0"),
 ]
 
 

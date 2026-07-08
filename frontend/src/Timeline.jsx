@@ -2,10 +2,15 @@ import React from 'react'
 
 // Multi-track rally timeline over the original video's frame axis.
 // tracks: [{ name, color, spans: [{start_frame, end_frame}] }]
-export default function Timeline({ frameCount, frame, tracks, onSeek }) {
+// marks (optional): ground-truth ball marks [{frame, event_type}] drawn as a
+// dot row so coverage is visible at a glance while marking.
+const MARK_COLORS = { bounce: '#00e5ff', hit: '#e5a53a', position: '#c3ce4a' }
+
+export default function Timeline({ frameCount, frame, tracks, marks, onSeek }) {
   const W = 1200
   const rowH = 22
-  const H = tracks.length * rowH + 26
+  const markRow = marks?.length ? 12 : 0
+  const H = tracks.length * rowH + markRow + 26
   const x = (f) => (f / Math.max(frameCount, 1)) * W
 
   const seek = (e) => {
@@ -29,6 +34,12 @@ export default function Timeline({ frameCount, frame, tracks, onSeek }) {
             </rect>
           ))}
         </g>
+      ))}
+      {marks?.length > 0 && marks.map((m, i) => (
+        <circle key={m.id || i} cx={x(m.frame)} cy={tracks.length * rowH + 6} r="3"
+                fill={MARK_COLORS[m.event_type] || MARK_COLORS.position} opacity="0.9">
+          <title>{`${m.event_type || 'position'} @ f${m.frame}`}</title>
+        </circle>
       ))}
       <line x1={x(frame)} x2={x(frame)} y1="0" y2={H - 14} stroke="#e8edf2" strokeWidth="1.5" />
       <text x={Math.min(x(frame) + 4, W - 60)} y={H - 2} fill="#e8edf2" fontSize="11">f {frame}</text>

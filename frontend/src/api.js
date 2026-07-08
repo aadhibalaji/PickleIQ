@@ -54,6 +54,12 @@ export const api = {
     fetch(`/api/videos/${id}/ball_corrections`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
     }).then(j),
+  updateBallCorrection: (cid, body) =>
+    fetch(`/api/ball_corrections/${cid}`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    }).then(j),
+  deleteBallCorrection: (cid) => fetch(`/api/ball_corrections/${cid}`, { method: 'DELETE' }).then(j),
+  projectPoint: (id, x, y) => fetch(`/api/videos/${id}/project_point?x=${x}&y=${y}`).then(j),
 
   generateReport: (id, aiSource) =>
     fetch(`/api/videos/${id}/report`, {

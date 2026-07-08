@@ -67,14 +67,38 @@ DEFAULTS: dict[str, Any] = {
     "ball_box_persist_px": 12.0,   # box-relative match radius for that persistence check
     "ball_foot_zone_frac": 0.25,   # bottom fraction of a player box = feet, always reject
     "ball_arc_split_deg": 55.0,    # direction change that splits the track into arcs
+    "ball_arc_split_dv_px": 4.0,   # min velocity-vector change (px/frame) for a split —
+                                   # angle alone shreds slow/noisy far-court shots
     "ball_arc_min_speed_px": 1.5,  # min px/frame both sides of a split must move
+    # Arc-stage values are set for the TRACKNET detector (the production path
+    # since 2026-07-07): its dense track lets the stricter pre-tuning values
+    # hold — measured on the held-out clip they keep the same bounce recall
+    # with true-FP precision 50% vs 33% against the looser values (min_pts 3,
+    # tol 9, gap/join 15, claim 3.0) that the classical fallback's short
+    # detection bursts needed. If you must run the classical detector as the
+    # primary again, those looser values recover its coverage.
     "ball_arc_gap_frames": 10,     # time gap that always splits arcs
     "ball_arc_tol_px": 6.0,        # RANSAC inlier tolerance around the arc fit
     "ball_arc_min_pts": 4,         # arcs smaller than this are fragments (noise unless
-                                   # temporally adjacent to a real arc)
-    "ball_arc_join_gap_frames": 8, # max junction gap for events / fragment continuity
+                                   # an adjacent arc extrapolates to them); <5-point
+                                   # arcs additionally need ball-like travel
+    "ball_arc_join_gap_frames": 8,  # max junction gap for events / fragment continuity
+    "ball_arc_claim_tol_mult": 2.5,  # rescue tolerance (x tol_px) for off-arc points
+                                   # against an adjacent arc's extrapolation
+    "ball_arc_max_interp_gap": 6,  # longest hole (frames) the arc fit may fill —
+                                   # long fills measured 286px median error vs GT marks
     "ball_event_min_angle_deg": 25.0,  # junction turns shallower than this = same shot
     "ball_hit_adjacent_frac": 0.30,    # box expansion for 'at/near a player' = hit
+    "ball_bounce_vertex_min_px": 4.0,  # min descend+ascend depth of a within-arc
+                                   # y-maximum to count as a swallowed bounce
+    "ball_bounce_plausibility": 1.0,  # bounce junctions must arrive descending and
+                                   # leave ascending (kills ghost-turn FPs); 0 = off
+    "ball_bounce_vy_frames": 3,    # frames each side of a junction to average vy over
+    "ball_bounce_vy_min_px": 0.5,  # min |vy| (px/frame) for the descend/ascend test
+    "ball_bounce_vy_trust_span": 7,  # arc frames needed before its vy estimate may
+                                   # VETO a bounce (short stubs abstain — their
+                                   # fitted vy wrongly rejected 2 real bounces)
+    "ball_bounce_merge_frames": 6, # bounce events closer than this merge into one
     # ---- Rally start: serve-receive formation ------------------------------
     "require_serve_receive": 1.0,  # 1 = a rally may only start from a proper serve-receive
                                    # formation (server + diagonal receiver both behind their
@@ -123,10 +147,16 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "ball_max_speed_mph": (30.0, 120.0), "ball_speed_headroom": (1.0, 3.0),
     "ball_box_persist_frames": (2, 10), "ball_box_persist_px": (4.0, 40.0),
     "ball_foot_zone_frac": (0.0, 0.5),
-    "ball_arc_split_deg": (20.0, 90.0), "ball_arc_min_speed_px": (0.5, 10.0),
+    "ball_arc_split_deg": (20.0, 90.0), "ball_arc_split_dv_px": (1.0, 20.0),
+    "ball_arc_min_speed_px": (0.5, 10.0),
     "ball_arc_gap_frames": (3, 30), "ball_arc_tol_px": (2.0, 20.0),
     "ball_arc_min_pts": (3, 10), "ball_arc_join_gap_frames": (2, 20),
+    "ball_arc_claim_tol_mult": (1.0, 5.0), "ball_arc_max_interp_gap": (1, 30),
     "ball_event_min_angle_deg": (10.0, 90.0), "ball_hit_adjacent_frac": (0.0, 1.0),
+    "ball_bounce_vertex_min_px": (1.0, 30.0),
+    "ball_bounce_plausibility": (0.0, 1.0), "ball_bounce_vy_frames": (1, 10),
+    "ball_bounce_vy_min_px": (0.0, 5.0), "ball_bounce_vy_trust_span": (3, 20),
+    "ball_bounce_merge_frames": (2, 15),
     "require_serve_receive": (0.0, 1.0), "serve_baseline_margin_m": (0.0, 2.0),
     "bounce_max_height_m": (0.05, 0.5), "hit_min_height_m": (0.2, 1.2),
     "player_radius_m": (0.5, 2.5), "min_event_gap_s": (0.05, 0.5),
