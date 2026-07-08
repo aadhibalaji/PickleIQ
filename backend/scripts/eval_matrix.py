@@ -21,7 +21,9 @@ from pathlib import Path
 import numpy as np
 
 BACKEND = Path(__file__).resolve().parents[1]
-PY = BACKEND / ".venv" / "Scripts" / "python.exe"
+# Run child evals with the SAME interpreter running this script (the old
+# hardcoded .venv/Scripts/python.exe was Windows-only and broke elsewhere).
+PY = Path(sys.executable)
 
 # Marked clips (Second 3 mins = tuning clip, clip #1 re-upload = held-out).
 DEFAULT_VIDEOS = ["760f1e0e95d048fc9ec20ce4c61ccd35",

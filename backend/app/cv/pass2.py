@@ -76,6 +76,13 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
         raise RuntimeError(
             "Pass 2 needs a court calibration (homography). Calibrate the "
             "court corners in the labeling tab, then hit Reprocess.")
+    if cam.focal_degenerate:
+        # Degenerate focal self-calibration = every ball height this run is
+        # built on a guessed focal. Surface it in the job, not just the log.
+        log.warning("pass2 %s: focal self-calibration was DEGENERATE — ball "
+                    "heights are unreliable; re-click the court corners.", video_id)
+        handle.update(message="WARNING: degenerate court calibration — ball "
+                              "heights unreliable (re-click court corners)")
 
     with db.connect() as con:
         vrow = con.execute("SELECT * FROM videos WHERE id=?", (video_id,)).fetchone()
@@ -104,25 +111,28 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
             raw.append([s, e])
 
     # 2. Pad each merged window, clamping the pad to at most half the gap to each
-    #    neighbour so two processing windows never overlap.
+    #    neighbour so two processing windows never overlap. The (gap-1)//2 clamp
+    #    matters: with gap//2 on both sides an EVEN gap made adjacent windows
+    #    share one frame (we_prev == ws_next, both inclusive), so that frame was
+    #    processed twice and its overlay entry written by both windows.
     windows: list[tuple[int, int, int, int]] = []  # ws, we, raw_start, raw_end
     for i, (s, e) in enumerate(raw):
         left_gap = s - raw[i - 1][1] if i > 0 else 10**9
         right_gap = raw[i + 1][0] - e if i < len(raw) - 1 else 10**9
-        ws = max(0, s - min(pad, max(0, left_gap // 2)))
+        ws = max(0, s - min(pad, max(0, (left_gap - 1) // 2)))
         we = min(last_frame, e + min(pad, max(0, right_gap // 2)))
         windows.append((ws, we, s, e))
 
-    # Ball detection/tracking is a switchable stage. OFF right now (PASS2_BALL=0)
-    # so Pass 2 is player-detection only — faster, and safe because the ball
-    # outputs are display-only and drive no rally boundaries. All the ball setup
-    # and per-frame/per-window ball work below is gated on this flag.
+    # Ball detection/tracking is on by default (PASS2_BALL=1). Set PASS2_BALL=0
+    # in .env for a faster player-only Pass 2 run.
     detect_ball = PASS2_BALL_ENABLED
-    # Phase-1 semantic filtering layer (ball_filter.py) on top of whichever
-    # ball source runs: velocity gate + player-box motion logic per frame,
-    # then per-window arc RANSAC + hit/bounce classification. ON by default;
-    # ball_filter_enabled=0 falls back to the previous heuristic unchanged.
-    filter_on = detect_ball and params.get("ball_filter_enabled", 1.0) > 0.5
+    if detect_ball:
+        log.info("pass2 %s: ball detection ON (PASS2_BALL=%s, filter=%s)",
+                 video_id, PASS2_BALL_ENABLED,
+                 params.get("ball_filter_enabled", 0.0) > 0.5)
+    # Optional semantic filtering layer (ball_filter.py): velocity gate, foot-zone
+    # rejection, arc RANSAC. Off by default — set ball_filter_enabled=1 to opt in.
+    filter_on = detect_ball and params.get("ball_filter_enabled", 0.0) > 0.5
 
     overlays.clear(video_id, source)
     # Pass 2 no longer emits its own rally boundaries — clear any stale ones so
@@ -130,7 +140,11 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
     with db.connect() as con:
         con.execute("DELETE FROM rally_labels WHERE video_id=? AND source=?", (video_id, source))
 
-    tracknet = TrackNetBall() if detect_ball else None
+    tracknet = TrackNetBall(
+        conf_threshold=float(params.get("tracknet_conf", 0.5))) if detect_ball else None
+    # Court-region margins for the ball blob filter (were hardcoded 2.5/3.0).
+    ball_mx = float(params.get("ball_court_margin_x_m", 2.5))
+    ball_my = float(params.get("ball_court_margin_y_m", 3.0))
     corrections: dict[int, tuple[float, float]] = {}
     ext_track: dict[int, list] = {}
     if detect_ball:
@@ -160,6 +174,7 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
     pose = PoseTracker(H, track_sequence=True,
                        conf=float(params.get("pose_conf", 0.25)),
                        imgsz=int(params.get("pose_imgsz", 1920)))
+    implied_heights: list[float] = []  # calibration cross-check samples
     for wi, (ws, we, _raw_ws, _raw_we) in enumerate(windows):
         pose.new_sequence()
         if detect_ball:
@@ -168,7 +183,9 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                 sat_min=float(params.get("ball_sat_min", 0.0)),
                 val_min=float(params.get("ball_val_min", 0.0)),
                 hue_lo=float(params.get("ball_hue_lo", 0.0)),
-                hue_hi=float(params.get("ball_hue_hi", 180.0)))
+                hue_hi=float(params.get("ball_hue_hi", 180.0)),
+                motion_thresh=int(params.get("ball_motion_thresh", 3.0)),
+                min_circularity=float(params.get("ball_min_circularity", 0.30)))
             # Motion-primary ball selection (see ball_track.py): the raw detector is
             # left PERMISSIVE (no player-box exclusion) so a ball passing over/leaving
             # a player still reaches the selector, which then keeps it only if it fits
@@ -180,7 +197,8 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                 foot_px=float(params.get("ball_foot_suppress_px", 35.0)),
                 hit_speed_px=float(params.get("ball_hit_speed_px", 18.0)),
                 acq_px=float(params.get("ball_acq_px", 90.0)),
-                seed_min_px=float(params.get("ball_seed_min_px", 4.0)),
+                seed_min_px=float(params.get("ball_seed_min_px", 2.0)),
+                suppress_on_player=params.get("ball_suppress_on_player", 1.0) > 0.5,
             )
             frame_filter = BallFrameFilter(
                 H, fps,
@@ -200,6 +218,7 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
         else:
             serve_ok = is_serve_formation
         ball_obs: list[tuple[int, float, float, float | None]] = []
+        src_counts: dict[str, int] = {}  # ball detections per source this window
         players_by_frame: dict[int, list[tuple[float, float]]] = {}
         boxes_by_frame: dict[int, list[tuple[float, float, float, float]]] = {}
         player_speed: dict[int, float] = {}     # frame -> mean player speed m/s
@@ -226,34 +245,67 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
             prev_courts = {_key(o): o.court_xy for o in obs if o.court_xy}
             player_speed[f] = float(np.mean(speeds)) if speeds else 0.0
 
-            if f % max(1, int(fps * 0.5)) == 0 and serve_ok(obs):
-                serve_frames.append(f)
-                pose.assign_numbers_at_serve(obs)
+            if f % max(1, int(fps * 0.5)) == 0:
+                if serve_ok(obs):
+                    serve_frames.append(f)
+                    pose.assign_numbers_at_serve(obs)
+                # Calibration cross-check sample: implied standing-player
+                # height from foot court position + head pixel. Aggregated
+                # after the run — a bad-but-not-degenerate calibration (wrong
+                # self-calibrated focal from imperfect corner clicks) shifts
+                # the whole distribution out of the human band.
+                for o in obs:
+                    if o.court_xy is None:
+                        continue
+                    hgt, resid = court.implied_person_height(
+                        cam, o.court_xy, ((o.box[0] + o.box[2]) / 2, o.box[1]))
+                    if resid < 0.5 and not math.isnan(hgt):
+                        implied_heights.append(hgt)
 
             # ---- ball observation ----------------------------------------
             # Priority: manual correction > external track > TrackNet > classical.
-            # Disabled while focusing on player detection (PASS2_BALL=0): Pass 2's
-            # ball outputs are display-only and feed no rally boundaries.
+            # Skipped when PASS2_BALL=0 (player-only Pass 2).
             det = None
+            src = None
             if detect_ball:
-                if f in corrections:
-                    x, y = corrections[f]
-                    det = (x, y, None, 1.0)
-                elif f in ext_track:
-                    ex = ext_track[f]
-                    det = (ex[0], ex[1], ex[2], ex[3] if ex[3] is not None else 0.9)
-                elif tracknet.available:
+                # Keep the temporal state of the ACTIVE lower-priority detector
+                # warm on EVERY frame, even ones covered by corrections or the
+                # external track. Both detectors difference consecutive frames
+                # (TrackNet: 3-frame buffer; classical: 3-frame diff), so
+                # skipping covered frames left them holding non-consecutive
+                # frames and produced garbage on the first frames after every
+                # coverage gap — a real mixed-source continuity bug.
+                raw_cands = None
+                if tracknet.available:
                     frame_buf.append(frame)
                     if len(frame_buf) > 3:
                         frame_buf.pop(0)
+                else:
+                    raw_cands = fallback.update(frame)
+                if f in corrections:
+                    x, y = corrections[f]
+                    det = (x, y, None, 1.0)
+                    src = "corr"
+                elif f in ext_track:
+                    ex = ext_track[f]
+                    det = (ex[0], ex[1], ex[2], ex[3] if ex[3] is not None else 0.9)
+                    src = "ext"
+                elif tracknet.available:
                     if len(frame_buf) == 3:
                         r = tracknet.infer_triplet(frame_buf)
                         if r:
-                            det = r
+                            # Diameter is deliberately dropped: TrackNet's
+                            # heatmap blob extent reflects its fixed training
+                            # label sigma, NOT the ball's physical apparent
+                            # size, so feeding it to size->depth produces
+                            # confidently wrong heights. Position + conf only;
+                            # height then honestly degrades to plane projection.
+                            det = (r[0], r[1], None, r[3])
+                            src = "tn"
                 else:
                     # Permissive detector (no box exclusion) + trajectory selector.
-                    cands = [cd for cd in fallback.update(frame)
-                             if _in_court_region(H, cd.x, cd.y)]
+                    cands = [cd for cd in raw_cands
+                             if _in_court_region(H, cd.x, cd.y, ball_mx, ball_my)]
                     if frame_filter is not None:
                         # Stage 1-2 of the filtering layer: velocity gate +
                         # player-box motion logic (foot zone / persistent blobs).
@@ -264,17 +316,18 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                     c = selector.select(f, cands, boxes, feet)
                     if c:
                         det = (c.x, c.y, c.diameter_px, c.score)
+                        src = "cls"
                 # The filtering layer applies to ANY detector: external/TrackNet
                 # dets pass the same stage 1-2 gates the classical candidates
                 # did above. Manual corrections stay authoritative.
                 if (det is not None and frame_filter is not None
-                        and f not in corrections
-                        and (f in ext_track or tracknet.available)):
+                        and src in ("ext", "tn")):
                     cand = SimpleNamespace(x=det[0], y=det[1])
                     if not frame_filter.filter(f, [cand], [(_key(o), o.box) for o in obs]):
                         det = None
                 if det:
                     ball_obs.append((f, det[0], det[1], det[2]))
+                    src_counts[src] = src_counts.get(src, 0) + 1
                     if frame_filter is not None:
                         # Whatever source produced the position, it is the
                         # velocity-gate reference for the next frames.
@@ -282,8 +335,7 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                     # The classical path updates the selector inside select(); for
                     # any other source seed the trajectory history so continuity
                     # holds if ball sources mix mid-window.
-                    classical = not (f in corrections or f in ext_track or tracknet.available)
-                    if not classical:
+                    if src != "cls":
                         selector.seed(f, det[0], det[1])
 
             entries[f] = {
@@ -293,6 +345,11 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                      "box": [round(v, 1) for v in o.box],
                      "cxy": [round(o.court_xy[0], 2), round(o.court_xy[1], 2)] if o.court_xy else None,
                      "team": o.team,
+                     # Identity-binding cost margin (identity.py): near zero =
+                     # the re-ID couldn't distinguish this player from their
+                     # teammate this frame, so the displayed number may be
+                     # swapped — surfaced instead of failing silently.
+                     **({"idm": o.id_margin} if o.id_margin is not None else {}),
                      "kp": [[round(x, 1), round(y, 1)] for x, y in o.keypoints]
                            if o.keypoints else None}
                     for o in obs
@@ -303,6 +360,10 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                 entries[f]["ball"] = [round(det[0], 1), round(det[1], 1),
                                       round(det[2], 1) if det[2] else None,
                                       round(det[3], 2)]
+                # Which source produced this point (corr/ext/tn/cls). Without
+                # it a silent fallback (TrackNet missing -> classical) changes
+                # the output statistics with no trace in the stored overlay.
+                entries[f]["src"] = src
             done_frames += 1
             if done_frames % 100 == 0:
                 # update() also raises if the job was cancelled — keeps a
@@ -316,7 +377,7 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
         # court position + height, and mark bounce/hit events for display. The
         # rally-decision code (rally_logic.detect_rallies, learned start/end
         # offsets, serve-vs-pass rejection) is deliberately not called. Skipped
-        # entirely when ball detection is off (PASS2_BALL=0).
+        # skipped when PASS2_BALL=0.
         if detect_ball:
             # Stage 3-4 of the filtering layer (batch, per window): per-shot arc
             # RANSAC that drops off-arc outliers and fills missed frames along
@@ -339,6 +400,7 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                 for bf, _, _, _ in ball_obs:      # picks the fits rejected
                     if bf not in kept and bf in entries:
                         entries[bf].pop("ball", None)
+                        entries[bf].pop("src", None)
                 for p in refined.interpolated:    # fit-filled misses
                     e = entries.get(p.frame)
                     if e is not None:
@@ -346,6 +408,7 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                                      round(p.diameter_px, 1) if p.diameter_px else None,
                                      0.0]
                         e["interp"] = True
+                        e["src"] = "interp"
                 ball_obs = [(p.frame, p.x, p.y, p.diameter_px)
                             for p in refined.points]
                 arc_events = classify_arc_events(
@@ -371,7 +434,9 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                         len(refined.interpolated), len(arc_events))
             track = smooth_track(ball_obs, max_gap=int(fps * 0.4),
                                  gate2=float(params.get("ball_kalman_gate2", 13.8)))
-            world = reconstruct_world(track, cam)
+            world = reconstruct_world(
+                track, cam,
+                height_sigma_max=float(params.get("ball_height_max_sigma_m", 0.35)))
             for w in world:  # feature trace: attach reconstruction to entries
                 e = entries.get(w.frame)
                 if e is not None:
@@ -402,16 +467,49 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                 # Legacy heuristic (ball_filter_enabled=0): height-reversal
                 # bounce/hit detection. Kept purely as visual annotations
                 # (model=None: no trained model drives anything in this pass).
+                # H + observed pixels let bounce positions come from the plane
+                # homography (exact on the floor) instead of noisy size->depth.
                 events = detect_events(world, players_by_frame, params, fps,
-                                       model=None, entries=entries)
+                                       model=None, entries=entries, H=H,
+                                       ball_px={bf: (bx, by)
+                                                for bf, bx, by, _ in ball_obs})
                 for ev in events:
                     e = entries.get(ev.frame)
                     if e is not None:
                         e["evt"] = {"kind": ev.kind, "in": ev.in_court, "side": ev.side,
                                     "cx": round(ev.court_x, 2), "cy": round(ev.court_y, 2)}
         overlays.write_entries(video_id, source, list(entries.values()))
+        if detect_ball:
+            n_ball = sum(1 for e in entries.values() if "ball" in e)
+            # Source mix makes silent fallbacks auditable per window: an
+            # all-"cls" window on a clip that was supposed to use an external
+            # track / TrackNet is a degraded run, and now says so.
+            log.info("pass2 %s w%d: %d frames, %d with ball (sources: %s)",
+                     video_id, wi + 1, len(entries), n_ball,
+                     ", ".join(f"{k}={v}" for k, v in sorted(src_counts.items()))
+                     or "none")
+
+    # Calibration cross-check verdict: standing players must reconstruct to
+    # plausible human heights. Outside the band = the homography+focal pair is
+    # wrong for this clip (bad corner clicks), and every ball height with it.
+    calib_note = ""
+    if len(implied_heights) >= 20:
+        med_h = float(np.median(implied_heights))
+        if not (1.2 <= med_h <= 2.2):
+            calib_note = (f" — WARNING: implied player height {med_h:.2f} m is "
+                          f"outside the human band; calibration is suspect, "
+                          f"re-click the court corners")
+            log.warning("pass2 %s: calibration cross-check FAILED — median "
+                        "implied player height %.2f m (n=%d). Ball heights and "
+                        "far-court positions are unreliable for this clip.",
+                        video_id, med_h, len(implied_heights))
+        else:
+            log.info("pass2 %s: calibration cross-check ok (median implied "
+                     "player height %.2f m, n=%d)", video_id, med_h,
+                     len(implied_heights))
 
     handle.update(progress=1.0,
-                  message=f"Pass 2 done: detection overlays for {len(windows)} window(s)")
+                  message=f"Pass 2 done: detection overlays for {len(windows)} "
+                          f"window(s){calib_note}")
     log.info("pass2 %s: detection overlays for %d windows", video_id, len(windows))
     return []

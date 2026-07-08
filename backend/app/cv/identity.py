@@ -124,9 +124,15 @@ class PlayerIdentityTracker:
         for di, ii in self._match(dets, hists, idents):
             # Reject a poor match only when we can still afford a new slot; once
             # both slots exist, always bind to the best (a 3rd det is noise).
-            if (self._cost(dets[di], hists[di], idents[ii]) > self.MATCH_MAX
-                    and len(idents) < self.MAX_PER_TEAM):
+            bound_cost = self._cost(dets[di], hists[di], idents[ii])
+            if bound_cost > self.MATCH_MAX and len(idents) < self.MAX_PER_TEAM:
                 continue
+            # Confidence of this binding = how much worse the best ALTERNATIVE
+            # slot would have been. A forced bind is otherwise silent — a wrong
+            # number looks exactly like a right one — so expose the margin.
+            alt = [self._cost(dets[di], hists[di], idents[j])
+                   for j in range(len(idents)) if j != ii]
+            dets[di].id_margin = round(min(alt) - bound_cost, 3) if alt else None
             self._update(idents[ii], dets[di], hists[di], frame_idx)
             dets[di].slot = idents[ii].id
             dets[di].number = idents[ii].number

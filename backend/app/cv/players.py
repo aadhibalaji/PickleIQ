@@ -23,6 +23,17 @@ from .device import ultralytics_device
 
 log = logging.getLogger("cv.players")
 
+# Geometry cull (calibrated path): a person whose FOOT projects this far
+# outside the court cannot be a participant — real players stay within a
+# couple of metres of the lines (the near side is bounded by the camera
+# itself). Deliberately wider than the court_xy validity margins below
+# (+-3 m / +-6 m) so it only removes what the homography proves is off this
+# court: neighbouring-court players, spectators, fence-line people. Unlike
+# the hand-tuned image-space EXCLUSION_ZONES it adapts to any framing
+# automatically (it derives from the calibration, which is per-setup anyway).
+GEOM_CULL_X_M = 4.0   # metres beyond either sideline
+GEOM_CULL_Y_M = 8.0   # metres beyond either baseline
+
 
 def _build_model(name: str):
     """Construct a FRESH YOLO-pose model. Each PoseTracker gets its own instance
@@ -85,6 +96,11 @@ class PlayerObs:
     team: str | None = None                 # 'near' | 'far'
     number: int | None = None
     slot: int | None = None                 # persistent match-stable identity id
+    # Identity assignment confidence: cost margin to the best ALTERNATIVE slot
+    # (None when there was no alternative). Near-zero margin = the re-ID could
+    # not tell the two players apart this frame (same-colour kits, crossing) —
+    # surfaced so a possible silent swap is at least detectable downstream.
+    id_margin: float | None = None
 
 
 class PoseTracker:
@@ -183,6 +199,13 @@ class PoseTracker:
             team = None
             if self.H is not None:
                 cxy = court.img_to_court(self.H, np.array([foot]))[0]
+                # Geometry cull: drop people the calibration proves are off
+                # this court entirely (see GEOM_CULL_* above). This catches
+                # what the image-space exclusion triangles miss and keeps
+                # working when the framing changes.
+                if not (-GEOM_CULL_X_M < cxy[0] < court.COURT_W + GEOM_CULL_X_M
+                        and -GEOM_CULL_Y_M < cxy[1] < court.COURT_L + GEOM_CULL_Y_M):
+                    continue
                 # Players stand around the court, not only inside it.
                 if -3 < cxy[0] < court.COURT_W + 3 and -6 < cxy[1] < court.COURT_L + 6:
                     court_xy = (float(cxy[0]), float(cxy[1]))

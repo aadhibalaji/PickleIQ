@@ -57,7 +57,7 @@ class TrajectoryBallSelector:
     def __init__(self, fps: float, gate_px: float = 45.0, accel_px: float = 6.0,
                  foot_px: float = 35.0, hit_speed_px: float = 18.0,
                  acq_px: float = 90.0, seed_min_px: float = 4.0,
-                 max_gap_s: float = 0.5):
+                 max_gap_s: float = 0.5, suppress_on_player: bool = True):
         self.fps = fps
         self.gate = float(gate_px)          # residual radius around the velocity prediction
         self.accel = float(accel_px)        # extra radius per frame^2 of gap
@@ -65,6 +65,11 @@ class TrajectoryBallSelector:
         self.hit_speed = float(hit_speed_px)  # px/frame that overrides foot suppression
         self.acq_px = float(acq_px)         # acquisition radius while velocity is unknown
         self.seed_min = float(seed_min_px)  # min px/frame a cold-start seed must move
+        # When False, candidates on a player box / foot are NOT suppressed. The
+        # weak classical detector's few blobs cluster near players on some clips,
+        # so suppression can reject the entire track — loosen it to recover a
+        # (noisier) track when a stronger detector isn't available.
+        self.suppress_on_player = bool(suppress_on_player)
         self.max_gap = max(1, int(fps * max_gap_s))
         self.hist: deque[_Pt] = deque(maxlen=5)
         # Cold-start acquisition state: the PREVIOUS frame's off-player candidate
@@ -119,7 +124,8 @@ class TrajectoryBallSelector:
             return self._cold_start(frame, cands, boxes, feet)
         best, best_s = None, -1e18
         for c in cands:
-            on_player = _on_player(c.x, c.y, boxes, feet, self.foot)
+            on_player = (self.suppress_on_player
+                         and _on_player(c.x, c.y, boxes, feet, self.foot))
             # A blob on a player/foot is only the ball if it's moving fast (a hit
             # or a fly-over). A slow blob on a foot IS a foot — skip it entirely.
             if on_player and not self._fast_from_last(frame, c.x, c.y):
@@ -149,7 +155,8 @@ class TrajectoryBallSelector:
         rejected; the ball, moving fast, is the one that matches. Returns the
         confirming candidate on the promotion frame, else None."""
         pool = [c for c in cands
-                if not _on_player(c.x, c.y, boxes, feet, self.foot)]
+                if not (self.suppress_on_player
+                        and _on_player(c.x, c.y, boxes, feet, self.foot))]
         prev, pf = self._cold_prev, self._cold_prev_f
         # Remember this frame's pool for the next frame's match.
         self._cold_prev, self._cold_prev_f = pool, frame

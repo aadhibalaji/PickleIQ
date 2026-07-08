@@ -453,10 +453,16 @@ def eval_video(v: dict, params: dict, args) -> dict | None:
 
     for ws, we in human:
         ctx = overlay_context(vid, ws, we)
+        # Mirror Pass 2's detector construction EXACTLY (pass2.py): the harness
+        # previously omitted motion_thresh/min_circularity, so it evaluated the
+        # detector at the class defaults (thresh 12, circ 0.35) while production
+        # ran the learned values (3, 0.30) — i.e. it wasn't measuring what ships.
         det_b = MotionBallDetector(
             min_area=2.0, max_area=600.0,
             sat_min=float(params["ball_sat_min"]), val_min=float(params["ball_val_min"]),
-            hue_lo=float(params["ball_hue_lo"]), hue_hi=float(params["ball_hue_hi"]))
+            hue_lo=float(params["ball_hue_lo"]), hue_hi=float(params["ball_hue_hi"]),
+            motion_thresh=int(params.get("ball_motion_thresh", 3.0)),
+            min_circularity=float(params.get("ball_min_circularity", 0.30)))
         sel_b, sel_f = new_selector(), new_selector()
         ff = BallFrameFilter(
             H, fps, max_speed_mph=float(params["ball_max_speed_mph"]),
@@ -569,10 +575,16 @@ def eval_video(v: dict, params: dict, args) -> dict | None:
 
         # ---- events -------------------------------------------------------
         # Baseline: legacy height-heuristic events on the Kalman/world track.
+        # Mirrors Pass 2: size->depth honesty gate + homography-exact bounce
+        # positions, so the harness measures what actually ships.
         track_b = smooth_track(obs_b, max_gap=int(fps * 0.4),
                                gate2=float(params["ball_kalman_gate2"]))
-        for ev in detect_events(reconstruct_world(track_b, cam),
-                                players_by_frame, params, fps):
+        world_b = reconstruct_world(
+            track_b, cam,
+            height_sigma_max=float(params.get("ball_height_max_sigma_m", 0.35)))
+        for ev in detect_events(world_b, players_by_frame, params, fps, H=H,
+                                ball_px={bf: (bx, by)
+                                         for bf, bx, by, _ in obs_b}):
             m["base"]["events"][ev.kind + ("" if ev.in_court else "_out")] += 1
             events_b.append((ev.frame, ev.court_x, ev.court_y, ev.in_court, ev.kind))
         # Filtered: arc-junction events.

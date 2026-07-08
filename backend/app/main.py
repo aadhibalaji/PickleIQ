@@ -32,6 +32,8 @@ app.add_middleware(
 def startup() -> None:
     db.init_db()
     learned_params.ensure_default_version()
+    learned_params.migrate_ball_filter_default()
+    learned_params.migrate_ball_detection_defaults()
     # Jobs that were queued/running when the previous process died can never
     # finish — mark them so the UI offers a clean retry instead of a stuck bar.
     with db.connect() as con:

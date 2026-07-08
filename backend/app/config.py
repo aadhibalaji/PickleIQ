@@ -7,7 +7,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-load_dotenv(REPO_ROOT / ".env")
+# override=True so repo-root .env wins over any stale shell exports.
+load_dotenv(REPO_ROOT / ".env", override=True)
 
 DATA_DIR = Path(os.getenv("DATA_DIR", REPO_ROOT / "data"))
 VIDEO_DIR = DATA_DIR / "videos"
@@ -39,13 +40,10 @@ TRACKNET_WEIGHTS = os.getenv("TRACKNET_WEIGHTS", "")
 # ball_tracknet.weights_path). The real payoff is a FINE-TUNED model later.
 TRACKNET_ENABLED = os.getenv("TRACKNET_ENABLED", "0").strip().lower() not in ("0", "false", "no", "")
 
-# Pass 2 ball detection/tracking. DISABLED by default right now: rally boundaries
-# come solely from Pass 1 and Pass 2's ball outputs are display-only (detect_events
-# runs model=None), so turning the ball off breaks nothing while player detection
-# is the focus — and it drops the per-frame motion/HSV ball detect + trajectory
-# select + per-window Kalman/height/event reasoning (~10 ms/frame, ~11% of Pass 2).
-# Set PASS2_BALL=1 to bring it back.
-PASS2_BALL_ENABLED = os.getenv("PASS2_BALL", "0").strip().lower() not in ("0", "false", "no", "")
+# Pass 2 ball detection/tracking. ON by default (classical detector + trajectory
+# selector + Kalman/height overlay). Set PASS2_BALL=0 to skip ball work for a
+# faster player-only Pass 2 run.
+PASS2_BALL_ENABLED = os.getenv("PASS2_BALL", "1").strip().lower() not in ("0", "false", "no", "")
 
 for _d in (DATA_DIR, VIDEO_DIR):
     _d.mkdir(parents=True, exist_ok=True)

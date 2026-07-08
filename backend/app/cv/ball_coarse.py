@@ -52,12 +52,15 @@ class MotionBallDetector:
 
     def __init__(self, min_area: float = 2.0, max_area: float = 400.0,
                  sat_min: float = 0.0, val_min: float = 0.0,
-                 hue_lo: float = 0.0, hue_hi: float = 180.0):
+                 hue_lo: float = 0.0, hue_hi: float = 180.0,
+                 motion_thresh: int = 12, min_circularity: float = 0.35):
         self.prev: np.ndarray | None = None
         self.prev2: np.ndarray | None = None
         self._prev_bgr: np.ndarray | None = None  # colour of the MIDDLE frame
         self.min_area = min_area
         self.max_area = max_area
+        self.motion_thresh = int(motion_thresh)
+        self.min_circularity = float(min_circularity)
         # Optional appearance gate (OpenCV HSV: H 0-180, S/V 0-255). A pickleball
         # is bright and saturated; a dark shorts hem or a broad-spectrum white
         # shoe often is not. DISABLED by default (sat_min=val_min=0, full hue
@@ -115,8 +118,9 @@ class MotionBallDetector:
                if self._color_gate and mid_bgr is not None else None)
         d1 = cv2.absdiff(gray, self.prev)
         d2 = cv2.absdiff(self.prev, self.prev2)
-        motion = cv2.bitwise_and(cv2.threshold(d1, 12, 255, cv2.THRESH_BINARY)[1],
-                                 cv2.threshold(d2, 12, 255, cv2.THRESH_BINARY)[1])
+        t = self.motion_thresh
+        motion = cv2.bitwise_and(cv2.threshold(d1, t, 255, cv2.THRESH_BINARY)[1],
+                                 cv2.threshold(d2, t, 255, cv2.THRESH_BINARY)[1])
         motion = cv2.morphologyEx(motion, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
         self.prev2, self.prev = self.prev, gray
 
@@ -130,7 +134,7 @@ class MotionBallDetector:
             if r <= 0:
                 continue
             circularity = area / (np.pi * r * r)
-            if circularity < 0.35:
+            if circularity < self.min_circularity:
                 continue
             # Suppress limbs / paddle / SHOE false positives: ignore any blob
             # inside a player's box (expanded outward by the shared margins — see
