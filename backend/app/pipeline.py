@@ -39,6 +39,19 @@ def effective_calibration(video_id: str):
     return H, cam, cal["id"]
 
 
+def _refine_after_pass2(video_id: str) -> None:
+    """Rally refinement over the fresh Pass 2 tracking data (pass2/refine
+    module). JSON-only output for now — it writes data/refine/<id>.json plus
+    diagnostics and NO rally_labels rows, so Pass 1 stays the app's boundary
+    source until the refiner is validated. Never fails the pass."""
+    try:
+        from .refine import run_refine_json
+        out = run_refine_json(video_id, plot=True)
+        log.info("rally refinement written to %s", out)
+    except Exception:
+        log.exception("rally refinement failed (non-fatal)")
+
+
 def start_processing(video_id: str) -> dict:
     """Kick off Pass 1 immediately (background); Pass 2 chains after it."""
     version, params = learned_params.get_latest()
@@ -57,6 +70,7 @@ def start_processing(video_id: str) -> dict:
     def do_pass2(handle: JobHandle) -> None:
         H, cam, _ = effective_calibration(video_id)
         run_pass2(video_id, params, H, cam, handle)
+        _refine_after_pass2(video_id)
 
     job_id = runner.submit(video_id, "pass1", do_pass1)
     return {"job_id": job_id, "learned_params_version": version}
@@ -72,6 +86,7 @@ def reprocess(video_id: str, which: str) -> dict:
     def do_pass2(handle: JobHandle) -> None:
         H, cam, _ = effective_calibration(video_id)
         run_pass2(video_id, params, H, cam, handle)
+        _refine_after_pass2(video_id)
 
     job_id = runner.submit(video_id, "pass2", do_pass2)
     return {"job_id": job_id, "learned_params_version": version}

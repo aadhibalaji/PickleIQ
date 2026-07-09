@@ -24,10 +24,13 @@ export const api = {
   streamUrl: (id) => `/api/videos/${id}/stream`,
 
   getRallies: (id) => fetch(`/api/videos/${id}/rallies`).then(j),
+  getRefined: (id) => fetch(`/api/videos/${id}/refined`).then(j),
   putHumanLabels: (id, labels) =>
     fetch(`/api/videos/${id}/labels/human`, {
       method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(labels),
     }).then(j),
+  writeServeDataset: (id) =>
+    fetch(`/api/videos/${id}/serve_dataset`, { method: 'POST' }).then(j),
 
   getOverlays: (id, source, start, end) =>
     fetch(`/api/videos/${id}/overlays?source=${source}&start=${start}&end=${end}`).then(j),

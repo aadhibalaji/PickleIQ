@@ -33,6 +33,7 @@ from ..jobs import JobCancelled, JobHandle
 from . import court
 from . import overlays
 from .ball_coarse import MotionBallDetector
+from .exclusions import in_excluded
 from .players import PoseTracker, is_serve_formation
 from .video_io import iter_frames, probe
 
@@ -211,6 +212,12 @@ def run_pass1(video_id: str, params: dict, H, handle: JobHandle,
         if roi is not None:
             cands = [c for c in cands
                      if roi[min(int(c.y), roi.shape[0] - 1), min(int(c.x), roi.shape[1] - 1)] > 0]
+        else:
+            # No court mask (homography unknown): fall back to the fixed-camera
+            # exclusion zones so background/fence-line motion in the red corner
+            # triangles can't drive the ball gate (see cv/exclusions.py).
+            fh, fw = frame.shape[:2]
+            cands = [c for c in cands if not in_excluded(c.x, c.y, fw, fh)]
         fast, fast_prev = _match_fast(cands, prev_cands, step, speed_min)
         prev_cands = cands
         crossed = False

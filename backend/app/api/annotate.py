@@ -39,6 +39,31 @@ def get_rallies(video_id: str):
     return out
 
 
+@router.get("/videos/{video_id}/refined")
+def get_refined(video_id: str):
+    """Pass 2 refined rally boundaries: the refiner's revised start/end for each
+    Pass 1 window, CLAMPED to stay within that window (Pass 1 is the outer bound
+    by design), with windows it judged non-rallies omitted. Read from the JSON
+    the refiner writes after Pass 2 — no rally_labels rows are involved, so this
+    stays advisory until the refiner is validated."""
+    import json
+    from ..refine.config import RefineConfig
+    from ..refine.refine import resolve_path
+    path = resolve_path(RefineConfig().out_dir) / f"{video_id}.json"
+    if not path.exists():
+        return {"exists": False, "rallies": [], "rejected": 0}
+    recs = json.loads(path.read_text()).get("records", [])
+    rallies = [
+        {"start_frame": max(r["refined_start_frame"], r["pass1_start_frame"]),
+         "end_frame": min(r["refined_end_frame"], r["pass1_end_frame"]),
+         "serve_gate_score": (r.get("confidence") or {}).get("serve_gate_score")}
+        for r in recs
+        if r.get("verdict") == "rally" and r.get("refined_start_frame") is not None
+    ]
+    rejected = sum(1 for r in recs if r.get("verdict") != "rally")
+    return {"exists": True, "rallies": rallies, "rejected": rejected}
+
+
 @router.put("/videos/{video_id}/labels/human")
 def put_human_labels(video_id: str, labels: list[RallyLabelIn]):
     for lb in labels:
@@ -68,6 +93,30 @@ def put_human_labels(video_id: str, labels: list[RallyLabelIn]):
 
     learn_job_id = runner.submit(video_id, "learn", learn_job)
     return {"saved": len(labels), "learn_job_id": learn_job_id}
+
+
+@router.get("/videos/{video_id}/serve_dataset")
+def preview_serve_dataset(video_id: str):
+    """Build the model-ready serve dataset from this clip's human rally marks
+    WITHOUT writing files — every rally-start becomes a labeled serve, with the
+    ±buffer exclusion applied. Lets the labeling UI eyeball it before saving."""
+    from ..refine.serve_labels import build_dataset
+    try:
+        return build_dataset(video_id, write=False)
+    except KeyError as exc:
+        raise HTTPException(404, "video not found") from exc
+
+
+@router.post("/videos/{video_id}/serve_dataset")
+def write_serve_dataset(video_id: str):
+    """Emit the per-clip serve dataset files (serve-events sidecar, rally file,
+    serve-gate spans) under ``data/refine/labels/``. Ball-tracking labels are
+    left untouched."""
+    from ..refine.serve_labels import build_dataset
+    try:
+        return build_dataset(video_id, write=True)
+    except KeyError as exc:
+        raise HTTPException(404, "video not found") from exc
 
 
 # ----------------------------------------------------------- calibration ---

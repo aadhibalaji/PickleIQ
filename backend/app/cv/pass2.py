@@ -32,6 +32,7 @@ from .ball_coarse import MotionBallDetector
 from .ball_filter import BallFrameFilter, classify_arc_events, refine_track
 from .ball_track import TrajectoryBallSelector
 from .ball_tracknet import TrackNetBall
+from .exclusions import in_excluded
 from .bounce import detect_events, reconstruct_world
 from .court import CameraModel
 from .kalman import smooth_track
@@ -236,6 +237,7 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
             # ball outputs are display-only and feed no rally boundaries.
             det = None
             if detect_ball:
+                h_px, w_px = frame.shape[:2]
                 if f in corrections:
                     x, y = corrections[f]
                     det = (x, y, None, 1.0)
@@ -252,8 +254,14 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                             det = r
                 else:
                     # Permissive detector (no box exclusion) + trajectory selector.
+                    # Drop blobs in the fixed camera's exclusion zones (the red
+                    # corner triangles — background / fence-line motion) BEFORE the
+                    # selector sees them, so a deadzone blob can never seed or
+                    # pollute the ball trajectory. Same zones that gate players
+                    # (see cv/exclusions.py).
                     cands = [cd for cd in fallback.update(frame)
-                             if _in_court_region(H, cd.x, cd.y)]
+                             if _in_court_region(H, cd.x, cd.y)
+                             and not in_excluded(cd.x, cd.y, w_px, h_px)]
                     if frame_filter is not None:
                         # Stage 1-2 of the filtering layer: velocity gate +
                         # player-box motion logic (foot zone / persistent blobs).
@@ -264,6 +272,14 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                     c = selector.select(f, cands, boxes, feet)
                     if c:
                         det = (c.x, c.y, c.diameter_px, c.score)
+                # Exclusion zones apply to ANY non-manual detector: an external /
+                # TrackNet position landing in a red corner triangle is dropped
+                # just like the classical candidates were above (the classical
+                # path already filtered at the candidate level). Manual
+                # corrections stay authoritative.
+                if (det is not None and f not in corrections
+                        and in_excluded(det[0], det[1], w_px, h_px)):
+                    det = None
                 # The filtering layer applies to ANY detector: external/TrackNet
                 # dets pass the same stage 1-2 gates the classical candidates
                 # did above. Manual corrections stay authoritative.

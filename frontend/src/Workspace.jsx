@@ -3,6 +3,7 @@ import { api } from './api.js'
 import VideoPlayer from './VideoPlayer.jsx'
 import Timeline from './Timeline.jsx'
 import CalibrationPanel from './CalibrationPanel.jsx'
+import LabelingPanel from './LabelingPanel.jsx'
 
 const TABS = [
   ['setup', 'Setup'],
@@ -13,6 +14,8 @@ const TABS = [
 export default function Workspace({ videoId, onBack }) {
   const [video, setVideo] = useState(null)
   const [rallies, setRallies] = useState({ human: [], pass1: [], pass2: [] })
+  const [humanDraft, setHumanDraft] = useState(null) // local rally-labeling draft
+  const [refined, setRefined] = useState({ exists: false, rallies: [], rejected: 0 }) // Pass 2 revised boundaries
   const [tab, setTab] = useState('setup')
   const [frame, setFrame] = useState(0)
   const [calibration, setCalibration] = useState(null)
@@ -30,7 +33,16 @@ export default function Workspace({ videoId, onBack }) {
   const playerRef = useRef(null)
 
   const loadRallies = useCallback(() => {
-    api.getRallies(videoId).then(setRallies).catch(() => {})
+    api.getRallies(videoId).then((r) => {
+      setRallies(r)
+      // Seed the labeling draft from saved human labels once, without clobbering
+      // an in-progress edit (the 3 s job poll also calls this).
+      setHumanDraft((d) => d ?? r.human.map(({ start_frame, end_frame }) => ({ start_frame, end_frame })))
+    }).catch(() => {})
+  }, [videoId])
+
+  const loadRefined = useCallback(() => {
+    api.getRefined(videoId).then(setRefined).catch(() => {})
   }, [videoId])
 
   const loadCalibration = useCallback(() => {
@@ -47,8 +59,9 @@ export default function Workspace({ videoId, onBack }) {
   useEffect(() => {
     api.getVideo(videoId).then(setVideo)
     loadRallies()
+    loadRefined()
     loadCalibration()
-  }, [videoId, loadRallies, loadCalibration])
+  }, [videoId, loadRallies, loadRefined, loadCalibration])
 
   // Poll jobs + streamed results while processing runs in the background.
   useEffect(() => {
@@ -58,12 +71,12 @@ export default function Workspace({ videoId, onBack }) {
         const active = v.jobs?.some((j) => j.status === 'queued' || j.status === 'running')
         // While a pass is running (and for one tick after it finishes) refetch
         // rallies + overlays: Pass 2 writes overlays per window as it goes.
-        if (active || wasActiveRef.current) { loadRallies(); setOverlayNonce((n) => n + 1) }
+        if (active || wasActiveRef.current) { loadRallies(); loadRefined(); setOverlayNonce((n) => n + 1) }
         wasActiveRef.current = active
       }).catch(() => {})
     }, 3000)
     return () => clearInterval(t)
-  }, [videoId, loadRallies])
+  }, [videoId, loadRallies, loadRefined])
 
   const seek = (f) => playerRef.current?.seekFrame(f)
   const note = (msg) => { setFlash(msg); setTimeout(() => setFlash(''), 2500) }
@@ -197,8 +210,9 @@ export default function Workspace({ videoId, onBack }) {
 
   const overlaySource = tab === 'pass1' ? 'pass1' : tab === 'pass2' ? 'pass2' : null
   const tracks = [
+    { name: 'Human', color: '#4cc38a', spans: humanDraft || [] },
     { name: 'Pass 1', color: '#e5a53a', spans: rallies.pass1 },
-    { name: 'Pass 2', color: '#58a6ff', spans: rallies.pass2 },
+    { name: 'Pass 2', color: '#58a6ff', spans: refined.rallies },
   ]
 
   return (
@@ -288,48 +302,107 @@ export default function Workspace({ videoId, onBack }) {
 
       <div className="tabbody">
         {tab === 'setup' && (
-          <CalibrationPanel
-            videoId={videoId}
-            calibration={calibration}
-            setClickMode={setClickMode}
-            clickMode={clickMode}
-            onSaved={() => {
-              loadCalibration()
-              // Pass 2 needs the homography — re-run it automatically now.
-              api.reprocess(videoId, 'pass2')
-                .then(() => note('Calibration saved — Pass 2 re-running automatically'))
-                .catch(() => note('Calibration saved'))
-            }}
-          />
+          <>
+            <CalibrationPanel
+              videoId={videoId}
+              calibration={calibration}
+              setClickMode={setClickMode}
+              clickMode={clickMode}
+              onSaved={() => {
+                loadCalibration()
+                // Pass 2 needs the homography — re-run it automatically now.
+                api.reprocess(videoId, 'pass2')
+                  .then(() => note('Calibration saved — Pass 2 re-running automatically'))
+                  .catch(() => note('Calibration saved'))
+              }}
+            />
+            <LabelingPanel
+              videoId={videoId}
+              fps={video.fps || 30}
+              frame={frame}
+              labels={humanDraft || []}
+              setLabels={setHumanDraft}
+              onSeek={seek}
+              onSaved={() => { note('Rally labels saved'); loadRallies() }}
+            />
+            <ServeDatasetPanel videoId={videoId} note={note} />
+          </>
         )}
 
-        {(tab === 'pass1' || tab === 'pass2') && (
-          <PassTab source={tab} rallies={rallies[tab]} fps={video.fps || 30} onSeek={seek} />
+        {tab === 'pass1' && (
+          <PassTab source="pass1" rallies={rallies.pass1} fps={video.fps || 30} onSeek={seek} />
+        )}
+        {tab === 'pass2' && (
+          <PassTab source="pass2" rallies={refined.rallies} rejected={refined.rejected}
+                   exists={refined.exists} fps={video.fps || 30} onSeek={seek} />
         )}
       </div>
     </div>
   )
 }
 
-function PassTab({ source, rallies, fps, onSeek }) {
-  if (source === 'pass2') {
+// Turns the saved human rally labels into the model-ready serve dataset
+// (rally-start = serve + ±buffer). Writes data/refine/labels/<id>.*; the ball
+// ground-truth marks are left untouched.
+function ServeDatasetPanel({ videoId, note }) {
+  const [busy, setBusy] = useState(false)
+  const [summary, setSummary] = useState(null)
+  const run = async () => {
+    setBusy(true)
+    try {
+      const r = await api.writeServeDataset(videoId)
+      setSummary(r)
+      note(`Serve dataset written: ${r.n_serves} serves · ${r.n_gate_negatives} negatives`)
+    } catch (e) { note(`export failed: ${e.message}`) }
+    setBusy(false)
+  }
+  return (
+    <div className="panel" style={{ marginTop: 8 }}>
+      <div className="row spread">
+        <div>
+          <b>Serve / rally dataset</b>
+          <div className="muted">
+            Every rally-start is a labeled serve; a ±buffer around it is held out of the
+            negatives. Save the labels above first.
+          </div>
+        </div>
+        <button className="blue" onClick={run} disabled={busy}>
+          {busy ? 'Exporting…' : 'Export serve dataset'}
+        </button>
+      </div>
+      {summary && (
+        <div className="muted" style={{ marginTop: 6 }}>
+          Wrote {summary.n_rallies} rallies · {summary.n_serves} serves ·{' '}
+          {summary.n_gate_negatives} negatives → data/refine/labels/
+        </div>
+      )}
+    </div>
+  )
+}
+
+function PassTab({ source, rallies, fps, onSeek, rejected = 0, exists = true }) {
+  const isPass2 = source === 'pass2'
+  if (isPass2 && !exists) {
     return (
       <div className="muted">
-        Pass 2 no longer produces its own rally boundaries. It runs full-rate
-        player and ball detection inside each Pass 1 rally window and writes the
-        accurate overlay you see on the video above (players, ball, height,
-        bounce/hit markers). Rally start/end come from <b>Pass 1</b> — see the
-        Pass 1 rallies tab. Re-runs automatically after you save calibration in the Setup tab.
+        No Pass 2 refinement for this clip yet. Pass 2 revises each Pass 1 rally
+        (tightens the serve start and end, and drops windows that aren't real
+        rallies) when it runs — reprocess Pass 2 (save calibration in Setup, or
+        Regenerate in the Report tab) to generate the revised timestamps.
       </div>
     )
   }
+  const intro = isPass2
+    ? 'Revised inside each Pass 1 window: the serve start is nudged later and the end earlier (never outside Pass 1’s edges), and windows judged not to be rallies are dropped.'
+    : 'Coarse gate over 100% of footage: motion energy + coarse ball + serve-formation spot checks. Boundaries are intentionally loose (padded + merged) to favour recall. Runs automatically on upload.'
   return (
     <div>
-      <div className="muted">
-        Coarse gate over 100% of footage: motion energy + coarse ball + serve-formation
-        spot checks. Now the sole source of rally start/end — boundaries are intentionally
-        loose (padded + merged) to favour recall. Runs automatically on upload.
-      </div>
+      <div className="muted">{intro}</div>
+      {isPass2 && rejected > 0 && (
+        <div className="muted" style={{ marginTop: 4 }}>
+          {rejected} Pass 1 window{rejected > 1 ? 's' : ''} dropped as non-rallies.
+        </div>
+      )}
       <table style={{ marginTop: 10 }}>
         <thead><tr><th>#</th><th>Start</th><th>End</th><th>Length</th><th></th></tr></thead>
         <tbody>
@@ -342,7 +415,11 @@ function PassTab({ source, rallies, fps, onSeek }) {
               <td><button onClick={() => onSeek(r.start_frame)}>▶</button></td>
             </tr>
           ))}
-          {rallies.length === 0 && <tr><td colSpan="5" className="muted">No rallies yet.</td></tr>}
+          {rallies.length === 0 && (
+            <tr><td colSpan="5" className="muted">
+              {isPass2 ? 'Pass 2 kept no rallies here.' : 'No rallies yet.'}
+            </td></tr>
+          )}
         </tbody>
       </table>
     </div>
