@@ -420,6 +420,20 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                      "kp": [[round(x, 1), round(y, 1)] for x, y in o.keypoints]
                            if o.keypoints else None}
                     for o in obs
+                    # identity.py caps real identity slots at MAX_PER_TEAM (2) per
+                    # team for the whole match, and force-binds every detection to
+                    # an existing slot once both are filled — so a team-tagged obs
+                    # that still has slot=None here is NOT a genuine re-ID miss, it
+                    # is a detection identity.py deliberately rejected as noise (a
+                    # 3rd+ same-team box in one frame: false positive / bystander
+                    # inside the court margin). Falling back to its raw track_id
+                    # used to fabricate a stable-looking id for that noise, which
+                    # fragmented one physical player into extra phantom ids across
+                    # window/track-id churn. Drop it instead. Untamed obs (team is
+                    # None — off-court projection) still fall back to track_id, as
+                    # before, purely for display; they never carry a team so they
+                    # can't pollute team-based analytics either way.
+                    if o.slot is not None or o.team is None
                 ],
                 "pspeed": round(player_speed[f], 2),
             }

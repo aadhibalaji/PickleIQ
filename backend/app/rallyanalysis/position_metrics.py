@@ -150,7 +150,22 @@ def _aggregate_rallies(rallies: list[tuple[str, list[dict]]]) -> dict:
     """Pure aggregation core, shared by compute_video_metrics (DB-backed) and
     the unit tests (synthetic entries). rallies: [(rally_id, entries)].
     Returns {rally_metrics: [RallyMetrics], players: {...}} — see
-    compute_video_metrics for the players-dict shape."""
+    compute_video_metrics for the players-dict shape.
+
+    NOT gated by a min-presence filter (unlike highlights.team_has_poach):
+    pass2.py no longer writes capacity-rejected noise detections into
+    overlays at all (see cv/pass2.py's players-list filter), which removes
+    most of the phantom-id source this would guard against. What's left here
+    aggregates at RALLY granularity (kitchen_arrival_pct/forward_pressure are
+    denominated in whole rallies, via kitchen_den/pressure_n below), so a
+    frame-level phantom id already can't inflate a percentage — at worst it
+    adds one low-signal player-id entry with kitchen_serving_rallies=1 /
+    forward_pressure_rallies=1, which is visibly a near-empty sample size
+    rather than a misleading one. A tighter, frame-level gate would need this
+    function to also thread each rally's total frame count through (it
+    currently only sees per-player frame counts), which is a bigger plumbing
+    change than this fix warrants — flagged as a follow-up if reviewers spot
+    single-rally phantom ids in practice."""
     kitchen_num: dict[int, int] = {}
     kitchen_den: dict[int, int] = {}
     pressure_sum: dict[int, float] = {}
