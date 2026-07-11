@@ -47,8 +47,38 @@ DEFAULTS: dict[str, Any] = {
     "ball_acq_px": 90.0,           # acquisition radius while ball velocity is unknown
     "ball_seed_min_px": 4.0,       # min px/frame a cold-start candidate must MOVE before it
                                    # can seed a track (rejects stationary shoe/short blobs)
+    "ball_motion_thresh": 3.0,     # three-frame diff threshold (0-255). 12 is fine for
+                                   # Pass 1's low-res subsample; full-res 60 fps clips often
+                                   # need ~3-5 or the classical detector sees zero motion.
+    "ball_min_circularity": 0.30,  # blob roundness floor (area / pi*r^2)
+    "ball_suppress_in_box": 0.0,   # 1 = drop ball CANDIDATES inside a detected player box
+                                   # (expanded by shoe/paddle margins) before the trajectory
+                                   # selector ever sees them. Default OFF: this pre-filter
+                                   # would strip the on-player blobs seed_on_player relies on
+                                   # to recover a serve struck from the server's own box at
+                                   # cold start (see ball_seed_on_player) — turn on only if
+                                   # you don't need that recovery and want harder box muting.
+    "ball_exclusion_zones": 1.0,   # apply the pose image-space deadzone triangles
+                                   # (exclusions.py) to ball candidates too
     "ball_foot_suppress_px": 35.0, # radius around foot keypoints to suppress blobs
     "ball_hit_speed_px": 18.0,     # px/frame a near-player blob must move to count as a hit
+    "ball_suppress_on_player": 1.0,  # 1 = drop ball blobs on a player box/foot unless moving
+                                   # fast; 0 = keep them (recovers a noisier track when the
+                                   # classical detector's blobs cluster near players).
+                                   # Independent of ball_seed_on_player: that one permits an
+                                   # on-player COLD-START seed; this one gates the established-
+                                   # trajectory path.
+    "ball_seed_on_player": 0.0,    # 1 = allow cold-start acquisition to seed from a blob ON a
+                                   # player (still gated on hit_speed) — recovers the SERVE
+                                   # ball, struck at the server, which cold start otherwise hides
+    # Pose-aware limb-lock ball exclusion (cv/ball_track.py): a candidate that
+    # rides a wrist at ~constant offset (same velocity) for limb_lock_frames
+    # consecutive frames is a limb/paddle blob, not the ball, and is dropped —
+    # regardless of how it was acquired. Catches what a single-frame hit-speed
+    # check at acquisition can't (e.g. a limb blob that MATCHED hit_speed once).
+    "limb_lock_dist_px": 30.0,     # a candidate this close to a wrist is a lock candidate
+    "limb_lock_rel_vel_px": 4.0,   # max |cand - wrist| displacement diff = moving in lockstep
+    "limb_lock_frames": 3,         # consecutive lockstep frames before a candidate is excluded
     # Classical-fallback appearance gate (OpenCV HSV; H 0-180, S/V 0-255). OFF by
     # default (sat/val floors 0, full hue range) because ball colour varies per
     # clip — set once you know the ball colour to cheaply drop off-colour blobs.
@@ -59,6 +89,16 @@ DEFAULTS: dict[str, Any] = {
     "ball_kalman_gate2": 13.8,     # Mahalanobis^2 gate: a measurement further than this
                                    # from the Kalman prediction is a physically-irregular
                                    # jump (foot/noise) and is rejected, not smoothed in
+    "ball_court_margin_x_m": 2.5,  # court-region ball filter: metres beyond the sidelines
+    "ball_court_margin_y_m": 3.0,  # ... and beyond the baselines a blob may project
+    "tracknet_conf": 0.5,          # TrackNet heatmap peak confidence floor (was hardcoded)
+    # Size->depth honesty gate (cv/bounce.py reconstruct_world height_sigma_max): a
+    # point whose HEIGHT 1-sigma for +-1px of diameter error exceeds this gets
+    # height=NaN + plane-projected court position instead of the noisy 3D estimate.
+    # Measured on the stored calibration: ~0.12 m/px at the near baseline vs
+    # ~0.57 m/px at the far baseline (<5 px ball) — far heights are structurally
+    # unreliable and must be reported as unknown, not confidently wrong.
+    "ball_height_max_sigma_m": 0.35,
     # ---- Pass 2 ball filtering layer (cv/ball_filter.py) -------------------
     "ball_filter_enabled": 1.0,    # 0 = fall back to the pre-filter heuristic path
     "ball_max_speed_mph": 65.0,    # generous max pickleball speed for the velocity gate
@@ -139,10 +179,18 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "pose_conf": (0.05, 0.6), "pose_imgsz": (640, 1920), "p1_pose_imgsz": (640, 1920),
     "ball_gate_px": (15.0, 120.0), "ball_accel_px": (0.0, 30.0),
     "ball_acq_px": (40.0, 200.0), "ball_seed_min_px": (1.0, 20.0),
+    "ball_motion_thresh": (2.0, 20.0), "ball_min_circularity": (0.15, 0.60),
+    "ball_suppress_in_box": (0.0, 1.0), "ball_exclusion_zones": (0.0, 1.0),
     "ball_sat_min": (0.0, 255.0), "ball_val_min": (0.0, 255.0),
     "ball_hue_lo": (0.0, 180.0), "ball_hue_hi": (0.0, 180.0),
     "ball_foot_suppress_px": (10.0, 80.0), "ball_hit_speed_px": (6.0, 50.0),
+    "ball_suppress_on_player": (0.0, 1.0), "ball_seed_on_player": (0.0, 1.0),
+    "limb_lock_dist_px": (5.0, 120.0), "limb_lock_rel_vel_px": (0.5, 30.0),
+    "limb_lock_frames": (2, 8),
     "ball_kalman_gate2": (5.0, 60.0),
+    "ball_court_margin_x_m": (0.5, 8.0), "ball_court_margin_y_m": (0.5, 8.0),
+    "tracknet_conf": (0.1, 0.9),
+    "ball_height_max_sigma_m": (0.05, 2.0),
     "ball_filter_enabled": (0.0, 1.0),
     "ball_max_speed_mph": (30.0, 120.0), "ball_speed_headroom": (1.0, 3.0),
     "ball_box_persist_frames": (2, 10), "ball_box_persist_px": (4.0, 40.0),
