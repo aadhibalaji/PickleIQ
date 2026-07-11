@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from . import db
-from .api import analyze, annotate, chat, media, models
+from .api import analyze, annotate, chat, media, models, rally_analysis
 from .jobs import runner
 from .learning import params as learned_params
 
@@ -46,6 +46,7 @@ app.include_router(annotate.router, prefix="/api")
 app.include_router(analyze.router, prefix="/api")
 app.include_router(chat.router, prefix="/api")
 app.include_router(models.router, prefix="/api")
+app.include_router(rally_analysis.router, prefix="/api")
 
 
 @app.get("/api/health")

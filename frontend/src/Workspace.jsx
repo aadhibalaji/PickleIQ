@@ -4,11 +4,13 @@ import VideoPlayer from './VideoPlayer.jsx'
 import Timeline from './Timeline.jsx'
 import CalibrationPanel from './CalibrationPanel.jsx'
 import LabelingPanel from './LabelingPanel.jsx'
+import RallyAnalysisPanel from './RallyAnalysis/RallyAnalysisPanel.jsx'
 
 const TABS = [
   ['setup', 'Setup'],
   ['pass1', 'Pass 1 rallies'],
   ['pass2', 'Pass 2 detection'],
+  ['rally-analysis', 'Rally Analysis'],
 ]
 
 export default function Workspace({ videoId, onBack }) {
@@ -363,6 +365,9 @@ export default function Workspace({ videoId, onBack }) {
                    partial={refined.partial} error={refined.error}
                    fps={video.fps || 30} onSeek={seek}
                    onGrade={gradeWindow} videoId={videoId} note={note} />
+        )}
+        {tab === 'rally-analysis' && (
+          <RallyAnalysisPanel videoId={videoId} onSeek={seek} />
         )}
       </div>
     </div>

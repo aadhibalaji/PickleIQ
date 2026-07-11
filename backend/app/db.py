@@ -161,6 +161,30 @@ CREATE TABLE IF NOT EXISTS param_eval (
   created_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS contact_events (
+  contact_id TEXT PRIMARY KEY,
+  video_id TEXT NOT NULL,
+  rally_id TEXT NOT NULL,
+  frame_idx INTEGER NOT NULL,
+  timestamp_s REAL NOT NULL,
+  player_id INTEGER NOT NULL,
+  team TEXT NOT NULL,               -- 'near' | 'far'
+  court_x REAL, court_y REAL,
+  shot_side TEXT,                   -- 'left' | 'right'
+  hand_speed_peak REAL,
+  confidence REAL,
+  is_serve INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS coaching_reports (
+  video_id TEXT PRIMARY KEY,        -- one report per video (latest wins, regenerate on request)
+  category_ratios TEXT NOT NULL,    -- JSON {category: {flagged_count, active_rally_seconds, ratio}}
+  worst_shots TEXT NOT NULL,        -- JSON [{contact_id, category, deviation_score, timestamp_s, rally_id, feature_vector}]
+  best_shots TEXT NOT NULL,         -- JSON same shape as worst_shots
+  narrative TEXT NOT NULL,
+  created_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS model_registry (
   version INTEGER PRIMARY KEY AUTOINCREMENT,
   kind TEXT NOT NULL,               -- 'rally_end' | 'serve_start' | 'tracknet'
