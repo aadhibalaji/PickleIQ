@@ -10,6 +10,7 @@ from fastapi import APIRouter
 from .. import db
 from ..rallyanalysis import contact_detect
 from ..rallyanalysis.position_metrics import compute_video_metrics
+from ..rallyanalysis.shot_metrics import compute_video_shot_metrics
 
 router = APIRouter()
 
@@ -67,5 +68,32 @@ def position_metrics(video_id: str):
                 "forward_pressure_dominance": pressure_dom.get(pid),
             }
             for pid, p in players.items()
+        },
+    }
+
+
+@router.get("/rally-analysis/{video_id}/shot-metrics")
+def shot_metrics(video_id: str):
+    """Per-rally shot count / length bucket / shot-side split, plus a
+    video-level per-player shot-side rollup. Reads contact_events directly
+    (Wave 1's detect-contacts endpoint must have run first)."""
+    data = compute_video_shot_metrics(video_id)
+    return {
+        "video_id": video_id,
+        "rallies": {
+            rm.rally_id: {
+                "shot_count": rm.shot_count,
+                "rally_length_bucket": rm.rally_length_bucket,
+                "shot_side_pct": {str(pid): v for pid, v in rm.shot_side_pct.items()},
+            }
+            for rm in data["rally_metrics"]
+        },
+        "players": {
+            str(pid): {
+                "team": p["team"],
+                "shot_count": p["shot_count"],
+                "shot_side_pct": p["shot_side_pct"],
+            }
+            for pid, p in data["players"].items()
         },
     }
