@@ -28,6 +28,16 @@ FIREFIGHT_NET_FRAC_MIN = 0.5
 # a crossing counts as a real poach rather than pose-jitter noise.
 POACH_CROSS_MARGIN_M = 0.3
 
+# Defense in depth against upstream identity fragmentation (cv/identity.py /
+# cv/pass2.py): re-ID will never be perfect, so even after the pass2.py fix
+# that stops writing capacity-rejected noise detections into overlays, a
+# genuine appearance/position re-acquisition hiccup can still hand a couple of
+# frames to the wrong/transient id. A team must have TWO ids each tracked for
+# at least this fraction of the rally's frames before they're treated as two
+# real, distinct players eligible for a poach check — a one-or-two-frame
+# phantom id should never register a crossing. Tunable.
+MIN_TEAM_PRESENCE_FRAC = 0.15
+
 TAG_LONG_RALLY = "Long Rally"
 TAG_FIREFIGHT = "Firefight"
 TAG_POACH = "Poach"
@@ -54,6 +64,14 @@ def aggregate_rally_positions(entries: list[dict]) -> tuple[dict[int, float], di
                 kitchen_n[pid] = kitchen_n.get(pid, 0) + 1
             team_x[team].setdefault(pid, []).append(float(cxy[0]))
     near_net_frac = {pid: kitchen_n.get(pid, 0) / total_n[pid] for pid in total_n}
+    # Drop ids that weren't tracked for a big enough share of the rally before
+    # they can count as a "real" second player for team_has_poach — see
+    # MIN_TEAM_PRESENCE_FRAC. near_net_frac is left alone (Firefight already
+    # requires >=50% net presence, which is a stronger gate on its own).
+    rally_frames = len(entries) or 1
+    for team in team_x:
+        team_x[team] = {pid: xs for pid, xs in team_x[team].items()
+                         if total_n.get(pid, 0) / rally_frames >= MIN_TEAM_PRESENCE_FRAC}
     return near_net_frac, team_x
 
 
@@ -153,5 +171,23 @@ if __name__ == "__main__":
     assert classify_rally_tags("short", 0, 1.0, {}, poach_team_x) == [TAG_POACH]
     no_poach_team_x = {"near": {1: [1.0, 1.0], 2: [5.0, 5.0]}, "far": {}}
     assert classify_rally_tags("short", 0, 1.0, {}, no_poach_team_x) == []
+
+    # MIN_TEAM_PRESENCE_FRAC gate (aggregate_rally_positions), via synthetic
+    # overlay entries: id 1 is a dominant, long-lived near player who never
+    # crosses; id 99 is a one-frame phantom that DOES cross. 10-frame rally.
+    def _frame(f, near, far=()):
+        return {"f": f, "players": [{"id": pid, "cxy": [x, 6.0], "team": "near"}
+                                      for pid, x in near]
+                          + [{"id": pid, "cxy": [x, 6.0], "team": "far"}
+                             for pid, x in far]}
+    phantom_entries = [_frame(i, [(1, 1.0)]) for i in range(9)] + [_frame(9, [(1, 1.0), (99, 5.0)])]
+    near_net_frac, team_x = aggregate_rally_positions(phantom_entries)
+    assert not team_has_poach(team_x["near"]), "one-frame phantom id must not trigger a poach"
+
+    # Two genuinely sustained ids that cross should still trigger Poach.
+    sustained_entries = ([_frame(i, [(1, 1.0), (2, 5.0)]) for i in range(8)]
+                          + [_frame(8, [(1, 5.0), (2, 1.0)]), _frame(9, [(1, 5.0), (2, 5.0)])])
+    _, team_x2 = aggregate_rally_positions(sustained_entries)
+    assert team_has_poach(team_x2["near"]), "two sustained ids crossing should still trigger a poach"
 
     print("highlights self-check OK")
