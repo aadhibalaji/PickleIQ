@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "clips": [
+    {
+      "video_id": "760f1e0e95d048fc9ec20ce4c61ccd35",
+      "filename": "Second 3 mins.mp4",
+      "dir": "Second_3_mins__760f1e0e",
+      "video_copied": true,
+      "ball_marks": 299,
+      "ball_bounces": 34,
+      "ball_hits": 35,
+      "ball_positions": 230,
+      "human_rally_labels": 0,
+      "notes": 0
+    },
+    {
+      "video_id": "17be6eb599a146159787a0976c3c54c0",
+      "filename": "clip #1.mp4",
+      "dir": "clip_1__17be6eb5",
+      "video_copied": true,
+      "ball_marks": 144,
+      "ball_bounces": 19,
+      "ball_hits": 27,
+      "ball_positions": 98,
+      "human_rally_labels": 0,
+      "notes": 0
+    }
+  ]
+}
