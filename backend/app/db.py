@@ -148,6 +148,30 @@ CREATE TABLE IF NOT EXISTS param_eval (
   created_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS ball_eval (
+  id TEXT PRIMARY KEY,
+  video_id TEXT NOT NULL,
+  tag TEXT NOT NULL,                -- config label (also the gallery subdir)
+  detector TEXT NOT NULL,           -- 'classical' | 'tracknet'
+  params_version INTEGER,           -- learned_params version the run is based on
+  diagnose INTEGER NOT NULL,        -- 1 = failure attribution + slices + gallery
+  status TEXT NOT NULL,             -- 'ok' | 'skipped'
+  message TEXT DEFAULT '',          -- EvalSkipped reason when status='skipped'
+  -- Headline metrics of the FILTERED pipeline, promoted out of `result` so the
+  -- list endpoint never parses a multi-MB blob per row (cf. param_eval).
+  n_marks INTEGER,
+  det_rate REAL,
+  pos_err_med_px REAL,
+  bounce_p REAL,
+  bounce_r REAL,
+  inout_acc REAL,
+  result TEXT,                      -- JSON: the full eval_video() dict
+  created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_ball_eval_video
+  ON ball_eval (video_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS model_registry (
   version INTEGER PRIMARY KEY AUTOINCREMENT,
   kind TEXT NOT NULL,               -- 'rally_end' | 'serve_start' | 'tracknet'
@@ -160,6 +184,17 @@ CREATE TABLE IF NOT EXISTS model_registry (
   created_at REAL NOT NULL,
   promoted_at REAL
 );
+
+CREATE TABLE IF NOT EXISTS audio_events (
+  id TEXT PRIMARY KEY,
+  video_id TEXT NOT NULL,
+  time_s REAL NOT NULL,             -- onset time (seconds into the clip)
+  frame_index INTEGER NOT NULL,     -- round(time_s * fps) — join key to overlays
+  onset_strength REAL NOT NULL,     -- spectral-flux value (rough confidence proxy)
+  created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_audio_events_video ON audio_events (video_id, frame_index);
 """
 
 # Columns added after the initial schema shipped. executescript won't ALTER an

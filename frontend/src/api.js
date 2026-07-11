@@ -24,6 +24,7 @@ export const api = {
   streamUrl: (id) => `/api/videos/${id}/stream`,
 
   getRallies: (id) => fetch(`/api/videos/${id}/rallies`).then(j),
+  getServes: (id) => fetch(`/api/videos/${id}/serves`).then(j),
   putHumanLabels: (id, labels) =>
     fetch(`/api/videos/${id}/labels/human`, {
       method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(labels),
@@ -82,6 +83,16 @@ export const api = {
   promoteModel: (version) => fetch(`/api/models/${version}/promote`, { method: 'POST' }).then(j),
   rejectModel: (version) => fetch(`/api/models/${version}/reject`, { method: 'POST' }).then(j),
   getLearningCurve: (kind) => fetch(`/api/models/learning_curve${kind ? `?kind=${kind}` : ''}`).then(j),
+
+  // Ball-eval harness. runBallEval returns a job_id; poll getVideo().jobs for
+  // kind 'ball_eval' the same way pass1/pass2 are polled.
+  runBallEval: (id, opts = {}) =>
+    fetch(`/api/videos/${id}/eval/run`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(opts),
+    }).then(j),
+  listBallEvals: (id) => fetch(`/api/videos/${id}/eval`).then(j),
+  getBallEval: (id, evalId) => fetch(`/api/videos/${id}/eval/${evalId}`).then(j),
+  evalDiagUrl: (file) => `/api/eval_diag/${file}`,
 
   chat: (videoId, messages) =>
     fetch('/api/chat', {

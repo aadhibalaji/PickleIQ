@@ -4,13 +4,17 @@ import React from 'react'
 // tracks: [{ name, color, spans: [{start_frame, end_frame}] }]
 // marks (optional): ground-truth ball marks [{frame, event_type}] drawn as a
 // dot row so coverage is visible at a glance while marking.
+// serves (optional): AI-inferred serve moments [{frame}] drawn as 'S' ticks —
+// distinct from ground truth (these come from the Pass 2 overlay evt channel).
 const MARK_COLORS = { bounce: '#00e5ff', hit: '#e5a53a', position: '#c3ce4a' }
+const SERVE_COLOR = '#78c850'   // gold-green, distinct from GT mark colours
 
-export default function Timeline({ frameCount, frame, tracks, marks, onSeek }) {
+export default function Timeline({ frameCount, frame, tracks, marks, serves, onSeek }) {
   const W = 1200
   const rowH = 22
   const markRow = marks?.length ? 12 : 0
-  const H = tracks.length * rowH + markRow + 26
+  const serveRow = serves?.length ? 12 : 0
+  const H = tracks.length * rowH + markRow + serveRow + 26
   const x = (f) => (f / Math.max(frameCount, 1)) * W
 
   const seek = (e) => {
@@ -40,6 +44,12 @@ export default function Timeline({ frameCount, frame, tracks, marks, onSeek }) {
                 fill={MARK_COLORS[m.event_type] || MARK_COLORS.position} opacity="0.9">
           <title>{`${m.event_type || 'position'} @ f${m.frame}`}</title>
         </circle>
+      ))}
+      {serves?.length > 0 && serves.map((s, i) => (
+        <text key={`sv${i}`} x={x(s.frame)} y={tracks.length * rowH + markRow + 10}
+              fill={SERVE_COLOR} fontSize="11" fontWeight="700" textAnchor="middle">S
+          <title>{`serve (AI-inferred) @ f${s.frame}`}</title>
+        </text>
       ))}
       <line x1={x(frame)} x2={x(frame)} y1="0" y2={H - 14} stroke="#e8edf2" strokeWidth="1.5" />
       <text x={Math.min(x(frame) + 4, W - 60)} y={H - 2} fill="#e8edf2" fontSize="11">f {frame}</text>

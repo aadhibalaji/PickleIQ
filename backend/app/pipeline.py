@@ -9,6 +9,7 @@ import logging
 import numpy as np
 
 from . import db
+from .cv import audio_events
 from .cv.court import CameraModel
 from .cv.pass1 import run_pass1
 from .cv.pass2 import run_pass2
@@ -58,6 +59,11 @@ def start_processing(video_id: str) -> dict:
         H, cam, _ = effective_calibration(video_id)
         run_pass2(video_id, params, H, cam, handle)
 
+    # Audio onset extraction has no calibration dependency and is cheap
+    # (~4% of realtime). Submit it FIRST so the single worker finishes it
+    # before Pass 2 (which fuses it) chains off Pass 1. Idempotent per video.
+    runner.submit(video_id, "audio",
+                  lambda h: audio_events.compute_and_store(video_id, params))
     job_id = runner.submit(video_id, "pass1", do_pass1)
     return {"job_id": job_id, "learned_params_version": version}
 
@@ -73,5 +79,8 @@ def reprocess(video_id: str, which: str) -> dict:
         H, cam, _ = effective_calibration(video_id)
         run_pass2(video_id, params, H, cam, handle)
 
+    # Ensure audio onsets exist for a pass2-only rerun (idempotent skip if so).
+    runner.submit(video_id, "audio",
+                  lambda h: audio_events.compute_and_store(video_id, params))
     job_id = runner.submit(video_id, "pass2", do_pass2)
     return {"job_id": job_id, "learned_params_version": version}

@@ -53,7 +53,8 @@ class MotionBallDetector:
     def __init__(self, min_area: float = 2.0, max_area: float = 400.0,
                  sat_min: float = 0.0, val_min: float = 0.0,
                  hue_lo: float = 0.0, hue_hi: float = 180.0,
-                 motion_thresh: int = 12, min_circularity: float = 0.35):
+                 motion_thresh: int = 12, min_circularity: float = 0.35,
+                 dedup: bool = True, dup_thresh: float = 0.2):
         self.prev: np.ndarray | None = None
         self.prev2: np.ndarray | None = None
         self._prev_bgr: np.ndarray | None = None  # colour of the MIDDLE frame
@@ -61,6 +62,21 @@ class MotionBallDetector:
         self.max_area = max_area
         self.motion_thresh = int(motion_thresh)
         self.min_circularity = float(min_circularity)
+        # Duplicate-frame guard. Many clips are lower-frame-rate content muxed up
+        # to 60 fps by REPEATING each source frame (here: every other frame is a
+        # near-exact copy of its predecessor, mean gray abs-diff ~0.02 vs ~0.6 on
+        # real frames). Three-frame differencing then collapses — one of its two
+        # diffs always spans a repeated pair and is ~0, so the AND is empty and
+        # the ball produces NO motion blob on any frame, leaving only stray
+        # compression noise. When on (default), a frame whose mean abs-diff to
+        # the last DISTINCT frame is below dup_thresh is treated as a repeat: the
+        # 3-frame state is not advanced (so it always differences genuinely
+        # distinct frames, i.e. runs at the true content rate) and the previous
+        # frame's candidates are re-emitted (the ball has not moved), keeping the
+        # downstream tracker dense instead of blind every other frame.
+        self.dedup = bool(dedup)
+        self.dup_thresh = float(dup_thresh)
+        self._last_out: list[BallCandidate] = []
         # Optional appearance gate (OpenCV HSV: H 0-180, S/V 0-255). A pickleball
         # is bright and saturated; a dark shorts hem or a broad-spectrum white
         # shoe often is not. DISABLED by default (sat_min=val_min=0, full hue
@@ -76,6 +92,7 @@ class MotionBallDetector:
     def reset(self) -> None:
         self.prev = self.prev2 = None
         self._prev_bgr = None
+        self._last_out = []
 
     def _color_ok(self, hsv: np.ndarray, x: float, y: float, r: float) -> bool:
         """Whether the blob's colour passes the appearance gate. Sampled from the
@@ -105,6 +122,13 @@ class MotionBallDetector:
                ) -> list[BallCandidate]:
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        # Repeated-frame guard (see __init__): skip frames that are near-identical
+        # to the last distinct one so the 3-frame diff below never spans a muxed
+        # duplicate. The ball is stationary across a repeat, so re-emit the last
+        # candidates for per-frame continuity.
+        if (self.dedup and self.prev is not None
+                and float(cv2.absdiff(gray, self.prev).mean()) < self.dup_thresh):
+            return list(self._last_out)
         # Three-frame differencing localises a moving blob to the MIDDLE frame's
         # position (the overlap of the two diffs), which is the PREVIOUS frame's
         # colour, not the current one — a fast ball has already moved on in the
@@ -151,4 +175,5 @@ class MotionBallDetector:
                 continue
             out.append(BallCandidate(float(x), float(y), float(2 * r), float(circularity)))
         out.sort(key=lambda b: -b.score)
-        return out[:5]
+        self._last_out = out[:5]
+        return list(self._last_out)

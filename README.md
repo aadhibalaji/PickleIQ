@@ -21,9 +21,42 @@ lessons globally** so every future clip starts from an improved baseline.
 copy .env.example .env        # then paste your Anthropic API key into .env
 npm install                   # one time, at the repo root (installs concurrently)
 
-# 2. Run everything (backend :8420 + frontend :5173) in one terminal
+# 2. Backend Python env (one time) — pick YOUR GPU path:
+npm run setup:backend:cuda    # NVIDIA GPU (recommended on CUDA machines)
+# OR
+npm run setup:backend         # Intel Arc (original dev machine)
+
+# 3. Run everything (backend :8420 + frontend :5173) in one terminal
 npm run dev                   # open http://localhost:5173
 ```
+
+### Backend setup (detail)
+
+**NVIDIA GPU** — use the CUDA PyTorch wheels, not the Intel XPU index:
+
+```powershell
+cd backend
+py -3.12 -m venv .venv
+.venv\Scripts\activate
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+pip install -r requirements-cuda.txt
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+Pick the `cu12x` index that matches `nvidia-smi` — see
+[pytorch.org/get-started](https://pytorch.org/get-started/locally/). Set
+`CV_DEVICE=cuda` in `.env`.
+
+**Intel Arc** — production path uses OpenVINO on the iGPU:
+
+```powershell
+cd backend
+py -3.12 -m venv .venv
+.venv\Scripts\pip install -r requirements.txt
+```
+
+Set `CV_DEVICE=auto` or `xpu` in `.env`. Optional: `pip install openvino` for the
+fast pose/TrackNet path on Intel GPU.
 
 `npm run dev` launches the FastAPI backend (from `backend\.venv`) and the Vite
 frontend together. To run them separately: `npm run dev:backend` and
@@ -156,13 +189,25 @@ via the lagging "players stopped and reset" signal with fuzzy timing.
 | `TRACKNET_WEIGHTS` | Path to TrackNet weights; unset = classical fallback. |
 | `DATA_DIR` | Storage root (default `./data`). |
 
-### Known behavior on this machine (Intel Arc 140V)
-- PyTorch runs on the Arc GPU via the XPU backend (`torch 2.12.1+xpu`) — used by
-  TrackNet and the BounceGRU once their weights exist.
-- Ultralytics currently rejects `device='xpu'` for YOLO-pose tracking; the code
-  detects this once and falls back to CPU automatically (logged as a warning).
-  CPU YOLO11-nano is fast enough for offline processing (~10-15 min for an
-  11-minute clip, Pass 1 + Pass 2 combined).
+### GPU / device notes
+
+| Hardware | Install file | `.env` | Inference path |
+|---|---|---|---|
+| **NVIDIA GPU** | `requirements-cuda.txt` + CUDA torch wheels | `CV_DEVICE=cuda` | Ultralytics + TrackNet on CUDA |
+| **Intel Arc** | `requirements.txt` (XPU wheels) | `CV_DEVICE=auto` or `xpu` | OpenVINO on iGPU (optional `pip install openvino`) |
+| **CPU only** | either file, torch CPU wheels | `CV_DEVICE=cpu` | Slower; same detection quality at default params |
+
+**Intel Arc 140V (original dev machine):**
+- PyTorch runs on the Arc GPU via the XPU backend — used by TrackNet and BounceGRU
+  when OpenVINO is unavailable.
+- Ultralytics rejects `device='xpu'` for YOLO-pose `.track()`; with OpenVINO
+  installed, pose runs on the Intel GPU. Without it, pose falls back to CPU.
+
+**NVIDIA:**
+- Do **not** install from the XPU index in `requirements.txt` — that can pull
+  the wrong torch build. Use `requirements-cuda.txt` instead.
+- OpenVINO targets Intel GPU only; on NVIDIA the code uses CUDA torch/Ultralytics
+  automatically. Detection quality matches at the same params; the main win is speed.
 
 ## Repo map
 

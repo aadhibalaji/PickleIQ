@@ -137,12 +137,16 @@ const VideoPlayer = forwardRef(function VideoPlayer(
     // Ball trail from recent entries — red so it contrasts with the (often
     // yellow) pickleball itself; current position gets a white outline.
     // Toggleable from the player controls (🎾).
-    if (stateRef.current.showBall) for (let d = 24; d >= 0; d--) {
+    if (stateRef.current.showBall) for (let d = 72; d >= 0; d--) {
       const e = c.byFrame.get(frame - d)
       if (e?.ball) {
-        const a = 1 - d / 28
+        const a = 1 - d / 80
         const isNow = d === 0 || (entry && e.f === entry.f)
-        g.fillStyle = isNow ? 'rgba(255,45,60,0.95)' : `rgba(255,45,60,${0.4 * a})`
+        const interp = e.interp || e.src === 'kalman' || e.src === 'cls-loose' || e.obs === false
+        const base = isNow ? 0.95 : 0.4 * a
+        g.fillStyle = isNow
+          ? (interp ? 'rgba(255,45,60,0.55)' : 'rgba(255,45,60,0.95)')
+          : `rgba(255,45,60,${interp ? 0.2 * a : base})`
         g.beginPath()
         g.arc(e.ball[0], e.ball[1], Math.max(4, (e.ball[2] || 7) / 2 + 1), 0, Math.PI * 2)
         g.fill()
@@ -155,16 +159,21 @@ const VideoPlayer = forwardRef(function VideoPlayer(
       // Event markers linger a few frames so they're visible at speed.
       if (e?.evt && frame - e.f <= 45) {
         const { evt } = e
-        g.strokeStyle = evt.kind === 'bounce'
-          ? (evt.in ? 'rgba(0,229,255,0.95)' : 'rgba(255,255,255,0.95)')
-          : 'rgba(229,165,58,0.95)'
+        // serve = AI-inferred (gold-green); bounce = cyan in / white out; hit = amber.
+        g.strokeStyle = evt.kind === 'serve'
+          ? 'rgba(120,200,80,0.95)'
+          : evt.kind === 'bounce'
+            ? (evt.in ? 'rgba(0,229,255,0.95)' : 'rgba(255,255,255,0.95)')
+            : 'rgba(229,165,58,0.95)'
         g.lineWidth = 4
         if (e.ball) {
           g.beginPath(); g.arc(e.ball[0], e.ball[1], 16, 0, Math.PI * 2); g.stroke()
           g.fillStyle = g.strokeStyle
           g.font = 'bold 17px system-ui'
-          g.fillText(evt.kind === 'bounce' ? (evt.in ? 'bounce' : 'bounce OUT') : 'hit',
-                     e.ball[0] + 20, e.ball[1] - 10)
+          const label = evt.kind === 'serve'
+            ? (evt.low_conf ? 'SERVE? (AI)' : 'SERVE (AI)')
+            : evt.kind === 'bounce' ? (evt.in ? 'bounce' : 'bounce OUT') : 'hit'
+          g.fillText(label, e.ball[0] + 20, e.ball[1] - 10)
         }
       }
     }

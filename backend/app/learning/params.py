@@ -49,6 +49,12 @@ DEFAULTS: dict[str, Any] = {
                                    # Pass 1's low-res subsample; full-res 60 fps clips often
                                    # need ~3-5 or the classical detector sees zero motion.
     "ball_min_circularity": 0.30,  # blob roundness floor (area / pi*r^2)
+    "ball_suppress_in_box": 1.0,   # drop ball blobs inside a detected player box
+                                   # (expanded by shoe/paddle margins). Overrides the
+                                   # permissive-detector default; ball is briefly lost
+                                   # during a hit (Kalman bridges it).
+    "ball_exclusion_zones": 1.0,   # apply the pose image-space deadzone triangles
+                                   # (exclusions.py) to ball candidates too
     "ball_seed_min_px": 2.0,       # min px/frame a cold-start candidate must MOVE before it
                                    # can seed a track (rejects stationary shoe/short blobs)
     "ball_foot_suppress_px": 35.0, # radius around foot keypoints to suppress blobs
@@ -76,7 +82,13 @@ DEFAULTS: dict[str, Any] = {
     # are structurally unreliable and must be reported as unknown, not wrong.
     "ball_height_max_sigma_m": 0.35,
     # ---- Pass 2 ball filtering layer (cv/ball_filter.py) -------------------
-    "ball_filter_enabled": 0.0,    # 1 = enable velocity/foot/arc RANSAC filter layer
+    "ball_filter_enabled": 0.0,    # 1 = enable stage 1-2 per-frame velocity/foot gate
+    "ball_arc_enabled": 0.0,       # 1 = enable stage 3-4 arc RANSAC + event classification.
+                                   # Independent of ball_filter_enabled: stage 1-2 gates raw
+                                   # per-frame dets; this gates the batch per-window arc
+                                   # segmentation/interpolation/hit-bounce pass. Default 0
+                                   # matches the only committed version (ball_filter_enabled=0,
+                                   # which disabled the arc stage for both detector paths).
     "ball_max_speed_mph": 65.0,    # generous max pickleball speed for the velocity gate
     "ball_speed_headroom": 1.6,    # gate slack (ball height/perspective aren't modelled)
     "ball_box_persist_frames": 3,  # frames at the same box-relative spot = shoe/hat/paddle
@@ -140,6 +152,26 @@ DEFAULTS: dict[str, Any] = {
     # e.g. "rally end lands consistently 4 frames late" -> end_offset -4.
     "start_offset_frames": 0,
     "end_offset_frames": 0,
+    # ---- Audio event extraction (cv/audio_events.py) -----------------------
+    "audio_band_low_hz": 1500.0,   # bandpass low edge — isolates paddle/ball 'pop'
+    "audio_band_high_hz": 6000.0,  # bandpass high edge (vs crowd/voice/low rumble)
+    "audio_onset_delta": 0.4,      # spectral-flux onset sensitivity (lower = more onsets)
+    "audio_onset_wait_s": 0.35,    # min seconds between accepted onsets
+    # ---- Audio x visual fusion (cv/bounce.py fuse_audio_events) -------------
+    "audio_visual_fusion_window_s": 0.12,  # match radius audio onset <-> visual event
+    "audio_paddle_px": 60.0,       # max px from ball to a wrist to count as paddle proximity
+    "audio_w_onset": 0.4,          # fusion weight: audio onset strength
+    "audio_w_kink": 0.35,          # fusion weight: trajectory (court-depth vy) kink
+    "audio_w_prox": 0.25,          # fusion weight: wrist/paddle proximity
+    "audio_visual_min_conf": 0.5,  # min fused confidence to SURFACE an audio-only hit marker
+    # ---- Pose-aware limb-lock ball exclusion (cv/ball_track.py) ------------
+    "limb_lock_dist_px": 30.0,     # a candidate this close to a wrist is a lock candidate
+    "limb_lock_rel_vel_px": 4.0,   # max |cand - wrist| displacement diff = moving in lockstep
+    "limb_lock_frames": 3,         # consecutive lockstep frames before a candidate is excluded
+    # ---- Serve marking (cv/pass2.py) --------------------------------------
+    "serve_window_start_s": 3.5,   # first fused hit within this of a rally start = serve.
+                                   # Pass 1 starts are recall-padded, so the real
+                                   # serve contact commonly lands 1-3 s in.
 }
 
 # Bounds keep report-driven updates from ever pushing a param somewhere
@@ -156,6 +188,7 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "ball_gate_px": (15.0, 120.0), "ball_accel_px": (0.0, 30.0),
     "ball_acq_px": (40.0, 200.0), "ball_seed_min_px": (1.0, 20.0),
     "ball_motion_thresh": (2.0, 20.0), "ball_min_circularity": (0.15, 0.60),
+    "ball_suppress_in_box": (0.0, 1.0), "ball_exclusion_zones": (0.0, 1.0),
     "ball_sat_min": (0.0, 255.0), "ball_val_min": (0.0, 255.0),
     "ball_hue_lo": (0.0, 180.0), "ball_hue_hi": (0.0, 180.0),
     "ball_foot_suppress_px": (10.0, 80.0), "ball_hit_speed_px": (6.0, 50.0),
@@ -164,7 +197,7 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "ball_court_margin_x_m": (0.5, 8.0), "ball_court_margin_y_m": (0.5, 8.0),
     "tracknet_conf": (0.1, 0.9),
     "ball_height_max_sigma_m": (0.05, 2.0),
-    "ball_filter_enabled": (0.0, 1.0),
+    "ball_filter_enabled": (0.0, 1.0), "ball_arc_enabled": (0.0, 1.0),
     "ball_max_speed_mph": (30.0, 120.0), "ball_speed_headroom": (1.0, 3.0),
     "ball_box_persist_frames": (2, 10), "ball_box_persist_px": (4.0, 40.0),
     "ball_foot_zone_frac": (0.0, 0.5),
@@ -186,6 +219,14 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "serve_formation_lookback_s": (1.0, 8.0), "confirm_window_s": (1.0, 6.0),
     "player_active_mps": (0.4, 3.0), "p2_reject_passes": (0.0, 1.0),
     "start_offset_frames": (-90, 90), "end_offset_frames": (-90, 90),
+    "audio_band_low_hz": (200.0, 4000.0), "audio_band_high_hz": (3000.0, 12000.0),
+    "audio_onset_delta": (0.05, 1.5), "audio_onset_wait_s": (0.05, 1.0),
+    "audio_visual_fusion_window_s": (0.03, 0.4), "audio_paddle_px": (15.0, 200.0),
+    "audio_w_onset": (0.0, 1.0), "audio_w_kink": (0.0, 1.0), "audio_w_prox": (0.0, 1.0),
+    "audio_visual_min_conf": (0.1, 0.95),
+    "limb_lock_dist_px": (5.0, 120.0), "limb_lock_rel_vel_px": (0.5, 30.0),
+    "limb_lock_frames": (2, 8),
+    "serve_window_start_s": (0.3, 4.0),
 }
 
 

@@ -42,9 +42,15 @@ def weights_path() -> Path | None:
     if TRACKNET_WEIGHTS:                 # explicit override always wins
         p = Path(TRACKNET_WEIGHTS)
         return p if p.exists() else None
-    if not TRACKNET_ENABLED:             # installed default gated by the flag
+    # Robust default pickup: if the canonical installed weights exist, use them.
+    # This keeps Pass 2 aligned with the integration docs after one-time setup
+    # (download + reprocess), even when .env changes have not been picked up by
+    # a stale backend process yet.
+    if DEFAULT_WEIGHTS.exists():
+        return DEFAULT_WEIGHTS
+    if not TRACKNET_ENABLED:
         return None
-    return DEFAULT_WEIGHTS if DEFAULT_WEIGHTS.exists() else None
+    return None
 
 
 def _build_model():

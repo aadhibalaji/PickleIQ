@@ -8,6 +8,7 @@ const TABS = [
   ['setup', 'Setup'],
   ['pass1', 'Pass 1 rallies'],
   ['pass2', 'Pass 2 detection'],
+  ['balleval', 'Ball Eval'],
 ]
 
 export default function Workspace({ videoId, onBack }) {
@@ -25,12 +26,14 @@ export default function Workspace({ videoId, onBack }) {
   // edit (an existing mark was clicked).
   const [gtMode, setGtMode] = useState(false)
   const [marks, setMarks] = useState([])
+  const [serves, setServes] = useState([])   // AI-inferred serve frames (pass2 overlay)
   const [gt, setGt] = useState({ step: 'idle', pending: null, choice: 'in', sel: null })
   const wasActiveRef = useRef(false)
   const playerRef = useRef(null)
 
   const loadRallies = useCallback(() => {
     api.getRallies(videoId).then(setRallies).catch(() => {})
+    api.getServes(videoId).then((r) => setServes(r.serves || [])).catch(() => {})
   }, [videoId])
 
   const loadCalibration = useCallback(() => {
@@ -195,10 +198,14 @@ export default function Workspace({ videoId, onBack }) {
   activeJobs.sort((a, b) => (a.status === 'running' ? -1 : 1))
   const lastError = jobs.find((j) => j.status === 'error')
 
-  const overlaySource = tab === 'pass1' ? 'pass1' : tab === 'pass2' ? 'pass2' : null
+  const overlaySource =
+    tab === 'pass1' ? 'pass1'
+    : tab === 'pass2' ? 'pass2'
+    : calibration?.calibrated ? 'pass2'
+    : null
   const tracks = [
     { name: 'Pass 1', color: '#e5a53a', spans: rallies.pass1 },
-    { name: 'Pass 2', color: '#58a6ff', spans: rallies.pass2 },
+    { name: 'Pass 2', color: '#58a6ff', spans: rallies.pass1 },
   ]
 
   return (
@@ -212,6 +219,18 @@ export default function Workspace({ videoId, onBack }) {
           <span className="muted">
             {video.fps?.toFixed(2)} fps · {video.frame_count} frames · params v{video.learned_params_version ?? '—'}
           </span>
+          {/* Re-run in place. Each pass wipes only its own rally_labels/overlays,
+              so ground-truth marks and human labels survive — no re-upload. */}
+          <button disabled={activeJobs.length > 0}
+                  onClick={() => api.reprocess(videoId, 'pass1').then(() => note('Pass 1 re-running (Pass 2 chains after)'))}
+                  title="Re-run Pass 1, then Pass 2. Keeps ground-truth marks and human labels.">
+            ↻ Pass 1
+          </button>
+          <button disabled={activeJobs.length > 0}
+                  onClick={() => api.reprocess(videoId, 'pass2').then(() => note('Pass 2 re-running'))}
+                  title="Re-run Pass 2 only. Keeps ground-truth marks and human labels.">
+            ↻ Pass 2
+          </button>
           <button className={gtMode ? 'active' : ''}
                   style={gtMode ? { borderColor: '#c3ce4a', color: '#c3ce4a' } : undefined}
                   onClick={() => { setGtMode((m) => !m); gtReset(); playerRef.current?.video()?.pause() }}
@@ -271,7 +290,7 @@ export default function Workspace({ videoId, onBack }) {
       />
       <div style={{ marginTop: 8 }}>
         <Timeline frameCount={video.frame_count || 1} frame={frame} tracks={tracks}
-                  marks={gtMode ? marks : null} onSeek={seek} />
+                  marks={gtMode ? marks : null} serves={serves} onSeek={seek} />
       </div>
 
       {gtMode && (
@@ -305,6 +324,10 @@ export default function Workspace({ videoId, onBack }) {
 
         {(tab === 'pass1' || tab === 'pass2') && (
           <PassTab source={tab} rallies={rallies[tab]} fps={video.fps || 30} onSeek={seek} />
+        )}
+
+        {tab === 'balleval' && (
+          <BallEvalTab videoId={videoId} jobs={jobs} fps={video.fps || 30} onSeek={seek} />
         )}
       </div>
     </div>
@@ -414,6 +437,323 @@ function GroundTruthPanel({ gt, marks, frame, fps, onSeek, onDelete }) {
       )}
     </div>
   )
+}
+
+// ---- Ball Eval -------------------------------------------------------------
+// Surfaces scripts/eval_ball_filter.py in the UI: run the harness as a
+// background job, then read back the pooled base-vs-filtered comparison, the
+// failure attribution, the condition slices, and the failure-crop gallery.
+
+const pctS = (n, d) => (d ? `${((100 * n) / d).toFixed(1)}%` : 'n/a')
+
+const median = (a) => {
+  if (!a || !a.length) return null
+  const s = [...a].sort((x, y) => x - y)
+  const m = s.length >> 1
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2
+}
+
+function BallEvalTab({ videoId, jobs, fps, onSeek }) {
+  const [runs, setRuns] = useState([])
+  const [selId, setSelId] = useState(null)
+  const [detail, setDetail] = useState(null)
+  const [err, setErr] = useState('')
+  const [detector, setDetector] = useState('classical')
+  const [diagnose, setDiagnose] = useState(true)
+  const [tag, setTag] = useState('run')
+  const wasRunning = useRef(false)
+
+  const job = jobs.find((jb) => jb.kind === 'ball_eval'
+    && (jb.status === 'queued' || jb.status === 'running'))
+
+  const load = useCallback(
+    () => api.listBallEvals(videoId).then(setRuns).catch((e) => setErr(String(e.message || e))),
+    [videoId])
+  useEffect(() => { load() }, [load])
+
+  // The clip-level poll in Workspace refreshes `jobs`; when the eval job stops
+  // being active, the new row exists — pull the list again.
+  useEffect(() => {
+    if (wasRunning.current && !job) load()
+    wasRunning.current = !!job
+  }, [job, load])
+
+  useEffect(() => { if (!selId && runs.length) setSelId(runs[0].id) }, [runs, selId])
+
+  useEffect(() => {
+    if (!selId) { setDetail(null); return }
+    let stale = false
+    api.getBallEval(videoId, selId)
+      .then((d) => { if (!stale) setDetail(d) })
+      .catch((e) => setErr(String(e.message || e)))
+    return () => { stale = true }
+  }, [videoId, selId])
+
+  const start = () => {
+    setErr('')
+    api.runBallEval(videoId, { detector, diagnose, tag })
+      .catch((e) => setErr(String(e.message || e)))
+  }
+
+  return (
+    <div>
+      <div className="muted">
+        Runs the ball-filter harness over this clip's rally windows: the pre-filter
+        Pass 2 path (<b>base</b>) against the Phase-1 filtering layer (<b>filt</b>).
+        Metrics are scored against the ground-truth marks you place with 🎯 Mark
+        ground truth. Read-only — nothing here changes detection.
+      </div>
+
+      <div className="row" style={{ marginTop: 10 }}>
+        <button onClick={start} disabled={!!job}>
+          {job ? `Running… ${Math.round((job.progress || 0) * 100)}%` : 'Run eval'}
+        </button>
+        <label className="muted">detector{' '}
+          <select value={detector} onChange={(e) => setDetector(e.target.value)} disabled={!!job}>
+            <option value="classical">classical</option>
+            <option value="tracknet">tracknet</option>
+          </select>
+        </label>
+        <label className="muted">
+          <input type="checkbox" checked={diagnose} disabled={!!job}
+                 onChange={(e) => setDiagnose(e.target.checked)} /> diagnose
+        </label>
+        <label className="muted">tag{' '}
+          <input value={tag} size="10" disabled={!!job}
+                 onChange={(e) => setTag(e.target.value)} />
+        </label>
+        {job && <span className="muted">{job.message}</span>}
+      </div>
+      {err && <div className="error" style={{ marginTop: 6 }}>⚠ {err}</div>}
+
+      <h3>Past runs</h3>
+      <table>
+        <thead>
+          <tr><th>When</th><th>Tag</th><th>Detector</th><th>Marks</th><th>Det rate</th>
+            <th>Pos err</th><th>Bounce P/R</th><th>In/out</th><th></th></tr>
+        </thead>
+        <tbody>
+          {runs.map((r) => (
+            <tr key={r.id} style={r.id === selId ? { background: '#1c2530' } : undefined}>
+              <td>{new Date(r.created_at * 1000).toLocaleString()}</td>
+              <td>{r.tag}</td>
+              <td>{r.detector}</td>
+              <td>{r.status === 'skipped' ? '—' : r.n_marks}</td>
+              <td>{r.det_rate != null ? `${(r.det_rate * 100).toFixed(1)}%` : '—'}</td>
+              <td>{r.pos_err_med_px != null ? `${r.pos_err_med_px.toFixed(1)}px` : '—'}</td>
+              <td>
+                {r.bounce_p != null && r.bounce_r != null
+                  ? `${(r.bounce_p * 100).toFixed(0)}% / ${(r.bounce_r * 100).toFixed(0)}%`
+                  : '—'}
+              </td>
+              <td>{r.inout_acc != null ? `${(r.inout_acc * 100).toFixed(0)}%` : '—'}</td>
+              <td><button onClick={() => setSelId(r.id)}>View</button></td>
+            </tr>
+          ))}
+          {runs.length === 0 && (
+            <tr><td colSpan="9" className="muted">No eval runs yet — hit “Run eval”.</td></tr>
+          )}
+        </tbody>
+      </table>
+
+      {detail && detail.status === 'skipped' && (
+        <div className="error" style={{ marginTop: 10 }}>
+          ⚠ This clip could not be evaluated: {detail.message}
+        </div>
+      )}
+      {detail && detail.status === 'ok' && detail.result && (
+        <EvalDetail detail={detail} fps={fps} onSeek={onSeek} />
+      )}
+    </div>
+  )
+}
+
+function EvalDetail({ detail, fps, onSeek }) {
+  const m = detail.result
+  const fr = m.frames || 1
+  const b = m.base
+  const fl = m.filt
+  const gt = m.gt || {}
+  const diag = m.diag || null
+
+  // Mirrors fmt_clip()'s base/filt comparison, in the same order.
+  const rows = [
+    ['det rate', pctS(b.det, fr),
+      `${pctS(fl.det, fr)} (+interp → ${pctS(fl.det + fl.interp, fr)})`],
+    ['phys viol %', `${pctS(b.viol, b.pairs)} of ${b.pairs}`,
+      `${pctS(fl.viol, fl.pairs)} of ${fl.pairs}`],
+    ['foot-zone FP %', pctS(b.foot, b.det), pctS(fl.foot, fl.det + fl.interp)],
+    ['pos err median px', fmtErr(b), fmtErr(fl)],
+  ]
+  if (gt.bounce) {
+    rows.push(['bounce P / R', fmtPR(b, gt.bounce), fmtPR(fl, gt.bounce)])
+    rows.push(['in/out accuracy', fmtAcc(b), fmtAcc(fl)])
+  }
+
+  return (
+    <div>
+      <h3>Pooled metrics</h3>
+      <div className="muted" style={{ marginBottom: 6 }}>
+        {m.windows} {m.win_source} rallies · {fr} frames · {m.raw_cands} raw candidates ·{' '}
+        {gt.in_windows || 0} GT marks in windows ({gt.bounce || 0} bounce, {gt.hit || 0} hit,{' '}
+        {gt.position || 0} position) · params v{detail.params_version || '—'} · overlay cover{' '}
+        <span style={m.overlay_cov / fr < 0.5 ? { color: 'var(--danger)', fontWeight: 600 } : undefined}>
+          {pctS(m.overlay_cov, fr)}
+        </span>
+        {m.overlay_cov / fr < 0.5 && ' — run Pass 2 first, the filter has no player boxes to work with'}
+      </div>
+      <table>
+        <thead><tr><th>Metric</th><th>Base (no filter)</th><th>Filtered</th></tr></thead>
+        <tbody>
+          {rows.map(([k, bv, fv]) => (
+            <tr key={k}><td>{k}</td><td>{bv}</td><td>{fv}</td></tr>
+          ))}
+        </tbody>
+      </table>
+
+      {!diag && (
+        <div className="muted" style={{ marginTop: 10 }}>
+          This run was made without <b>diagnose</b>, so there is no failure
+          attribution, slice table, or gallery. Re-run with it checked.
+        </div>
+      )}
+
+      {diag && (
+        <>
+          <h3>Failure attribution</h3>
+          <div className="muted" style={{ marginBottom: 6 }}>
+            Every GT mark the filtered pipeline missed, attributed to the pipeline
+            stage that lost the ball.
+          </div>
+          <table>
+            <thead><tr><th>Category</th><th>Count</th><th>Suggested lever</th></tr></thead>
+            <tbody>
+              {detail.attribution.map((a) => (
+                <tr key={a.category}>
+                  <td>{a.category}</td><td>{a.count}</td>
+                  <td className="muted">{a.lever}</td>
+                </tr>
+              ))}
+              {detail.attribution.length === 0 && (
+                <tr><td colSpan="3" className="muted">No mark failures.</td></tr>
+              )}
+            </tbody>
+          </table>
+
+          {detail.bounce_attribution.length > 0 && (
+            <>
+              <h3>Bounce-event misses</h3>
+              <table>
+                <thead><tr><th>Category</th><th>Count</th><th>Suggested lever</th></tr></thead>
+                <tbody>
+                  {detail.bounce_attribution.map((a) => (
+                    <tr key={a.category}>
+                      <td>{a.category}</td><td>{a.count}</td>
+                      <td className="muted">{a.lever}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </>
+          )}
+
+          <h3>Condition slices</h3>
+          <div className="muted" style={{ marginBottom: 6 }}>
+            On-ball = final output within 25px of the mark. Pooled median{' '}
+            {diag.pooled_med_px?.toFixed(1)}px. <span style={{ color: 'var(--danger)' }}>*HIGH</span>{' '}
+            = median error over 2× pooled; <i>~lowN</i> = fewer than 8 marks, treat as noise.
+          </div>
+          <table>
+            <thead>
+              <tr><th>Dim</th><th>Value</th><th>n</th><th>On-ball %</th><th>Median err</th><th>Flags</th></tr>
+            </thead>
+            <tbody>
+              {diag.slices.map(([dim, val, n, onball, med, flag], i) => {
+                const high = flag.includes('*HIGH')
+                return (
+                  <tr key={`${dim}-${val}-${i}`}>
+                    <td>{dim}</td>
+                    <td>{val}</td>
+                    <td>{n}</td>
+                    <td>{onball.toFixed(1)}%</td>
+                    <td style={high ? { color: 'var(--danger)', fontWeight: 600 } : undefined}>
+                      {med != null ? `${med.toFixed(1)}px` : 'n/a'}
+                    </td>
+                    <td>
+                      {high && <span style={{ color: 'var(--danger)' }}>*HIGH </span>}
+                      {flag.includes('~lowN') && <span className="muted">~lowN</span>}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+
+          <Gallery gallery={diag.gallery || []} fps={fps} onSeek={onSeek} />
+        </>
+      )}
+    </div>
+  )
+}
+
+// Failure crops grouped by category. Yellow = GT mark, white = raw candidate,
+// red = filter-rejected, green = final output (see _save_galleries).
+function Gallery({ gallery, fps, onSeek }) {
+  if (!gallery.length) {
+    return (
+      <>
+        <h3>Failure gallery</h3>
+        <div className="muted">No crops written for this run.</div>
+      </>
+    )
+  }
+  const byCat = {}
+  for (const g of gallery) (byCat[g.category] ||= []).push(g)
+  return (
+    <>
+      <h3>Failure gallery</h3>
+      <div className="muted" style={{ marginBottom: 6 }}>
+        Up to 10 worst crops per category. Yellow = ground truth · white = raw
+        candidate · red = rejected by the filter · green = final output. Click a
+        crop to seek there.
+      </div>
+      {Object.entries(byCat).map(([cat, items]) => (
+        <div key={cat} style={{ marginBottom: 12 }}>
+          <div style={{ marginBottom: 4 }}><b>{cat}</b> <span className="muted">({items.length})</span></div>
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+            {items.map((g) => (
+              <figure key={g.file} style={{ margin: 0, cursor: 'pointer' }}
+                      onClick={() => onSeek(g.frame)} title={`seek to frame ${g.frame}`}>
+                <img src={api.evalDiagUrl(g.file)} alt={`${cat} frame ${g.frame}`}
+                     loading="lazy" width="150"
+                     style={{ display: 'block', borderRadius: 4, border: '1px solid var(--border)' }} />
+                <figcaption className="muted" style={{ textAlign: 'center' }}>
+                  {fmt(g.frame, fps)}
+                </figcaption>
+              </figure>
+            ))}
+          </div>
+        </div>
+      ))}
+    </>
+  )
+}
+
+function fmtErr(d) {
+  const med = median(d.pos_err)
+  return med == null
+    ? `n/a (miss ${d.pos_miss})`
+    : `${med.toFixed(1)}px (n=${d.pos_err.length}, miss ${d.pos_miss})`
+}
+
+function fmtPR(d, nGtBounce) {
+  const p = d.bounce_pred ? (100 * d.bounce_matched) / d.bounce_pred : 0
+  const r = (100 * d.bounce_matched) / nGtBounce
+  return `P ${p.toFixed(0)}% R ${r.toFixed(0)}% (${d.bounce_matched}/${d.bounce_pred} pred)`
+}
+
+function fmtAcc(d) {
+  return d.inout_n ? `${((100 * d.inout_ok) / d.inout_n).toFixed(0)}% of ${d.inout_n}` : 'n/a'
 }
 
 function fmt(f, fps) {

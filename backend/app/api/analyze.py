@@ -22,6 +22,18 @@ def get_overlays(video_id: str, source: str, start: int = 0, end: int = 10**9):
     return {"entries": overlays.read_range(video_id, source, start, end)}
 
 
+@router.get("/videos/{video_id}/serves")
+def get_serves(video_id: str):
+    """AI-inferred serve moments (Pass 2 overlay evt.kind=='serve'), for the
+    timeline 'S' ticks. Cheap typed read — avoids shipping the full overlay to
+    the client just to find a handful of serves."""
+    serves = [{"frame": e["f"],
+               "low_conf": bool(e.get("evt", {}).get("low_conf"))}
+              for e in overlays.read_range(video_id, "pass2", 0, 10**9)
+              if e.get("evt", {}).get("kind") == "serve"]
+    return {"serves": serves}
+
+
 @router.get("/videos/{video_id}/detect_debug")
 def detect_debug(video_id: str):
     """Read-only diagnostics for why a clip matches (or doesn't) its human

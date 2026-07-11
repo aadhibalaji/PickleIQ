@@ -122,15 +122,65 @@ def _resolve_video(con, filename: str) -> str | None:
     return rows[0]["id"] if rows else None
 
 
-def import_(in_path: Path, replace: bool) -> None:
+def _legacy_to_videos(payload: list, id_map: dict[str, str]) -> dict:
+    """Convert the legacy flat-array export (raw ball_corrections rows keyed by
+    the EXPORTING machine's video_id — no filenames) to the portable
+    {filename: {marks}} shape. Legacy ids mean nothing in another install's DB,
+    so each id must be mapped to a local filename via --map; unmapped ids are
+    reported loudly instead of silently importing nothing."""
+    by_id: dict[str, list[dict]] = {}
+    for row in payload:
+        by_id.setdefault(row.get("video_id", "?"), []).append(row)
+    videos: dict[str, dict] = {}
+    unmapped = []
+    for vid, rows in sorted(by_id.items()):
+        name = id_map.get(vid) or next(
+            (v for k, v in id_map.items() if vid.startswith(k)), None)
+        if name is None:
+            unmapped.append(f"{vid[:12]}… ({len(rows)} marks)")
+            continue
+        marks = videos.setdefault(name, {"marks": []})["marks"]
+        seen = {_mark_key(m) for m in marks}
+        for r in rows:
+            m = {f: r.get(f) for f in _MARK_FIELDS}
+            if not m.get("event_type"):
+                m["event_type"] = "position"
+            if m.get("scope") is None:
+                m["scope"] = "clip_local"
+            m["disagree"] = int(m.get("disagree") or 0)
+            key = _mark_key(m)
+            if key not in seen:
+                seen.add(key)
+                marks.append(m)
+    if unmapped:
+        print("LEGACY FILE: these exporter-local video ids have no --map entry "
+              "and were SKIPPED (marks unusable without knowing which clip "
+              "file they belong to):")
+        for u in unmapped:
+            print(f"  {u}")
+        print('  fix: re-run with --map <id-prefix>=<local filename>, e.g. '
+              '--map 760f1e0e="doubles clip.mp4"')
+    return videos
+
+
+def import_(in_path: Path, replace: bool, id_map: dict[str, str]) -> None:
     if not in_path.exists():
         sys.exit(f"no ground-truth file at {in_path} — run 'export' first "
                  "(or point --in at the shared file)")
     payload = json.loads(in_path.read_text())
-    if payload.get("format_version") != FORMAT_VERSION:
-        print(f"warning: format_version {payload.get('format_version')} != "
-              f"{FORMAT_VERSION}; attempting import anyway")
-    videos = payload.get("videos", {})
+    if isinstance(payload, list):
+        # Legacy flat-array format (pre-FORMAT_VERSION exporter): raw DB rows
+        # keyed by the exporting machine's video_id. This is what an old
+        # reference_data/ball_gt.json contains — without this branch the
+        # import crashed (or worse, matched nothing) on other machines.
+        print(f"legacy flat-array ground-truth file ({len(payload)} rows) — "
+              "converting")
+        videos = _legacy_to_videos(payload, id_map)
+    else:
+        if payload.get("format_version") != FORMAT_VERSION:
+            print(f"warning: format_version {payload.get('format_version')} != "
+                  f"{FORMAT_VERSION}; attempting import anyway")
+        videos = payload.get("videos", {})
 
     n_ins = n_skip = n_clips = 0
     unmatched: list[str] = []
@@ -189,12 +239,19 @@ def main() -> None:
                     help=f"input path (default: {DEFAULT_PATH})")
     pi.add_argument("--replace", action="store_true",
                     help="clear each clip's existing marks before importing")
+    pi.add_argument("--map", action="append", default=[], metavar="ID=FILENAME",
+                    help="legacy files only: map an exporter-local video id "
+                         "(prefix ok) to a local clip filename (repeatable)")
 
     args = ap.parse_args()
     if args.cmd == "export":
         export(args.out, args.video_id)
     else:
-        import_(args.in_path, args.replace)
+        id_map = {}
+        for kv in args.map:
+            k, _, v = kv.partition("=")
+            id_map[k.strip()] = v.strip().strip('"')
+        import_(args.in_path, args.replace, id_map)
 
 
 if __name__ == "__main__":

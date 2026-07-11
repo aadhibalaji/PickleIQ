@@ -1,6 +1,9 @@
-# Install into a Python 3.12 venv (NOT 3.14 — torch/ultralytics support):
+# Intel Arc (XPU) backend install — Python 3.12 venv (NOT 3.14).
+#
 #   py -3.12 -m venv .venv
 #   .venv\Scripts\pip install -r requirements.txt
+#
+# NVIDIA GPU? Use requirements-cuda.txt instead (see README § Backend setup).
 #
 # torch/torchvision come from the Intel XPU wheel index so inference can run
 # on the Intel Arc GPU (falls back to CPU automatically if unavailable).
@@ -13,6 +16,10 @@ uvicorn[standard]
 python-multipart
 python-dotenv
 numpy
+scipy                # bandpass filter for audio onset detection (cv/audio_events.py)
+librosa              # spectral-flux onset detection (audio hit candidates)
+soundfile            # librosa wav backend
+imageio-ffmpeg       # bundled static ffmpeg for audio extraction (no system ffmpeg needed)
 opencv-python
 ultralytics          # YOLO11-pose + ByteTrack (weights auto-download)
 lapx                 # assignment solver used by the tracker

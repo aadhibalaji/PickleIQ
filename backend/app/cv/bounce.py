@@ -22,6 +22,7 @@ improves localization.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -242,6 +243,125 @@ def detect_events(
             if (not np.isnan(h[i]) and h[i] > hit_h) or near_player(i):
                 add(i, "hit", {"reason": "depth reversal at height or player"})
     return events
+
+
+# COCO-17 wrist keypoint indices (left, right) — the closest proxy this pose
+# model has to a paddle/contact point (no paddle keypoint exists).
+_WRIST_KP = (9, 10)
+
+
+def _wrist_pts(entry: dict | None) -> list[tuple[float, float]]:
+    """Detected wrist pixel positions from an overlay entry ((0,0) = missing)."""
+    if not entry:
+        return []
+    out = []
+    for p in entry.get("players", []):
+        kp = p.get("kp") or []
+        for j in _WRIST_KP:
+            if j < len(kp) and kp[j] and (kp[j][0] or kp[j][1]):
+                out.append((float(kp[j][0]), float(kp[j][1])))
+    return out
+
+
+def fuse_audio_events(
+    events: list[BallEvent],
+    world: list[BallWorld],
+    entries: dict[int, dict],
+    audio_rows: list[dict],          # {time_s, frame_index, onset_strength} in-window
+    params: dict,
+    fps: float,
+    H: np.ndarray | None,
+    ball_px: dict[int, tuple[float, float]],
+) -> list[BallEvent]:
+    """Cross-reference audio onsets against the visual event list + pose.
+
+    Returns the (possibly extended) event list with a fused confidence attached
+    in each event's `detail` ('conf' 0-1, 'audio' bool). Rules (plan Feature 2):
+      * an onset matched to a visual event -> boost: mark audio-corroborated.
+      * an onset with a trajectory KINK + wrist PROXIMITY but NO visual event
+        and conf >= audio_visual_min_conf -> SURFACE a new low-confidence hit
+        (recall path for the far-court weak-visual-signal case).
+      * an onset with neither kink nor proximity (cross-court bleed) -> dropped.
+    Never deletes an existing visual event; unmatched visual events keep their
+    own (audio=False) confidence. `audio_rows` must already be clipped to the
+    current Pass 1 rally window by the caller (window gating).
+    """
+    if not audio_rows or not world:
+        return events
+    w_on = float(params.get("audio_w_onset", 0.4))
+    w_kn = float(params.get("audio_w_kink", 0.35))
+    w_px = float(params.get("audio_w_prox", 0.25))
+    min_conf = float(params.get("audio_visual_min_conf", 0.5))
+    paddle_px = float(params.get("audio_paddle_px", 60.0))
+    match_win = max(1, int(fps * params.get("audio_visual_fusion_window_s", 0.12)))
+    min_gap = max(3, int(fps * params.get("min_event_gap_s", 0.12)))
+
+    frames = np.array([w.frame for w in world])
+    ys = np.array([w.court_y for w in world])
+    vy = np.gradient(_median_filter(ys, 5))
+    kink_all = np.abs(np.gradient(vy))              # curvature of court-depth
+    max_kink = float(kink_all.max()) if len(kink_all) else 0.0
+    max_onset = max((float(r["onset_strength"]) for r in audio_rows), default=0.0)
+
+    def nearest_idx(f: int) -> int:
+        i = int(np.searchsorted(frames, f))
+        i = min(max(i, 0), len(frames) - 1)
+        if i > 0 and abs(frames[i - 1] - f) < abs(frames[i] - f):
+            i -= 1
+        return i
+
+    def ball_at(f: int) -> tuple[float, float] | None:
+        for df in range(match_win + 1):             # nearest observed pixel
+            for c in ((f, f - df, f + df) if df else (f,)):
+                if c in ball_px:
+                    return ball_px[c]
+        return None
+
+    new_events: list[BallEvent] = []
+    for r in audio_rows:
+        fa = int(r["frame_index"])
+        i = nearest_idx(fa)
+        if abs(frames[i] - fa) > match_win:
+            continue                                # onset far outside the track
+        kink = float(kink_all[i])
+        kink_n = kink / max_kink if max_kink > 0 else 0.0
+        onset_n = float(r["onset_strength"]) / max_onset if max_onset > 0 else 0.0
+        bpx = ball_at(fa)
+        wpts = _wrist_pts(entries.get(int(frames[i])))
+        prox = 0.0
+        if bpx is not None and wpts:
+            d = min(math.hypot(bpx[0] - wx, bpx[1] - wy) for wx, wy in wpts)
+            prox = max(0.0, 1.0 - d / paddle_px)
+        conf = round(w_on * onset_n + w_kn * kink_n + w_px * prox, 3)
+
+        match = min(events, key=lambda e: abs(e.frame - fa), default=None)
+        if match is not None and abs(match.frame - fa) <= match_win:
+            match.detail["audio"] = True
+            match.detail["conf"] = max(float(match.detail.get("conf", 0.0)), conf)
+            continue
+        # Unmatched: surface if there's a real trajectory kink and the combined
+        # confidence clears the bar. Wrist proximity BOOSTS conf but is NOT
+        # required — on the far axial camera pose wrists are often missing, and
+        # requiring them would kill exactly the far-court recall case this exists
+        # for. Cross-court bleed still falls through: it's window-gated out, and a
+        # weak onset+kink can't reach min_conf on its own.
+        if kink_n > 0 and conf >= min_conf:
+            if any(abs(e.frame - fa) < min_gap for e in events + new_events):
+                continue
+            wpt = world[i]
+            cx, cy = wpt.court_x, wpt.court_y
+            if H is not None and bpx is not None:
+                cxy = court.img_to_court(H, np.array([[bpx[0], bpx[1]]]))[0]
+                cx, cy = float(cxy[0]), float(cxy[1])
+            new_events.append(BallEvent(
+                frame=int(frames[i]), kind="hit", court_x=cx, court_y=cy,
+                height=wpt.height if not np.isnan(wpt.height) else -1.0,
+                in_court=bool(court.in_court(np.array([[cx, cy]]))[0]),
+                side=court.side_of_net(cy), near_player=prox > 0,
+                observed=wpt.observed, height_known=not np.isnan(wpt.height),
+                detail={"src": "audio", "audio": True, "conf": conf},
+            ))
+    return sorted(events + new_events, key=lambda e: e.frame)
 
 
 # ---------------------------------------------------------------------------

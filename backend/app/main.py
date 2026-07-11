@@ -12,6 +12,8 @@ from fastapi.staticfiles import StaticFiles
 
 from . import db
 from .api import analyze, annotate, chat, media, models
+from .api import eval as eval_api  # `eval` shadows the builtin — alias it
+from .config import DATA_DIR
 from .jobs import runner
 from .learning import params as learned_params
 
@@ -48,11 +50,20 @@ app.include_router(annotate.router, prefix="/api")
 app.include_router(analyze.router, prefix="/api")
 app.include_router(chat.router, prefix="/api")
 app.include_router(models.router, prefix="/api")
+app.include_router(eval_api.router, prefix="/api")
 
 
 @app.get("/api/health")
 def health():
     return {"ok": True}
+
+
+# Failure-crop galleries written by the ball_eval harness. Mounted under /api so
+# the Vite dev server's proxy (which only forwards /api) serves them in dev too;
+# it must also precede the catch-all "/" frontend mount below.
+_eval_diag = DATA_DIR / "eval_diag"
+_eval_diag.mkdir(parents=True, exist_ok=True)
+app.mount("/api/eval_diag", StaticFiles(directory=_eval_diag), name="eval_diag")
 
 
 # Serve the built frontend when it exists (production mode); during
