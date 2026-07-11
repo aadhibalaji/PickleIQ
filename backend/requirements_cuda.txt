@@ -1,0 +1,33 @@
+# NVIDIA CUDA backend install (Python 3.12 venv — NOT 3.14).
+#
+# 1. Create / activate the venv:
+#      py -3.12 -m venv .venv
+#      .venv\Scripts\activate          # Windows
+#      source .venv/bin/activate       # Linux / macOS
+#
+# 2. Check your driver supports which CUDA build:
+#      nvidia-smi
+#    Note the "CUDA Version" line, then pick the matching wheel index from
+#    https://pytorch.org/get-started/locally/  (e.g. cu124, cu126, cu128).
+#
+# 3. Install PyTorch *before* this file (replace cu126 if needed):
+#      pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+#
+# 4. Install the rest of the backend:
+#      pip install -r requirements-cuda.txt
+#
+# 5. Verify GPU is visible:
+#      python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+#
+# Set CV_DEVICE=cuda (or auto) in .env. OpenVINO is Intel-GPU only — on NVIDIA,
+# pose and TrackNet run via Ultralytics/PyTorch on CUDA automatically.
+
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv
+numpy
+opencv-python
+ultralytics          # YOLO11-pose + ByteTrack (weights auto-download)
+lapx                 # assignment solver used by the tracker
+anthropic            # discrepancy-analysis report only

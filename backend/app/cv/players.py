@@ -23,6 +23,18 @@ from .device import ultralytics_device
 
 log = logging.getLogger("cv.players")
 
+# Resolved once: passing the bare name "bytetrack.yaml" makes ultralytics
+# re-glob its whole package tree to find it on EVERY .track() call (measured:
+# ~29% of total Pass 2 time going into ultralytics.utils.checks.check_file's
+# recursive glob, called once per frame). An absolute path hits check_file's
+# Path.exists() fast path instead.
+def _bytetrack_yaml() -> str:
+    import ultralytics
+    return str(Path(ultralytics.__file__).parent / "cfg" / "trackers" / "bytetrack.yaml")
+
+
+_BYTETRACK_YAML = _bytetrack_yaml()
+
 
 def _build_model(name: str):
     """Construct a FRESH YOLO-pose model. Each PoseTracker gets its own instance
@@ -134,7 +146,7 @@ class PoseTracker:
         # Pass 1 keeps resetting (sparse), Pass 2 then persists for stable IDs.
         persist = self._track_sequence and self._started
         self._started = True
-        kwargs = dict(persist=persist, tracker="bytetrack.yaml", classes=[0],
+        kwargs = dict(persist=persist, tracker=_BYTETRACK_YAML, classes=[0],
                       conf=self._conf, imgsz=self._imgsz, verbose=False)
         try:
             res = model.track(frame, device=self._device if self._device_ok else "cpu", **kwargs)
