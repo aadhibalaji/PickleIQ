@@ -54,6 +54,10 @@ class RefineConfig:
     stationary_mps: float = 1.0     # "stationary" player speed (pose jitter!)
     behind_baseline_m: float = 1.5  # soft ramp: at/behind baseline -> this far in
     formation_hold_s: float = 0.8   # formation must hold this long (serve pre-phase)
+    # retreat_frac: players walking back to their own baseline = point over.
+    # Walking band only — a sprint to a deep lob is play, not a reset.
+    retreat_min_mps: float = 0.3
+    retreat_max_mps: float = 3.0
     reactivity_window_s: float = 2.0
     reactivity_spike_mps: float = 1.2   # player speed spike threshold
     reactivity_match_s: float = 0.5     # spike within this of a crossing counts
@@ -87,6 +91,10 @@ class RefineConfig:
         "mean_pspeed_n": 1.5,       # players run during a point, stop between
         "max_pspeed_n": 0.7,
         "near_player_time_n": -1.4, # ball parked near one player = dead
+        "retreat_frac": -1.5,       # players walking back to their own baseline
+                                    # = point over (live-vs-gap AUC 0.84; cut a
+                                    # late rally end 86.4s -> 78.6s on the
+                                    # verified Second-3-mins clip)
         "ready_frac": 0.2,
         "out_of_court_time_n": -1.4,
     })
@@ -126,6 +134,11 @@ class RefineConfig:
                                             # one (plane projection is only valid
                                             # when the ball is near the ground)
     serve_min_gap_s: float = 0.2    # ball invisible at least this long before "appearance"
+    # When the ball was visible in less than this fraction of the serve search
+    # range, the contact/landing zeros are a sensor gap, not evidence of no
+    # serve — the gate rescores over the observable phases (formation, flight,
+    # rally evidence), gated on pre_serve >= 0.5 + a detected flight crossing.
+    serve_ball_vis_excuse: float = 0.4
     serve_flight_min_s: float = 0.3
     serve_flight_max_s: float = 2.0
     # rally_evidence: sustained net-crossing rate inside the segment. Partial

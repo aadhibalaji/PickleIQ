@@ -102,7 +102,47 @@ def stream_video(video_id: str, request: Request):
         row = con.execute("SELECT path FROM videos WHERE id=?", (video_id,)).fetchone()
     if row is None:
         raise HTTPException(404, "video not found")
-    path = Path(row["path"])
+    return _stream_file(Path(row["path"]), request)
+
+
+# ------------------------------------------------ rallies-only cropped video ---
+
+@router.post("/videos/{video_id}/cropped")
+def build_cropped_video(video_id: str):
+    """Queue the rallies-only export (kept refined segments concatenated).
+    Progress shows up in the normal jobs panel; kind='crop'."""
+    from .. import export
+    status = export.cropped_status(video_id)
+    if status["n_rallies"] == 0:
+        raise HTTPException(400, "no kept rallies to export — run Pass 2 first")
+
+    def do_crop(handle):
+        export.build_cropped(video_id, handle)
+
+    job_id = runner.submit(video_id, "crop", do_crop)
+    return {"job_id": job_id, **status}
+
+
+@router.get("/videos/{video_id}/cropped")
+def cropped_video_status(video_id: str):
+    from .. import export
+    try:
+        return export.cropped_status(video_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.get("/videos/{video_id}/cropped/stream")
+def stream_cropped_video(video_id: str, request: Request):
+    from .. import export
+    try:
+        path = export.cropped_path(video_id)
+    except ValueError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return _stream_file(path, request)
+
+
+def _stream_file(path: Path, request: Request):
     if not path.exists():
         raise HTTPException(404, "video file missing on disk")
     size = path.stat().st_size

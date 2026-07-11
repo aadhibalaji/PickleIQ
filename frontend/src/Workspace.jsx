@@ -329,6 +329,15 @@ export default function Workspace({ videoId, onBack }) {
       <div className="tabbody">
         {tab === 'setup' && (
           <>
+            <LabelingPanel
+              videoId={videoId}
+              fps={video.fps || 30}
+              frame={frame}
+              labels={humanDraft || []}
+              setLabels={setHumanDraft}
+              onSeek={seek}
+              onSaved={() => { note('Rally labels saved'); loadRallies() }}
+            />
             <CalibrationPanel
               videoId={videoId}
               calibration={calibration}
@@ -341,15 +350,6 @@ export default function Workspace({ videoId, onBack }) {
                   .then(() => note('Calibration saved — Pass 2 re-running automatically'))
                   .catch(() => note('Calibration saved'))
               }}
-            />
-            <LabelingPanel
-              videoId={videoId}
-              fps={video.fps || 30}
-              frame={frame}
-              labels={humanDraft || []}
-              setLabels={setHumanDraft}
-              onSeek={seek}
-              onSaved={() => { note('Rally labels saved'); loadRallies() }}
             />
             <ServeDatasetPanel videoId={videoId} note={note} />
           </>
@@ -492,6 +492,7 @@ function PassTab({ source, rallies = [], windows = [], fps, onSeek, exists = tru
         </div>
       </div>
       <Recommendation videoId={videoId} note={note} nGraded={graded.length} />
+      <CroppedVideoPanel videoId={videoId} note={note} />
       <table style={{ marginTop: 10 }}>
         <thead><tr>
           <th>#</th><th>Start</th><th>End</th><th>Length</th>
@@ -593,6 +594,76 @@ function Recommendation({ videoId, note, nGraded }) {
             </button>
           ) : <div className="muted" style={{ marginTop: 6 }}>Current threshold is already best on your grades.</div>}
         </div>
+      )}
+    </div>
+  )
+}
+
+// Rallies-only export: concatenates the kept refined segments into one video
+// (all dead time cut out). Build runs as a background job (kind 'crop', shows
+// in the jobs panel); the panel polls status while building and swaps in the
+// player when the file is ready. `stale` = refine results changed since the
+// last build.
+function CroppedVideoPanel({ videoId, note }) {
+  const [status, setStatus] = useState(null)
+  const [building, setBuilding] = useState(false)
+  const [show, setShow] = useState(false)
+
+  const load = useCallback(() => {
+    api.croppedStatus(videoId).then((s) => {
+      setStatus(s)
+      if (s.exists) setBuilding(false)
+    }).catch(() => {})
+  }, [videoId])
+  useEffect(() => { load() }, [load])
+
+  // While a build is running, poll until the file lands.
+  useEffect(() => {
+    if (!building) return undefined
+    const t = setInterval(load, 3000)
+    return () => clearInterval(t)
+  }, [building, load])
+
+  const build = async () => {
+    try {
+      await api.buildCropped(videoId)
+      setBuilding(true)
+      setShow(false)
+      note('Cropped video build queued — progress shows in the jobs panel')
+    } catch (e) { note(`cropped build failed: ${e.message}`) }
+  }
+
+  if (!status) return null
+  // cache-bust the player after a rebuild (same URL, new bytes)
+  const src = `${api.croppedStreamUrl(videoId)}?v=${status.size_bytes || 0}`
+  return (
+    <div className="panel" style={{ padding: 8, marginTop: 8 }}>
+      <div className="row spread">
+        <div>
+          <b>Cropped video</b>{' '}
+          <span className="muted">
+            — just the rallies, start to finish
+            {status.n_rallies > 0 && ` (${status.n_rallies} rallies · ${status.total_s}s)`}
+            {status.exists && status.stale && ' · ⚠ results changed since last build'}
+          </span>
+        </div>
+        <div className="row">
+          {status.exists && (
+            <button onClick={() => setShow((s) => !s)}>{show ? 'Hide' : '▶ Watch'}</button>
+          )}
+          {status.exists && (
+            <a href={src} download={`rallies_${videoId.slice(0, 8)}.mp4`}>
+              <button>⬇ Download</button>
+            </a>
+          )}
+          <button className="blue" onClick={build} disabled={building || status.n_rallies === 0}>
+            {building ? 'Building…' : status.exists ? 'Rebuild' : 'Generate'}
+          </button>
+        </div>
+      </div>
+      {show && status.exists && (
+        <video controls src={src}
+               style={{ width: '100%', marginTop: 8, borderRadius: 8, background: '#000' }} />
       )}
     </div>
   )

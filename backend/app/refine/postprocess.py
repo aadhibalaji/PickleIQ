@@ -6,7 +6,11 @@ Order matters and is fixed:
    the recent window was LIVE, which bounds boundary lag and absorbs short
    dropouts;
 3. merge LIVE segments separated by short gaps;
-4. drop LIVE segments that are too short to be a rally.
+4. walk each segment start back to the raw hysteresis rising edge (undoes the
+   ratio filter's start lag, which otherwise eats short rallies) — AFTER the
+   merge, so the walk-back cannot shrink a genuine dead gap below the merge
+   threshold and glue two rallies together;
+5. drop LIVE segments that are too short to be a rally.
 
 Works purely on sample indices; the caller maps back to times.
 """
@@ -68,6 +72,27 @@ def to_segments(mask: np.ndarray) -> list[Segment]:
     return [Segment(s, e) for s, e in zip(starts, ends)]
 
 
+def walk_back_starts(segs: list[Segment], hyst: np.ndarray) -> list[Segment]:
+    """Extend each segment's start back to the raw hysteresis rising edge.
+
+    The trailing live-ratio filter exists to kill flicker, but it also DELAYS
+    every rally start by up to (1-ratio)*window (~1.4 s) — on a short point
+    that lag can eat more than half the rally and the min-length filter then
+    deletes a real point (seen on the first serve of a clip). The un-filtered
+    hysteresis state knows the true rising edge, so walk back to it; ends are
+    left to the ratio filter (its trailing window bounds end lag by design).
+    """
+    out = []
+    prev_end = 0
+    for s in segs:
+        st = s.start
+        while st > prev_end and hyst[st - 1]:
+            st -= 1
+        out.append(Segment(st, s.end))
+        prev_end = s.end
+    return out
+
+
 def merge_segments(segs: list[Segment], max_gap: int) -> list[Segment]:
     out: list[Segment] = []
     for s in segs:
@@ -83,11 +108,12 @@ def postprocess(p_live: np.ndarray, cfg: RefineConfig,
     """Full Stage C. Returns (segments, smoothed bool state) — the state array
     is what diagnostics plot alongside raw P(live)."""
     hz = hz or cfg.feature_hz
-    state = hysteresis(p_live, cfg.enter_thresh, cfg.exit_thresh)
-    state = live_ratio_filter(state, cfg.live_ratio,
+    hyst = hysteresis(p_live, cfg.enter_thresh, cfg.exit_thresh)
+    state = live_ratio_filter(hyst, cfg.live_ratio,
                               max(1, int(round(cfg.ratio_window_s * hz))))
     segs = to_segments(state)
     segs = merge_segments(segs, max(1, int(round(cfg.merge_gap_s * hz))))
+    segs = walk_back_starts(segs, hyst)
     min_len = int(round(cfg.min_rally_s * hz))
     segs = [s for s in segs if len(s) >= min_len]
     return segs, state

@@ -103,12 +103,21 @@ stages (`refine/refine.py :: refine_window`).
 
 ### 2.1 Stage B — P(live) per timestep (`feature_hz = 15`)
 Default classifier `rules` (`refine/classifiers.py`):
-`P = σ(bias + Σ wᵢ·featureᵢ)`, `rules_bias = −1.6`.
-- Positive weights: `cross_recency 3.2` (exp-decayed, τ=`cross_recency_tau_s=2.5 s`),
-  `crossings_3s 0.8`, `ball_speed_n 1.2`, `frac_visible_1s 0.6`,
-  `reactivity 0.8`, `max_pspeed_n 0.7`, `ready_frac 0.6`.
+`P = σ(bias + Σ wᵢ·featureᵢ)`, `rules_bias = −2.0`.
+- Positive weights (2026-07-10 reweight — derived from measured live-vs-gap
+  separability over 55 labeled windows: ball speed / in-court / player motion
+  are the real discriminators; cross recency is NOT, because between-point
+  knock-backs refresh it): `ball_speed_n 3.0`, `ball_in_court 1.5`,
+  `mean_pspeed_n 1.5`, `cross_recency 1.0` (exp-decayed,
+  τ=`cross_recency_tau_s=2.5 s`), `crossings_3s 0.8`, `reactivity 0.8`,
+  `max_pspeed_n 0.7`, `frac_visible_1s 0.6`, `ready_frac 0.2`.
 - Negative weights: `near_player_time_n −1.4` (ball parked on a player = dead),
-  `out_of_court_time_n −1.0`.
+  `retreat_frac −1.5` (players walking back to their own baseline = point
+  over; 2026-07-11, live-vs-gap AUC 0.84, walking band
+  `retreat_min_mps=0.3`..`retreat_max_mps=3.0`, ~1 s smoothed),
+  `out_of_court_time_n −1.4`.
+- This reweight is what lets P(live) fall below `exit_thresh` in the dead gap
+  between two points, so merged Pass 1 windows actually **split**.
 - An XGBoost backend exists (F1 ~0.52 vs rules ~0.34) but `rules` is the default
   and the permanent fallback if the model artifact is missing/broken.
 
@@ -118,6 +127,13 @@ Stage C (`refine/postprocess.py`) turns P(live) into segments:
 - **Trailing live-ratio filter:** a timestep is in-rally only if `≥ live_ratio=0.7`
   of the last `ratio_window_s=2.0 s` were live.
 - **Merge** segments with gaps `≤ merge_gap_s=2.0 s`.
+- **Walk-back (2026-07-11, `walk_back_starts`, runs AFTER merge):** each
+  segment's start is extended back to the raw hysteresis rising edge — the
+  ratio filter's start lag (~1.4 s) otherwise eats more than half of a short
+  point and the min-length filter then deletes a real rally (seen on a clip's
+  first serve). Must run after the merge: walking starts back first shrinks
+  genuine dead gaps below `merge_gap_s` and glues two rallies (regressed a
+  rally end 81.6 s → 86.4 s before the reorder).
 - **Drop** segments shorter than `min_rally_s=2.5 s`.
 
 Then per segment, accept gates — ANY failure ⇒ record `verdict="rejected"` with
@@ -125,8 +141,17 @@ a reason:
 - No segments at all ⇒ reject `low_live_ratio` (if `max P < enter_thresh`) else
   `too_short`.
 - `mean_p_live < mean_p_live_min=0.25` ⇒ reject `low_live_ratio`.
-- `serve_gate_score < serve_gate_min=0.25` ⇒ reject `no_serve`.
+- `serve_gate_score < serve_gate_min` (default 0.25, **0.35 via the live
+  `config.override.yaml`**) ⇒ reject `no_serve`.
 - refined duration `< min_rally_s=2.5 s` after snapping ⇒ reject `too_short`.
+- **Tiny-window guard (2026-07-11):** Pass 1 window `< min_rally_s` AND no
+  serve contact located ⇒ reject `too_short` — such a window only reaches
+  rally length by ballooning into the ±`window_margin_s` analysis margins.
+- **Window-fill guard (2026-07-11):** the refined span must overlap its Pass 1
+  window by `≥ min(min_rally_s, window_len − pre_roll_s)`, else reject
+  `outside_window`. A real rally fills its window; a between-point knock-back
+  rescued from the margins (which can look serve-like — ball appearing near a
+  baseline player, then crossing the net) only clips the window's edge.
 
 A single Pass 1 window can **split** into several rally records (one per
 surviving segment) — this un-does Pass 1's under-segmentation/merging.
@@ -145,6 +170,12 @@ landing 0.10, rally_evidence 0.15}`:
 - **rally_evidence:** crossing rate normalized to `rally_evidence_x10s=5.0`/10 s,
   multiplied by "deep fraction" (fraction of visible ball beyond kitchen / 0.3)
   — discounts kitchen dinking drills.
+- **Unobservable-contact excuse (2026-07-11):** contact + landing are BALL
+  evidence; when the ball was visible in `< serve_ball_vis_excuse=0.4` of the
+  serve search range, their zeros are a sensor gap, not proof of no serve. If
+  `contact == 0` AND `pre_serve ≥ 0.5` AND a flight crossing exists, the gate
+  rescores over just {pre_serve, flight, rally_evidence} and takes the max
+  (a textbook rally was being rejected 0.3497 vs the 0.35 gate this way).
 
 ### 2.3 DECISION 2 — move the start LATER (`refined_start`)
 ```
@@ -155,6 +186,14 @@ refined_start = max(span_lo, anchor − pre_roll_s=0.5)
 ```
 Because Pass 1 padded the start back by `p1_pad_s`, anchoring to the actual serve
 contact (−0.5 s pre-roll) almost always **pulls the start later**, onto the serve.
+
+**Contact-anchor sanity (2026-07-11):** nothing crosses the net before the
+serve. If a detected crossing sits in `[contact_t − serve_flight_max_s,
+contact_t − 0.3]`, the "contact" is a mid-rally ball event (the real strike is
+usually untracked — ball fused with the body — so its first detection scores
+poorly and a later, cleaner event can win); the anchor is pulled back to
+`first such crossing − 0.9`. Fixes real serves being clipped off the front of
+the rally.
 
 ### 2.4 DECISION 3 — end SOONER (`refined_end`)
 `snap_end` walks back from the segment falling edge to the **last meaningful ball
@@ -251,7 +290,10 @@ currently JSON-only, not yet promoted to `rally_labels`.
 - `backend/app/refine/postprocess.py` — Stage C (`hysteresis`, `live_ratio_filter`, segments)
 - `backend/app/refine/serve_gate.py` — `score_serve`, `snap_end`
 - `backend/app/refine/config.py` — `RefineConfig` (ALL refine thresholds/weights)
-- `backend/app/pipeline.py` — `_refine_after_pass2` hook
+- `backend/app/pipeline.py` — `_refine_after_pass2` hook + `_window_refiner`
+  (incremental per-window refine during Pass 2, live UI results)
+- `backend/app/export.py` — rallies-only cropped-video export (ffmpeg concat
+  of kept refined segments; `POST/GET /videos/{id}/cropped`)
 - `backend/app/learning/params.py` — `LearnedParams` (all Pass 1 `p1_*` params)
 - `PASS1_PASS2_SPEC.md` — broader detection-pipeline spec (companion doc)
 
@@ -275,5 +317,30 @@ currently JSON-only, not yet promoted to `rally_labels`.
   ball_flights`): extrapolate the serve arc back to the untracked strike.
   Benchmark F1 0.643 → 0.673 (precision + recall both up). `ball_seed_on_player`
   Pass 2 toggle added but rejected (no benefit — ball untrackable at the strike).
+- 2026-07-10 — **P(live) reweight (merged-window split fix).** Weights re-derived
+  from measured live-vs-gap AUC (§2.1); bias −1.6 → −2.0. Merged windows now
+  split into their component rallies. Benchmark F1 0.700 → 0.750.
+- 2026-07-11 — **Four boundary fixes** (all diagnosed on Second 3 mins, user-
+  verified windows): (1) `walk_back_starts` — Stage C ratio-filter start lag no
+  longer eats short rallies; (2) contact-anchor sanity — a crossing shortly
+  before the claimed serve contact re-anchors the start (real serves were being
+  clipped); (3) tiny-window guard; (4) window-fill guard (`outside_window`
+  reason) — margin-ballooned between-point knock-backs rejected. Plus the
+  serve-gate unobservable-contact excuse (`serve_ball_vis_excuse=0.4`).
+- 2026-07-11 — Incremental refine during Pass 2 (`IncrementalRefiner` +
+  `run_pass2(on_window=…)`): verdicts + refined boundaries stream into the UI
+  per window (`partial: true` JSON) instead of arriving at pass end. Refined
+  segments now surfaced per window in `get_refined` (`segments`) and drawn in
+  the UI (table column + purple "Refined" timeline track). Rallies-only cropped
+  video export added (`app/export.py`, jobs kind `crop`).
 
-**Last verified against code: 2026-07-10.**
+- 2026-07-11 — **Retreat-to-baseline dead signal + walk-back reorder.**
+  New `retreat_frac` feature (fraction of players walking toward their own
+  baseline; user-proposed, measured live-vs-gap AUC 0.84) weighted −1.5 in the
+  rules — cut a verified late rally end 86.4 s → 78.6 s (true ≈ 78.5) and
+  improved pooled end-median 0.94 → 0.88 s. `walk_back_starts` moved AFTER
+  merge (it was shrinking genuine dead gaps below `merge_gap_s` and gluing
+  rallies — the same rally's end had regressed 81.6 → 86.4 s). Benchmark on
+  4 human-marked fresh clips: pooled F1 0.901 (two clips perfect).
+
+**Last verified against code: 2026-07-11.**

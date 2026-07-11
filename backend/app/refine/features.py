@@ -341,6 +341,28 @@ def compute_features(td: TrackingData, cfg: RefineConfig) -> Features:
     formation_held = _rolling_mean(formation,
                                    max(1, int(cfg.formation_hold_s * fps)))
 
+    # ---- retreat: players walking back to their own baseline ---------------
+    # The clearest "point over" cue: after the last shot players drift back to
+    # reset for the next serve, while during a point movement is toward or
+    # lateral to the net. Per player: signed y-velocity toward their own
+    # baseline over ~0.5 s, counted when in the walking band (a sprint to a
+    # deep lob is play, not a reset); fraction over tracked players, smoothed
+    # ~1 s so a single reposition step doesn't register.
+    kr = max(1, int(fps * 0.5))
+    ret_cnt = np.zeros(n)
+    ret_tot = np.zeros(n)
+    for s, xy in td.players.items():
+        y = _median_filter(xy[:, 1], cfg.speed_median_k)
+        vy = np.full(n, np.nan)
+        vy[kr:] = (y[kr:] - y[:-kr]) * fps / kr
+        toward = np.where(y > NET_Y, vy, -vy)     # + = toward own baseline
+        ok = np.isfinite(toward)
+        ret_cnt += ok & (toward > cfg.retreat_min_mps) & (toward < cfg.retreat_max_mps)
+        ret_tot += ok
+    with np.errstate(invalid="ignore", divide="ignore"):
+        retreat = np.where(ret_tot > 0, ret_cnt / ret_tot, 0.0)
+    retreat_frac = _rolling_mean(retreat, max(1, int(fps * 1.0)))
+
     # ---- ball <-> player proximity (deadzone-aware) ------------------------
     dist_np = np.full(n, 10.0)
     time_near = np.zeros(n)
@@ -414,6 +436,7 @@ def compute_features(td: TrackingData, cfg: RefineConfig) -> Features:
         "near_player_time_n": np.minimum(time_near, 4.0) / 4.0,
         "mean_pspeed_n": np.minimum(mean_ps, 3.0) / 3.0,
         "max_pspeed_n": np.minimum(max_ps, 5.0) / 5.0,
+        "retreat_frac": retreat_frac,
         "ready_frac": ready_frac,
         "formation_valid": formation,
         "reactivity": reactivity,

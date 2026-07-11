@@ -47,6 +47,10 @@ export const api = {
   getOverlays: (id, source, start, end) =>
     fetch(`/api/videos/${id}/overlays?source=${source}&start=${start}&end=${end}`).then(j),
 
+  croppedStatus: (id) => fetch(`/api/videos/${id}/cropped`).then(j),
+  buildCropped: (id) => fetch(`/api/videos/${id}/cropped`, { method: 'POST' }).then(j),
+  croppedStreamUrl: (id) => `/api/videos/${id}/cropped/stream`,
+
   referencePoints: () => fetch('/api/calibration/reference_points').then(j),
   getCalibration: (videoId) =>
     fetch(`/api/calibration${videoId ? `?video_id=${videoId}` : ''}`).then(j),

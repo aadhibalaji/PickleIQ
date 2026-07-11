@@ -11,7 +11,8 @@ Output contract (per record)::
     {"pass1_window_id": str, "pass1_start": s, "pass1_end": s,
      "pass1_start_frame": int, "pass1_end_frame": int,
      "verdict": "rally"|"rejected",
-     "rejection_reason": null|"no_serve"|"low_live_ratio"|"too_short",
+     "rejection_reason": null|"no_serve"|"low_live_ratio"|"too_short"
+                         |"outside_window",
      "refined_start": s|null, "refined_end": s|null,
      "refined_start_frame": int|null, "refined_end_frame": int|null,
      "confidence": {"mean_p_live": f, "serve_gate_score": f,
@@ -132,6 +133,18 @@ def refine_window(window: Pass1Window, td: TrackingData, cfg: RefineConfig,
         # real start, a crossing never precedes the serve); else rising edge.
         if gate.contact_t is not None:
             anchor = gate.contact_t
+            # Sanity: nothing crosses the net before the serve. A detected
+            # crossing shortly BEFORE the claimed contact means the contact
+            # candidate is a mid-rally ball event (the real serve strike is
+            # usually untracked — ball fused with the body — so its first
+            # detection scores poorly and a later, cleaner event can win).
+            # Anchor on the pre-contact crossing instead, backed off by a
+            # typical serve-flight time, so the real serve isn't clipped.
+            early = feats.crossings_t[
+                (feats.crossings_t >= anchor - cfg.serve_flight_max_s)
+                & (feats.crossings_t <= anchor - 0.3)]
+            if len(early):
+                anchor = min(anchor, float(early[0]) - 0.9)
         else:
             cross = feats.crossings_t[(feats.crossings_t >= t_start - cfg.serve_lookback_s)
                                       & (feats.crossings_t <= t_end)]
@@ -141,6 +154,28 @@ def refine_window(window: Pass1Window, td: TrackingData, cfg: RefineConfig,
         end = min(span_hi, ev_t + cfg.post_roll_s)
         if end - start < cfg.min_rally_s:
             dbg.records.append(_record(window, fps, "rejected", "too_short",
+                                       None, None, mean_p, gate.score, cross10))
+            continue
+        # A Pass 1 window SHORTER than the minimum rally can only reach
+        # min_rally_s by ballooning into the analysis margins — activity
+        # Pass 1 itself did not endorse. Without a located serve contact to
+        # vouch for it, that's a between-point exchange, not a rally.
+        win_len = (window.end_frame - window.start_frame) / fps
+        if win_len < cfg.min_rally_s and gate.contact_t is None:
+            dbg.records.append(_record(window, fps, "rejected", "too_short",
+                                       None, None, mean_p, gate.score, cross10))
+            continue
+        # A real rally FILLS its Pass 1 window; a between-point knock-back
+        # rescued from the margins only clips the window's edge (Pass 1
+        # endorsed the window span, not the margins — and knock-backs can look
+        # serve-like: ball appearing near a baseline player, crossing the
+        # net). Require at least min_rally_s of in-window time, scaled down
+        # by pre-roll slack for windows barely longer than a short rally.
+        need = min(cfg.min_rally_s, win_len - cfg.pre_roll_s)
+        overlap = (min(end, window.end_frame / fps)
+                   - max(start, window.start_frame / fps))
+        if overlap < need:
+            dbg.records.append(_record(window, fps, "rejected", "outside_window",
                                        None, None, mean_p, gate.score, cross10))
             continue
         rec = _record(window, fps, "rally", None, start, end,

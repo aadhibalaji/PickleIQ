@@ -258,6 +258,23 @@ def score_serve(feats: Features, seg_start: float, seg_end: float,
              "landing": landing, "rally_evidence": rally_ev}
     w = cfg.serve_weights
     score = sum(w[k] * comps[k] for k in w) / sum(w.values())
+
+    # Contact + landing are BALL evidence. When the tracker barely saw the
+    # ball around the serve, their zeros punish the sensor gap, not the play
+    # (a textbook rally was rejected 0.3497 vs the 0.35 gate this way). If the
+    # observable phases still look like a serve — formation held plus a
+    # serve-timed net crossing — rescore over just those. The pre_serve floor
+    # keeps the excuse path honest: a serve nobody saw must at least have
+    # looked like one about to happen.
+    if contact == 0.0 and pre >= 0.5 and flight > 0.0:
+        m2 = (feats.native_t >= t0) & (feats.native_t <= t1)
+        vis = float(np.mean(feats.ball_visible_native[m2])) if m2.any() else 1.0
+        if vis < cfg.serve_ball_vis_excuse:
+            obs = ("pre_serve", "flight", "rally_evidence")
+            score = max(score, sum(w[k] * comps[k] for k in obs)
+                        / sum(w[k] for k in obs))
+            comps["ball_unobservable"] = round(vis, 2)
+
     return ServeGateResult(score=float(score), contact_t=contact_t,
                            components=comps)
 

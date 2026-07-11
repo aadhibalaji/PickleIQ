@@ -24,7 +24,6 @@ import numpy as np
 
 from .. import db
 from ..analysis.metrics import Rally, compare
-from ..cv.pass2 import DETECTION_CODE_VERSION
 
 # A change must not worsen a non-targeted metric by more than this to pass.
 _EPS_FRAMES = 0.5
@@ -94,9 +93,12 @@ def _apply_offsets(ai_raw, start_off: int, end_off: int) -> list[Rally]:
 
 
 def _analytic_stale(ai_raw) -> bool:
-    """True if any stored boundary predates the current detection code (its raw
-    boundary can't be trusted for analytic re-eval — the clip needs a reprocess)."""
-    return any(m.get("code_version") != DETECTION_CODE_VERSION or m.get("raw_start") is None
+    """True if any stored boundary lacks the raw-boundary meta the analytic
+    re-eval needs. Pass 2 stopped emitting rally boundaries (and the
+    ``DETECTION_CODE_VERSION`` stamp) in the detection-only pivot — Pass 1 is
+    the sole rally source and refine output is JSON-only — so any label
+    without that meta is stale by definition and the clip is skipped."""
+    return any(m.get("code_version") is None or m.get("raw_start") is None
                for (_, _, m) in ai_raw)
 
 
