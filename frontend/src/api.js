@@ -98,6 +98,9 @@ export const api = {
   rejectModel: (version) => fetch(`/api/models/${version}/reject`, { method: 'POST' }).then(j),
   getLearningCurve: (kind) => fetch(`/api/models/learning_curve${kind ? `?kind=${kind}` : ''}`).then(j),
 
+  getRallyHighlights: (id) => fetch(`/api/rally-analysis/${id}/highlights`).then(j),
+  getCoachingReport: (id) => fetch(`/api/rally-analysis/${id}/coaching-report`).then(j),
+
   chat: (videoId, messages) =>
     fetch('/api/chat', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },

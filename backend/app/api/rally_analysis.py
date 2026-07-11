@@ -9,6 +9,7 @@ from fastapi import APIRouter
 
 from .. import db
 from ..rallyanalysis import coaching, contact_detect
+from ..rallyanalysis.highlights import compute_video_highlights
 from ..rallyanalysis.position_metrics import compute_video_metrics
 from ..rallyanalysis.shot_metrics import compute_video_shot_metrics
 
@@ -97,6 +98,13 @@ def shot_metrics(video_id: str):
             for pid, p in data["players"].items()
         },
     }
+
+
+@router.get("/rally-analysis/{video_id}/highlights")
+def highlights(video_id: str):
+    """Rule-based rally tags (Long Rally / Firefight / Poach) computed on
+    demand from existing RallyMetrics — nothing persisted."""
+    return {"video_id": video_id, "highlights": compute_video_highlights(video_id)}
 
 
 @router.post("/rally-analysis/{video_id}/coaching-report")

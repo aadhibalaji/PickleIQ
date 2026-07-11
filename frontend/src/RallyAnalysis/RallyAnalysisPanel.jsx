@@ -1,15 +1,39 @@
-import React from 'react'
+import React, { useEffect, useState } from 'react'
+import { api } from '../api.js'
 import ClipList from './ClipList.jsx'
 import DominanceBar from './DominanceBar.jsx'
 import StatBlock from './StatBlock.jsx'
 import { mockPlayers, mockRallyMetrics, averagePlayerMetric } from './mockData.js'
 
 // TODO(integration pass): replace mockRallyMetrics/mockPlayers with
-// api.getRallyMetrics(videoId) / api.getCoachingReport(videoId).
+// api.getRallyMetrics(videoId) (position/shot metrics endpoints).
 export default function RallyAnalysisPanel({ videoId, onSeek }) {
   const [p1, p2] = Object.keys(mockPlayers)
   const kitchenArrival = averagePlayerMetric(mockRallyMetrics, 'kitchen_arrival')
   const forwardPressure = averagePlayerMetric(mockRallyMetrics, 'forward_pressure')
+
+  const [highlightClips, setHighlightClips] = useState([])
+  useEffect(() => {
+    api.getRallyHighlights(videoId)
+      .then((r) => setHighlightClips((r.highlights || []).map((h) => ({
+        label: `${h.tag} — ${h.rally_id}`, timestampS: h.timestamp_s, onSeek,
+      }))))
+      .catch(() => setHighlightClips([]))
+  }, [videoId, onSeek])
+
+  const [coachingClips, setCoachingClips] = useState([])
+  useEffect(() => {
+    api.getCoachingReport(videoId)
+      .then((r) => {
+        const report = r.report
+        const shots = [...(report?.worst_shots || []), ...(report?.best_shots || [])]
+        setCoachingClips(shots.map((s) => ({
+          label: `${s.category} (${s.deviation_score > 0 ? '+' : ''}${s.deviation_score.toFixed(2)})`,
+          timestampS: s.timestamp_s, onSeek,
+        })))
+      })
+      .catch(() => setCoachingClips([]))
+  }, [videoId, onSeek])
 
   return (
     <div className="rally-analysis-panel">
@@ -58,8 +82,8 @@ export default function RallyAnalysisPanel({ videoId, onSeek }) {
         </div>
       </div>
 
-      <ClipList title="Highlights" items={[]} />
-      <ClipList title="Coaching Moments" items={[]} />
+      <ClipList title="Highlights" items={highlightClips} />
+      <ClipList title="Coaching Moments" items={coachingClips} />
     </div>
   )
 }
