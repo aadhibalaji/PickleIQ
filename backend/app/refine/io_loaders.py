@@ -69,6 +69,17 @@ class TrackingData:
     hit: np.ndarray                          # [N] bool (evt kind='hit')
     evt_xy: np.ndarray                       # [N,2] court m of the evt or NaN
     video_id: str = ""
+    # Raw IMAGE-space tracks, kept alongside the court projection. The ball's
+    # court position is corrupted whenever it is airborne (the plane projection
+    # assumes height=0 and the size->depth estimate is too noisy for the far
+    # ball), so proximity checks at the serve — where the ball is high — must be
+    # done in pixels, where the track is accurate. None on synthetic inputs that
+    # don't set them (callers fall back to court space).
+    ball_px: np.ndarray | None = None        # [N,2] full-res image px or NaN
+    player_box: dict = field(default_factory=dict)  # slot -> [N,4] px (x0,y0,x1,y1)
+    ball_flights: list = field(default_factory=list)  # ballistic.Flight per fitted arc
+                                             # (lets the serve gate extrapolate the
+                                             # serve arc back to the untracked strike)
 
     @property
     def n(self) -> int:
@@ -130,17 +141,26 @@ def project_px(H: np.ndarray, xy_px: np.ndarray) -> np.ndarray:
 
 def load_tracking(video_id: str, f0: int, f1: int,
                   H: np.ndarray | None = None,
-                  fps: float | None = None) -> TrackingData:
+                  fps: float | None = None,
+                  reconstruct_3d: bool = False,
+                  max_rms_px: float = 12.0) -> TrackingData:
     """Tracking arrays for frames [f0, f1] inclusive, from the pass2 overlay.
 
     Frames with no overlay entry (outside any processed window) stay NaN with
     ``present=False`` — features treat them as "nothing tracked", never as
     evidence of dead play by itself.
+
+    ``reconstruct_3d`` replaces the ground-plane ball projection with a ballistic
+    3D fit (correct court x/y + height for airborne balls); see
+    ``refine/ballistic.py``.
     """
+    vid_row = None
+    if H is None or (reconstruct_3d and fps is None):
+        vid_row = load_video(video_id)
     if H is None:
         H = load_homography(video_id)
     if fps is None:
-        fps = float(load_video(video_id)["fps"])
+        fps = float((vid_row or load_video(video_id))["fps"])
     n = f1 - f0 + 1
     td = TrackingData(
         fps=fps, f0=f0,
@@ -155,24 +175,33 @@ def load_tracking(video_id: str, f0: int, f1: int,
         hit=np.zeros(n, bool),
         evt_xy=np.full((n, 2), np.nan),
         video_id=video_id,
+        ball_px=np.full((n, 2), np.nan),
+        player_box={},
     )
     for e in overlays.read_range(video_id, "pass2", f0, f1):
         i = e["f"] - f0
         td.present[i] = True
         td.pspeed[i] = float(e.get("pspeed") or 0.0)
         ball = e.get("ball")
-        if ball is not None and H is not None:
-            td.ball_xy[i] = project_px(H, [ball[:2]])[0]
-            td.ball_conf[i] = float(ball[3] if ball[3] is not None else 0.0)
-            td.ball_interp[i] = bool(e.get("interp", False))
+        if ball is not None:
+            td.ball_px[i] = ball[:2]
+            if H is not None:
+                td.ball_xy[i] = project_px(H, [ball[:2]])[0]
+                td.ball_conf[i] = float(ball[3] if ball[3] is not None else 0.0)
+                td.ball_interp[i] = bool(e.get("interp", False))
         world = e.get("world")
         if world is not None and world[2] is not None:
             td.ball_height[i] = float(world[2])
         for p in e.get("players") or []:
-            if p.get("cxy") is None:
-                continue
             slot = p.get("id")
             if slot is None:
+                continue
+            if p.get("box") is not None:
+                bx = td.player_box.get(slot)
+                if bx is None:
+                    bx = td.player_box[slot] = np.full((n, 4), np.nan)
+                bx[i] = p["box"]
+            if p.get("cxy") is None:
                 continue
             arr = td.players.get(slot)
             if arr is None:
@@ -182,6 +211,14 @@ def load_tracking(video_id: str, f0: int, f1: int,
         if evt is not None:
             (td.bounce if evt.get("kind") == "bounce" else td.hit)[i] = True
             td.evt_xy[i] = (evt.get("cx", np.nan), evt.get("cy", np.nan))
+
+    if reconstruct_3d and H is not None:
+        vid_row = vid_row or load_video(video_id)
+        if vid_row.get("width") and vid_row.get("height"):
+            from ..cv.court import CameraModel
+            from . import ballistic
+            cam = CameraModel.from_homography(H, vid_row["width"], vid_row["height"])
+            ballistic.reconstruct(td, cam, max_rms_px=max_rms_px)
     return td
 
 

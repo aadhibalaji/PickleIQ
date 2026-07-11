@@ -46,7 +46,9 @@ def _refine_after_pass2(video_id: str) -> None:
     source until the refiner is validated. Never fails the pass."""
     try:
         from .refine import run_refine_json
-        out = run_refine_json(video_id, plot=True)
+        from .refine.config import load_config, override_path
+        cfg = load_config(override_path())  # picks up any applied serve-gate override
+        out = run_refine_json(video_id, cfg, plot=True)
         log.info("rally refinement written to %s", out)
     except Exception:
         log.exception("rally refinement failed (non-fatal)")

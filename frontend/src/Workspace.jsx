@@ -15,7 +15,7 @@ export default function Workspace({ videoId, onBack }) {
   const [video, setVideo] = useState(null)
   const [rallies, setRallies] = useState({ human: [], pass1: [], pass2: [] })
   const [humanDraft, setHumanDraft] = useState(null) // local rally-labeling draft
-  const [refined, setRefined] = useState({ exists: false, rallies: [], rejected: 0 }) // Pass 2 revised boundaries
+  const [refined, setRefined] = useState({ exists: false, rallies: [], windows: [], rejected: 0 }) // Pass 2 keep/drop verdicts
   const [tab, setTab] = useState('setup')
   const [frame, setFrame] = useState(0)
   const [calibration, setCalibration] = useState(null)
@@ -44,6 +44,23 @@ export default function Workspace({ videoId, onBack }) {
   const loadRefined = useCallback(() => {
     api.getRefined(videoId).then(setRefined).catch(() => {})
   }, [videoId])
+
+  // Grade Pass 2's keep/drop on one window; clicking the active verdict again
+  // clears it. Immediate POST/DELETE then reload — get_refined re-attaches the
+  // grade to the window by frame-span IoU, so the button state updates itself.
+  const gradeWindow = useCallback((win, verdict) => {
+    const p = (win.human_verdict === verdict && win.grade_id)
+      ? api.deleteWindowGrade(win.grade_id)
+      : api.addWindowGrade(videoId, {
+          pass1_start_frame: win.pass1_start_frame,
+          pass1_end_frame: win.pass1_end_frame,
+          human_verdict: verdict,
+          ai_verdict: win.ai_verdict,
+          ai_rejection_reason: win.rejection_reason,
+          serve_gate_score: win.serve_gate_score,
+        })
+    p.then(loadRefined).catch((e) => note(`grade failed: ${e.message}`))
+  }, [videoId, loadRefined])
 
   const loadCalibration = useCallback(() => {
     api.getCalibration(videoId).then((c) => {
@@ -212,7 +229,13 @@ export default function Workspace({ videoId, onBack }) {
   const tracks = [
     { name: 'Human', color: '#4cc38a', spans: humanDraft || [] },
     { name: 'Pass 1', color: '#e5a53a', spans: rallies.pass1 },
-    { name: 'Pass 2', color: '#58a6ff', spans: refined.rallies },
+    // Pass 2 track spans the FULL Pass 1 windows, coloured by keep/drop verdict
+    // (kept = blue, dropped = grey) with a grade dot, so dropped windows are
+    // visible for grading — not just the kept rallies.
+    { name: 'Pass 2', color: '#58a6ff',
+      spans: (refined.windows || []).map((w) => ({
+        start_frame: w.pass1_start_frame, end_frame: w.pass1_end_frame,
+        verdict: w.ai_verdict, human_verdict: w.human_verdict })) },
   ]
 
   return (
@@ -333,8 +356,9 @@ export default function Workspace({ videoId, onBack }) {
           <PassTab source="pass1" rallies={rallies.pass1} fps={video.fps || 30} onSeek={seek} />
         )}
         {tab === 'pass2' && (
-          <PassTab source="pass2" rallies={refined.rallies} rejected={refined.rejected}
-                   exists={refined.exists} fps={video.fps || 30} onSeek={seek} />
+          <PassTab source="pass2" windows={refined.windows || []} exists={refined.exists}
+                   error={refined.error} fps={video.fps || 30} onSeek={seek}
+                   onGrade={gradeWindow} videoId={videoId} note={note} />
         )}
       </div>
     </div>
@@ -380,48 +404,175 @@ function ServeDatasetPanel({ videoId, note }) {
   )
 }
 
-function PassTab({ source, rallies, fps, onSeek, rejected = 0, exists = true }) {
-  const isPass2 = source === 'pass2'
-  if (isPass2 && !exists) {
+function PassTab({ source, rallies = [], windows = [], fps, onSeek, exists = true,
+                  error, onGrade, videoId, note }) {
+  if (source !== 'pass2') {
     return (
-      <div className="muted">
-        No Pass 2 refinement for this clip yet. Pass 2 revises each Pass 1 rally
-        (tightens the serve start and end, and drops windows that aren't real
-        rallies) when it runs — reprocess Pass 2 (save calibration in Setup, or
-        Regenerate in the Report tab) to generate the revised timestamps.
+      <div>
+        <div className="muted">
+          Coarse gate over 100% of footage: motion energy + coarse ball + serve-formation
+          spot checks. Boundaries are intentionally loose (padded + merged) to favour recall.
+          Runs automatically on upload.
+        </div>
+        <table style={{ marginTop: 10 }}>
+          <thead><tr><th>#</th><th>Start</th><th>End</th><th>Length</th><th></th></tr></thead>
+          <tbody>
+            {rallies.map((r, i) => (
+              <tr key={r.id || i}>
+                <td>{i + 1}</td>
+                <td>{fmt(r.start_frame, fps)}</td>
+                <td>{fmt(r.end_frame, fps)}</td>
+                <td>{((r.end_frame - r.start_frame) / fps).toFixed(1)}s</td>
+                <td><button onClick={() => onSeek(r.start_frame)}>▶</button></td>
+              </tr>
+            ))}
+            {rallies.length === 0 && (
+              <tr><td colSpan="5" className="muted">No rallies yet.</td></tr>
+            )}
+          </tbody>
+        </table>
       </div>
     )
   }
-  const intro = isPass2
-    ? 'Revised inside each Pass 1 window: the serve start is nudged later and the end earlier (never outside Pass 1’s edges), and windows judged not to be rallies are dropped.'
-    : 'Coarse gate over 100% of footage: motion energy + coarse ball + serve-formation spot checks. Boundaries are intentionally loose (padded + merged) to favour recall. Runs automatically on upload.'
+
+  // ---- Pass 2: keep/drop grading -------------------------------------------
+  if (!exists) {
+    return (
+      <div className="muted">
+        No Pass 2 refinement for this clip yet. Pass 2 judges each Pass 1 window
+        keep-or-drop when it runs — reprocess Pass 2 (save calibration in Setup,
+        or Regenerate in the Report tab) to generate the verdicts.
+        {error ? <div className="error" style={{ marginTop: 4 }}>refine error: {error}</div> : null}
+      </div>
+    )
+  }
+
+  // Live keep/drop accuracy, derived from the graded windows in view.
+  const graded = windows.filter((w) => w.human_verdict)
+  let nCorrect = 0, droppedWrong = 0, keptWrong = 0
+  const byReason = {}
+  for (const w of graded) {
+    const aiKeep = w.ai_verdict === 'rally'
+    const humanKeep = w.human_verdict === 'keep'
+    if (aiKeep === humanKeep) nCorrect++
+    else if (aiKeep) keptWrong++
+    else { droppedWrong++; const r = w.rejection_reason || 'unknown'; byReason[r] = (byReason[r] || 0) + 1 }
+  }
+  const acc = graded.length ? Math.round((100 * nCorrect) / graded.length) : null
+  const reasonStr = Object.entries(byReason).map(([k, v]) => `${k} ${v}`).join(', ')
+
   return (
     <div>
-      <div className="muted">{intro}</div>
-      {isPass2 && rejected > 0 && (
-        <div className="muted" style={{ marginTop: 4 }}>
-          {rejected} Pass 1 window{rejected > 1 ? 's' : ''} dropped as non-rallies.
+      <div className="muted">
+        Each Pass 1 window with Pass 2’s keep/drop verdict. Grade 👍 (real rally,
+        should keep) or 👎 (not a rally, should drop) — the score below updates
+        live and drives the serve-gate recommendation. Keep/drop only; boundaries
+        are out of scope here.
+      </div>
+      <div className="row spread" style={{ marginTop: 8, alignItems: 'baseline' }}>
+        <div>
+          {graded.length ? (
+            <b>Keep/drop accuracy {acc}% ({nCorrect}/{graded.length})</b>
+          ) : <b className="muted">No windows graded yet</b>}
+          {graded.length > 0 && (
+            <span className="muted">
+              {' · '}dropped-wrong {droppedWrong}{reasonStr ? ` (${reasonStr})` : ''}
+              {' · '}kept-wrong {keptWrong}
+            </span>
+          )}
         </div>
-      )}
+      </div>
+      <Recommendation videoId={videoId} note={note} nGraded={graded.length} />
       <table style={{ marginTop: 10 }}>
-        <thead><tr><th>#</th><th>Start</th><th>End</th><th>Length</th><th></th></tr></thead>
+        <thead><tr>
+          <th>#</th><th>Start</th><th>End</th><th>Length</th>
+          <th>AI verdict</th><th>gate</th><th>Grade</th><th></th>
+        </tr></thead>
         <tbody>
-          {rallies.map((r, i) => (
-            <tr key={r.id || i}>
-              <td>{i + 1}</td>
-              <td>{fmt(r.start_frame, fps)}</td>
-              <td>{fmt(r.end_frame, fps)}</td>
-              <td>{((r.end_frame - r.start_frame) / fps).toFixed(1)}s</td>
-              <td><button onClick={() => onSeek(r.start_frame)}>▶</button></td>
-            </tr>
-          ))}
-          {rallies.length === 0 && (
-            <tr><td colSpan="5" className="muted">
-              {isPass2 ? 'Pass 2 kept no rallies here.' : 'No rallies yet.'}
-            </td></tr>
+          {windows.map((w, i) => {
+            const kept = w.ai_verdict === 'rally'
+            const wrong = w.human_verdict && (kept !== (w.human_verdict === 'keep'))
+            return (
+              <tr key={i} style={wrong ? { background: '#3a2530' } : undefined}>
+                <td>{i + 1}</td>
+                <td>{fmt(w.pass1_start_frame, fps)}</td>
+                <td>{fmt(w.pass1_end_frame, fps)}</td>
+                <td>{((w.pass1_end_frame - w.pass1_start_frame) / fps).toFixed(1)}s</td>
+                <td style={{ color: kept ? '#58a6ff' : '#b08' }}>
+                  {kept ? 'KEPT' : `dropped: ${w.rejection_reason || '—'}`}
+                  {w.is_split ? ' (split)' : ''}
+                </td>
+                <td className="muted">{w.serve_gate_score != null ? w.serve_gate_score.toFixed(2) : '—'}</td>
+                <td>
+                  <button className={w.human_verdict === 'keep' ? 'active' : ''}
+                          style={w.human_verdict === 'keep' ? { borderColor: '#4cc38a', color: '#4cc38a' } : undefined}
+                          title="Real rally — should keep" onClick={() => onGrade(w, 'keep')}>👍</button>
+                  {' '}
+                  <button className={w.human_verdict === 'drop' ? 'active' : ''}
+                          style={w.human_verdict === 'drop' ? { borderColor: '#ff5470', color: '#ff5470' } : undefined}
+                          title="Not a rally — should drop" onClick={() => onGrade(w, 'drop')}>👎</button>
+                </td>
+                <td><button onClick={() => onSeek(w.pass1_start_frame)}>▶</button></td>
+              </tr>
+            )
+          })}
+          {windows.length === 0 && (
+            <tr><td colSpan="8" className="muted">Pass 2 produced no windows here.</td></tr>
           )}
         </tbody>
       </table>
+    </div>
+  )
+}
+
+// Read-only serve-gate recommendation from the accumulated grades. Applying
+// writes the override YAML; Pass 2 must be reprocessed for it to take effect.
+function Recommendation({ videoId, note, nGraded }) {
+  const [rec, setRec] = useState(null)
+  const [busy, setBusy] = useState(false)
+  const load = async () => {
+    setBusy(true)
+    try { setRec(await api.getGradeRecommendation(videoId)) }
+    catch (e) { note(`recommendation failed: ${e.message}`) }
+    setBusy(false)
+  }
+  const apply = async (min) => {
+    try {
+      await api.writeRefineOverride({ serve_gate_min: min })
+      note(`serve_gate_min = ${min} written — reprocess Pass 2 to apply`)
+    } catch (e) { note(`apply failed: ${e.message}`) }
+  }
+  return (
+    <div className="panel" style={{ padding: 8, marginTop: 8 }}>
+      <div className="row spread">
+        <div className="muted">
+          Recommend the serve-gate threshold that best matches your grades (pools
+          grades across all clips).
+        </div>
+        <button className="blue" onClick={load} disabled={busy}>
+          {busy ? 'Sweeping…' : 'Recommend better serve gate'}
+        </button>
+      </div>
+      {rec && !rec.ready && <div className="muted" style={{ marginTop: 6 }}>{rec.reason}</div>}
+      {rec && rec.ready && (
+        <div style={{ marginTop: 6 }}>
+          <div>
+            <b>serve_gate_min {rec.current.serve_gate_min} → {rec.recommended.overrides.serve_gate_min}</b>
+            {' '}<span className="muted">
+              accuracy {(rec.current.accuracy * 100).toFixed(0)}% → {(rec.recommended.accuracy * 100).toFixed(0)}%
+              {' '}({rec.recommended.delta >= 0 ? '+' : ''}{(rec.recommended.delta * 100).toFixed(0)} pts)
+              {' · '}rescues {rec.current.dropped_wrong - rec.recommended.dropped_wrong} wrong-drops
+              {' · '}n={rec.n_graded}
+            </span>
+          </div>
+          {rec.recommended.overrides.serve_gate_min !== rec.current.serve_gate_min ? (
+            <button style={{ marginTop: 6 }}
+                    onClick={() => apply(rec.recommended.overrides.serve_gate_min)}>
+              Apply serve_gate_min = {rec.recommended.overrides.serve_gate_min} (writes config; re-run Pass 2)
+            </button>
+          ) : <div className="muted" style={{ marginTop: 6 }}>Current threshold is already best on your grades.</div>}
+        </div>
+      )}
     </div>
   )
 }

@@ -16,6 +16,15 @@ from pathlib import Path
 
 import yaml
 
+_ROOT = Path(__file__).resolve().parents[3]   # repo root (refine/ -> app -> backend -> root)
+
+
+def override_path() -> Path:
+    """The single writable YAML that overrides refine defaults. Read on every
+    refine run (pipeline + on-demand regen); written by the grade-recommendation
+    'Apply'. Missing file => pure defaults (load_config handles that)."""
+    return _ROOT / "data" / "refine" / "config.override.yaml"
+
 
 @dataclass
 class RefineConfig:
@@ -25,6 +34,13 @@ class RefineConfig:
     history_s: float = 1.5          # sliding history window for stacked features
 
     # ---- Stage A: features ---------------------------------------------
+    # Ballistic 3D: replace the ground-plane ball projection with a gravity-arc
+    # fit to the pixel track, so court x/y AND height are correct even when the
+    # ball is airborne (fixes net crossings, contact, bounces at once). See
+    # refine/ballistic.py. ON by default — improved the labeled benchmark F1
+    # 0.561 -> 0.643 (+6 recovered rallies). ~5s/clip; disable for fast sweeps.
+    use_ballistic_3d: bool = True
+    ballistic_max_rms_px: float = 12.0   # accept a flight fit under this reproj error
     speed_diff_frames: int = 3      # finite-difference span for ball speed
     speed_median_k: int = 5         # median smoothing kernel (odd)
     visible_window_s: float = 1.0   # frac_visible_last_1s
@@ -81,7 +97,22 @@ class RefineConfig:
                                     # by up to ratio_window_s + flight time)
     serve_gate_min: float = 0.25
     serve_contact_speed_mps: float = 4.0    # min initial ball speed at contact
-    serve_contact_near_m: float = 2.0       # contact must be this near the server
+    serve_contact_near_m: float = 2.0       # contact this near the server (court m,
+                                            # fallback when no pixel track)
+    # Measure serve contact by BALL-PIXEL -> player-BOX proximity (when the ball
+    # is airborne) instead of the court-metre distance. Fixes serves the height-
+    # corrupted court projection drops (verified: a real serve 0.21 -> 0.75), but
+    # image proximity is more permissive and slightly regressed the tiny 7-clip
+    # benchmark (-1 window) — off until representative airborne-serve clips are
+    # graded into the eval set. Flip on via config.override.yaml to A/B.
+    serve_contact_use_pixels: bool = False
+    serve_contact_near_px: float = 130.0    # contact this near the server BOX in
+                                            # image px, used ONLY when the ball is
+                                            # airborne (court pos then unreliable)
+    serve_airborne_h_m: float = 0.7         # ball above this height => trust the
+                                            # PIXEL proximity over the court-metre
+                                            # one (plane projection is only valid
+                                            # when the ball is near the ground)
     serve_min_gap_s: float = 0.2    # ball invisible at least this long before "appearance"
     serve_flight_min_s: float = 0.3
     serve_flight_max_s: float = 2.0

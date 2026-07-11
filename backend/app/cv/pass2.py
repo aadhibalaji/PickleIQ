@@ -182,6 +182,7 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                 hit_speed_px=float(params.get("ball_hit_speed_px", 18.0)),
                 acq_px=float(params.get("ball_acq_px", 90.0)),
                 seed_min_px=float(params.get("ball_seed_min_px", 4.0)),
+                seed_on_player=bool(params.get("ball_seed_on_player", False)),
             )
             frame_filter = BallFrameFilter(
                 H, fps,

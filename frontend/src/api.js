@@ -24,7 +24,19 @@ export const api = {
   streamUrl: (id) => `/api/videos/${id}/stream`,
 
   getRallies: (id) => fetch(`/api/videos/${id}/rallies`).then(j),
-  getRefined: (id) => fetch(`/api/videos/${id}/refined`).then(j),
+  getRefined: (id, regenerate = 0) =>
+    fetch(`/api/videos/${id}/refined${regenerate ? '?regenerate=1' : ''}`).then(j),
+  listWindowGrades: (id) => fetch(`/api/videos/${id}/window_grades`).then(j),
+  addWindowGrade: (id, body) =>
+    fetch(`/api/videos/${id}/window_grades`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    }).then(j),
+  deleteWindowGrade: (gradeId) => fetch(`/api/window_grades/${gradeId}`, { method: 'DELETE' }).then(j),
+  getGradeRecommendation: (id) => fetch(`/api/videos/${id}/grade_recommendation`).then(j),
+  writeRefineOverride: (body) =>
+    fetch('/api/refine/config/override', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    }).then(j),
   putHumanLabels: (id, labels) =>
     fetch(`/api/videos/${id}/labels/human`, {
       method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(labels),

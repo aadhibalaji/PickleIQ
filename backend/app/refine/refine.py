@@ -172,7 +172,9 @@ def refine_video(video_id: str, cfg: RefineConfig | None = None,
     for w in load_pass1_windows(video_id, p1_source):
         f0 = max(0, w.start_frame - margin)
         f1 = min(last_frame, w.end_frame + margin)
-        td = load_tracking(video_id, f0, f1, fps=fps)
+        td = load_tracking(video_id, f0, f1, fps=fps,
+                           reconstruct_3d=cfg.use_ballistic_3d,
+                           max_rms_px=cfg.ballistic_max_rms_px)
         dbg = refine_window(w, td, cfg, classifier)
         records.extend(dbg.records)
         debugs.append(dbg)

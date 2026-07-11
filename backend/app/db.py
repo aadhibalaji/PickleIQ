@@ -119,6 +119,19 @@ CREATE TABLE IF NOT EXISTS ball_tracks (
   created_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS window_grades (
+  id TEXT PRIMARY KEY,
+  video_id TEXT NOT NULL,
+  pass1_start_frame INTEGER NOT NULL, -- the graded Pass 1 window span; grades key
+  pass1_end_frame INTEGER NOT NULL,   -- on the span, NOT pass1_window_id (re-minted
+                                      -- every Pass 1 run), re-associated by IoU
+  ai_verdict TEXT,                    -- 'rally'|'rejected' snapshot at grade time
+  ai_rejection_reason TEXT,           -- 'no_serve'|'low_live_ratio'|'too_short'|NULL
+  serve_gate_score REAL,              -- snapshot, for the recommendation sweep
+  human_verdict TEXT NOT NULL,        -- 'keep' | 'drop' (human judgment, not "AI ok")
+  created_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS pending_changes (
   id TEXT PRIMARY KEY,
   video_id TEXT,                    -- clip that triggered it (context)

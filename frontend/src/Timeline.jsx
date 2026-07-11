@@ -26,13 +26,27 @@ export default function Timeline({ frameCount, frame, tracks, marks, onSeek }) {
         <g key={t.name}>
           <text x="6" y={i * rowH + 15} fill="#93a4b5" fontSize="11">{t.name}</text>
           <line x1="0" x2={W} y1={(i + 1) * rowH} y2={(i + 1) * rowH} stroke="#1f2831" />
-          {t.spans.map((s, j) => (
-            <rect key={j} x={x(s.start_frame)} y={i * rowH + 4}
-                  width={Math.max(2, x(s.end_frame) - x(s.start_frame))} height={rowH - 8}
-                  rx="3" fill={t.color} opacity="0.75">
-              <title>{`${t.name}: ${s.start_frame} → ${s.end_frame}`}</title>
-            </rect>
-          ))}
+          {t.spans.map((s, j) => {
+            // Pass 2 spans carry a keep/drop verdict: kept = track colour,
+            // dropped = dim grey. A graded span gets a small dot (green=keep,
+            // red=drop) so graded-vs-ungraded is visible at a glance.
+            const fill = s.verdict ? (s.verdict === 'rally' ? t.color : '#8b6b78') : t.color
+            const gradeColor = s.human_verdict === 'keep' ? '#4cc38a'
+              : s.human_verdict === 'drop' ? '#ff5470' : null
+            return (
+              <g key={j}>
+                <rect x={x(s.start_frame)} y={i * rowH + 4}
+                      width={Math.max(2, x(s.end_frame) - x(s.start_frame))} height={rowH - 8}
+                      rx="3" fill={fill} opacity={s.verdict && s.verdict !== 'rally' ? 0.5 : 0.75}>
+                  <title>{`${t.name}: ${s.start_frame} → ${s.end_frame}`
+                    + (s.verdict ? ` (${s.verdict === 'rally' ? 'kept' : 'dropped'}${s.human_verdict ? `, graded ${s.human_verdict}` : ''})` : '')}</title>
+                </rect>
+                {gradeColor && (
+                  <circle cx={x(s.start_frame) + 4} cy={i * rowH + 8} r="2.5" fill={gradeColor} />
+                )}
+              </g>
+            )
+          })}
         </g>
       ))}
       {marks?.length > 0 && marks.map((m, i) => (

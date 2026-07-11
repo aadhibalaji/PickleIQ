@@ -36,12 +36,34 @@ class ServeGateResult:
     components: dict = field(default_factory=dict)
 
 
+def _point_box_dist_px(px: np.ndarray, box: np.ndarray) -> float:
+    """Distance (px) from a point to an axis-aligned box (0 if inside)."""
+    dx = max(box[0] - px[0], 0.0, px[0] - box[2])
+    dy = max(box[1] - px[1], 0.0, px[1] - box[3])
+    return float(np.hypot(dx, dy))
+
+
 def _server_fit(feats: Features, t: float, xy: np.ndarray,
                 cfg: RefineConfig) -> tuple[float, float | None]:
-    """How well `xy` at time `t` sits adjacent to a stationary at/behind-
-    baseline player. Returns (fit in [0,1], server court y or None)."""
+    """How well the ball at time `t` sits adjacent to a stationary at/behind-
+    baseline player. Proximity is measured in IMAGE PIXELS (ball pixel -> player
+    box) when the pixel track is available — the ball's court position is
+    height-corrupted at the serve, so a court-metre distance there is garbage;
+    the "behind baseline" test still uses the reliable player court position.
+    Falls back to court-metre distance (`xy`) when no pixel track is present
+    (synthetic inputs). Returns (fit in [0,1], server court y or None)."""
     td = feats.td
     i = int(np.clip(np.searchsorted(feats.native_t, t), 0, len(feats.native_t) - 1))
+    # Use pixel proximity ONLY when the ball is airborne — that is exactly when
+    # the court projection is unreliable. When it's low, the court-metre distance
+    # is both accurate and more discriminating (a fixed pixel radius is more
+    # permissive and costs precision on clips the court metric already handles).
+    h_i = td.ball_height[i] if (getattr(td, "ball_height", None) is not None
+                                and np.isfinite(td.ball_height[i])) else None
+    airborne = h_i is not None and h_i > cfg.serve_airborne_h_m
+    ball_px = (td.ball_px[i] if (cfg.serve_contact_use_pixels and airborne
+                                 and getattr(td, "ball_px", None) is not None
+                                 and np.isfinite(td.ball_px[i]).all()) else None)
     best, best_y = 0.0, None
     for slot, pxy in td.players.items():
         p = pxy[i]
@@ -57,8 +79,13 @@ def _server_fit(feats: Features, t: float, xy: np.ndarray,
         # behind either baseline (soft over behind_baseline_m into the court)
         m = cfg.behind_baseline_m
         behind = max(np.clip(1 - p[1] / m, 0, 1), np.clip(1 - (COURT_L - p[1]) / m, 0, 1))
-        near = np.clip(1 - max(0.0, float(np.hypot(*(xy - p))) - 0.3)
-                       / cfg.serve_contact_near_m, 0, 1)
+        box = td.player_box.get(slot) if hasattr(td, "player_box") else None
+        if ball_px is not None and box is not None and np.isfinite(box[i]).all():
+            d_px = _point_box_dist_px(ball_px, box[i])
+            near = np.clip(1 - d_px / cfg.serve_contact_near_px, 0, 1)
+        else:
+            near = np.clip(1 - max(0.0, float(np.hypot(*(xy - p))) - 0.3)
+                           / cfg.serve_contact_near_m, 0, 1)
         spd = feats.player_speed.get(slot)
         v = spd[i] if spd is not None and np.isfinite(spd[i]) else 0.0
         still = np.clip(1 - v / (2 * cfg.stationary_mps), 0, 1)
@@ -92,6 +119,61 @@ def _contact_candidates(feats: Features, t0: float, t1: float,
     return sorted(out)
 
 
+def _ballistic_contact(feats: Features, seg_start: float, t1: float,
+                       cfg: RefineConfig) -> tuple[float, float, float | None, np.ndarray] | None:
+    """Recover the serve contact the tracker never saw. The ball is untrackable
+    at the strike (small, fused with the body), so its first detection is already
+    mid-flight; but the fitted gravity arc extrapolates BACKWARD to where the ball
+    came from. Walk the serve's arc back frame-by-frame and score proximity to a
+    stationary at/behind-baseline player (in correct 3D court metres). Returns
+    (fit, contact_t, server_y, xy) or None."""
+    td = feats.td
+    flights = getattr(td, "ball_flights", None)
+    if not flights:
+        return None
+    # The serve's outgoing arc = the earliest flight near the segment start. Note
+    # the serve begins BEFORE the smoothed segment edge (the rising edge lags the
+    # real start), so the search window opens serve_lookback_s early, not at it.
+    cand = None
+    for fl in flights:
+        t_fs = fl.f_start / td.fps
+        if seg_start - cfg.serve_lookback_s <= t_fs <= t1 \
+                and (cand is None or fl.f_start < cand.f_start):
+            cand = fl
+    if cand is None:
+        return None
+    # The serve signature in the extrapolated arc: it ORIGINATES low (a struck
+    # ball leaves the paddle near the ground) and at/behind a baseline. Player
+    # proximity is a soft bonus, not a gate — the extrapolated x carries some
+    # uncertainty and the server stands off to a side.
+    m = cfg.behind_baseline_m
+    best = None
+    for back in range(1, int(cfg.serve_flight_max_s * td.fps) + 1):
+        f = cand.f_start - back
+        if f < 0:
+            break
+        t = f / td.fps
+        if t < seg_start - cfg.serve_lookback_s:
+            break
+        x, y, h = cand.eval(f)
+        if not (-0.2 <= h <= 1.2):                  # contact is low; skip airborne
+            continue
+        if not (-1.0 <= x <= COURT_W + 1.0):        # off the court sideways
+            continue
+        behind = max(np.clip(1 - y / m, 0, 1), np.clip(1 - (COURT_L - y) / m, 0, 1))
+        if behind < 0.5:                            # not at/behind a baseline
+            continue
+        low = np.clip(1 - abs(h - 0.4) / 0.9, 0, 1)  # ideal strike ~0.4 m
+        fit, server_y = _server_fit(feats, t, (x, y), cfg)
+        prox = np.clip(fit / 0.3, 0, 1)
+        score = behind * (0.55 + 0.30 * low + 0.15 * prox)
+        if server_y is None:                        # infer serving end from origin
+            server_y = 0.0 if y < COURT_L / 2 else COURT_L
+        if best is None or score > best[0]:
+            best = (float(score), t, float(server_y), np.array([x, y]))
+    return best
+
+
 def score_serve(feats: Features, seg_start: float, seg_end: float,
                 cfg: RefineConfig,
                 search_from: float | None = None) -> ServeGateResult:
@@ -121,6 +203,16 @@ def score_serve(feats: Features, seg_start: float, seg_end: float,
     contact = best[0] if best else 0.0
     contact_t = best[1] if best else None
     server_y = best[2] if best else None
+
+    # Fallback: the strike is untrackable (ball fused with the body), so no
+    # detected candidate sits at the server. Recover it from the serve arc,
+    # extrapolated back to where the ball originated. Slightly discounted vs a
+    # directly-observed contact since it is inferred, not seen.
+    if best is None:
+        bc = _ballistic_contact(feats, seg_start, t1, cfg)
+        if bc is not None:
+            contact = 0.85 * bc[0]
+            contact_t, server_y = bc[1], bc[2]
 
     # -- phase 3: flight (booster) ------------------------------------------
     anchor = contact_t if contact_t is not None else seg_start

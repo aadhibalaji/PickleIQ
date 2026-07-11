@@ -57,7 +57,7 @@ class TrajectoryBallSelector:
     def __init__(self, fps: float, gate_px: float = 45.0, accel_px: float = 6.0,
                  foot_px: float = 35.0, hit_speed_px: float = 18.0,
                  acq_px: float = 90.0, seed_min_px: float = 4.0,
-                 max_gap_s: float = 0.5):
+                 max_gap_s: float = 0.5, seed_on_player: bool = False):
         self.fps = fps
         self.gate = float(gate_px)          # residual radius around the velocity prediction
         self.accel = float(accel_px)        # extra radius per frame^2 of gap
@@ -65,6 +65,12 @@ class TrajectoryBallSelector:
         self.hit_speed = float(hit_speed_px)  # px/frame that overrides foot suppression
         self.acq_px = float(acq_px)         # acquisition radius while velocity is unknown
         self.seed_min = float(seed_min_px)  # min px/frame a cold-start seed must move
+        # Allow cold-start acquisition to seed from a blob ON a player, provided
+        # it still passes the two-frame ball-speed motion match. Recovers the
+        # SERVE ball (struck at the server, so on their box + the first ball of
+        # the rally = cold start) that the off-player-only pool otherwise hides
+        # until it is already mid-court. A stationary foot fails the motion match.
+        self.seed_on_player = bool(seed_on_player)
         self.max_gap = max(1, int(fps * max_gap_s))
         self.hist: deque[_Pt] = deque(maxlen=5)
         # Cold-start acquisition state: the PREVIOUS frame's off-player candidate
@@ -148,8 +154,15 @@ class TrajectoryBallSelector:
         _match_fast). Feet/shorts blobs barely move frame-to-frame and are
         rejected; the ball, moving fast, is the one that matches. Returns the
         confirming candidate on the promotion frame, else None."""
-        pool = [c for c in cands
-                if not _on_player(c.x, c.y, boxes, feet, self.foot)]
+        # Normally the acquisition pool excludes on-player blobs entirely. With
+        # seed_on_player we keep them — the two-frame motion match below still
+        # rejects a stationary foot, and an on-player seed is additionally held
+        # to hit_speed (a served ball is fast; a shuffling foot is not).
+        if self.seed_on_player:
+            pool = list(cands)
+        else:
+            pool = [c for c in cands
+                    if not _on_player(c.x, c.y, boxes, feet, self.foot)]
         prev, pf = self._cold_prev, self._cold_prev_f
         # Remember this frame's pool for the next frame's match.
         self._cold_prev, self._cold_prev_f = pool, frame
@@ -173,6 +186,11 @@ class TrajectoryBallSelector:
             if min(range(len(pool)), key=lambda i: back[i]) != ci:
                 continue
             speed = d / gap
+            # An on-player seed must be clearly ball-fast (a hit), not a shuffling
+            # foot — a stricter bar than the off-player seed_min floor.
+            if self.seed_on_player and speed < self.hit_speed \
+                    and _on_player(c.x, c.y, boxes, feet, self.foot):
+                continue
             if speed > best_speed:                # the ball is the fast one
                 best_speed, best = speed, (p, c)
         if best is None:

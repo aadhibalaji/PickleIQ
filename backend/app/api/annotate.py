@@ -6,6 +6,9 @@ all future clips), with a clip_local escape hatch for anomalous clips.
 """
 from __future__ import annotations
 
+import json
+import logging
+
 import numpy as np
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -16,6 +19,7 @@ from ..cv.court import CameraModel
 from ..cv.video_io import iter_frames
 
 router = APIRouter()
+log = logging.getLogger("api.annotate")
 
 
 # ---------------------------------------------------------------- labels ---
@@ -39,29 +43,232 @@ def get_rallies(video_id: str):
     return out
 
 
-@router.get("/videos/{video_id}/refined")
-def get_refined(video_id: str):
-    """Pass 2 refined rally boundaries: the refiner's revised start/end for each
-    Pass 1 window, CLAMPED to stay within that window (Pass 1 is the outer bound
-    by design), with windows it judged non-rallies omitted. Read from the JSON
-    the refiner writes after Pass 2 — no rally_labels rows are involved, so this
-    stays advisory until the refiner is validated."""
-    import json
-    from ..refine.config import RefineConfig
-    from ..refine.refine import resolve_path
-    path = resolve_path(RefineConfig().out_dir) / f"{video_id}.json"
+# --------------------------------------------------- pass 2 keep/drop grading ---
+# Pass 2 refinement judges each Pass 1 window keep (verdict 'rally') or drop
+# ('rejected', with a reason). The verdict data lives in data/refine/<id>.json.
+# The grading loop surfaces EVERY window (kept + dropped) so the user can grade
+# whether each keep/drop was right; grades key on the FRAME SPAN, not the Pass 1
+# window uuid (which is re-minted every Pass 1 run), and are re-associated to the
+# current windows by best-IoU. Grades feed a live accuracy readout + a serve-gate
+# recommendation (see recommend.py). No rally_labels rows are involved.
+
+def _refine_records(video_id: str, regenerate: bool = False) -> tuple[list[dict], str | None]:
+    """The refiner's per-window records, self-healing when the JSON is missing
+    but Pass 2 overlays exist. Returns (records, error). error is set only on a
+    genuine failure; a not-yet-processed clip returns ([], None)."""
+    from ..refine.config import load_config, override_path
+    from ..refine.refine import resolve_path, run_refine_json
+    cfg = load_config(override_path())
+    path = resolve_path(cfg.out_dir) / f"{video_id}.json"
+    if regenerate or not path.exists():
+        with db.connect() as con:
+            has_overlays = con.execute(
+                "SELECT 1 FROM overlays WHERE video_id=? AND source='pass2' LIMIT 1",
+                (video_id,)).fetchone()
+        if not has_overlays:
+            return [], None  # not processed yet — not an error
+        try:
+            run_refine_json(video_id, cfg, plot=False)
+        except Exception as exc:  # never 500 the grading UI over a refine failure
+            log.exception("on-demand refine failed for %s", video_id)
+            return [], str(exc)
     if not path.exists():
-        return {"exists": False, "rallies": [], "rejected": 0}
-    recs = json.loads(path.read_text()).get("records", [])
+        return [], None
+    return json.loads(path.read_text()).get("records", []), None
+
+
+def _group_windows(records: list[dict]) -> list[dict]:
+    """One entry per Pass 1 window (records with the same window uuid — i.e. a
+    split window — collapse into one). AI kept the window iff ANY child segment
+    survived as a rally."""
+    groups: dict[str, list[dict]] = {}
+    order: list[str] = []
+    for r in records:
+        wid = r["pass1_window_id"]
+        if wid not in groups:
+            groups[wid] = []
+            order.append(wid)
+        groups[wid].append(r)
+    windows = []
+    for wid in order:
+        recs = groups[wid]
+        r0 = recs[0]
+        kept = [r for r in recs if r.get("verdict") == "rally"]
+        reason = None if kept else next(
+            (r.get("rejection_reason") for r in recs if r.get("rejection_reason")), None)
+        scores = [(r.get("confidence") or {}).get("serve_gate_score") for r in recs]
+        scores = [s for s in scores if s is not None]
+        windows.append({
+            "pass1_start_frame": r0["pass1_start_frame"],
+            "pass1_end_frame": r0["pass1_end_frame"],
+            "ai_verdict": "rally" if kept else "rejected",
+            "rejection_reason": reason,
+            "serve_gate_score": max(scores) if scores else None,
+            "is_split": len(recs) > 1,
+        })
+    return windows
+
+
+def _load_grades(video_id: str) -> list[dict]:
+    with db.connect() as con:
+        rows = con.execute(
+            "SELECT * FROM window_grades WHERE video_id=? ORDER BY pass1_start_frame",
+            (video_id,)).fetchall()
+    return db.rows_to_dicts(rows)
+
+
+def _attach_grades(windows: list[dict], grades: list[dict]) -> list[dict]:
+    """Join each window to its human grade by best-IoU (>=0.5) on the frame span,
+    tolerating boundary drift across Pass 1 re-runs. Returns the grades that
+    matched no window (stale — surfaced, not silently dropped)."""
+    from ..refine.evaluate import iou
+    matched_ids: set[str] = set()
+    for w in windows:
+        wspan = (w["pass1_start_frame"], w["pass1_end_frame"])
+        best, best_iou = None, 0.5
+        for g in grades:
+            v = iou(wspan, (g["pass1_start_frame"], g["pass1_end_frame"]))
+            if v >= best_iou:
+                best_iou, best = v, g
+        w["human_verdict"] = best["human_verdict"] if best else None
+        w["grade_id"] = best["id"] if best else None
+        if best:
+            matched_ids.add(best["id"])
+    return [g for g in grades if g["id"] not in matched_ids]
+
+
+@router.get("/videos/{video_id}/refined")
+def get_refined(video_id: str, regenerate: int = 0):
+    """Every Pass 1 window with Pass 2's keep/drop verdict + the user's grade.
+    Self-heals the refine JSON on demand (pass ?regenerate=1 to force). Also
+    returns the kept-rally spans (`rallies`) for the existing Pass 2 timeline
+    track, for back-compat."""
+    try:
+        records, error = _refine_records(video_id, regenerate=bool(regenerate))
+    except Exception as exc:  # defensive — never 500 the workspace
+        log.exception("get_refined failed for %s", video_id)
+        return {"exists": False, "windows": [], "rallies": [], "rejected": 0,
+                "error": str(exc)}
+    if error:
+        return {"exists": False, "windows": [], "rallies": [], "rejected": 0,
+                "error": error}
+    if not records:
+        return {"exists": False, "windows": [], "rallies": [], "rejected": 0}
+    windows = _group_windows(records)
+    stale = _attach_grades(windows, _load_grades(video_id))
     rallies = [
         {"start_frame": max(r["refined_start_frame"], r["pass1_start_frame"]),
          "end_frame": min(r["refined_end_frame"], r["pass1_end_frame"]),
          "serve_gate_score": (r.get("confidence") or {}).get("serve_gate_score")}
-        for r in recs
+        for r in records
         if r.get("verdict") == "rally" and r.get("refined_start_frame") is not None
     ]
-    rejected = sum(1 for r in recs if r.get("verdict") != "rally")
-    return {"exists": True, "rallies": rallies, "rejected": rejected}
+    rejected = sum(1 for w in windows if w["ai_verdict"] != "rally")
+    return {"exists": True, "windows": windows, "rallies": rallies,
+            "rejected": rejected, "n_stale_grades": len(stale)}
+
+
+class WindowGradeIn(BaseModel):
+    pass1_start_frame: int
+    pass1_end_frame: int
+    human_verdict: str                 # 'keep' | 'drop'
+    ai_verdict: str | None = None      # AI snapshot at grade time (for the sweep)
+    ai_rejection_reason: str | None = None
+    serve_gate_score: float | None = None
+
+
+@router.get("/videos/{video_id}/window_grades")
+def list_window_grades(video_id: str):
+    return _load_grades(video_id)
+
+
+@router.post("/videos/{video_id}/window_grades")
+def add_window_grade(video_id: str, body: WindowGradeIn):
+    if body.human_verdict not in ("keep", "drop"):
+        raise HTTPException(400, "human_verdict must be 'keep' or 'drop'")
+    gid = db.new_id()
+    with db.connect() as con:
+        # Upsert by span: re-grading the same window replaces the prior grade.
+        con.execute(
+            "DELETE FROM window_grades WHERE video_id=? AND pass1_start_frame=?"
+            " AND pass1_end_frame=?",
+            (video_id, body.pass1_start_frame, body.pass1_end_frame))
+        con.execute(
+            "INSERT INTO window_grades (id, video_id, pass1_start_frame,"
+            " pass1_end_frame, ai_verdict, ai_rejection_reason, serve_gate_score,"
+            " human_verdict, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (gid, video_id, body.pass1_start_frame, body.pass1_end_frame,
+             body.ai_verdict, body.ai_rejection_reason, body.serve_gate_score,
+             body.human_verdict, db.now()))
+    return {"id": gid, "human_verdict": body.human_verdict}
+
+
+@router.delete("/window_grades/{grade_id}")
+def delete_window_grade(grade_id: str):
+    with db.connect() as con:
+        con.execute("DELETE FROM window_grades WHERE id=?", (grade_id,))
+    return {"deleted": True}
+
+
+def _grades_by_clip(video_id: str | None) -> dict[str, list[dict]]:
+    """{video_id: [grade, ...]}. video_id=None pools grades across ALL clips —
+    more labeled windows make the serve-gate recommendation more trustworthy."""
+    with db.connect() as con:
+        if video_id:
+            rows = con.execute("SELECT * FROM window_grades WHERE video_id=?",
+                               (video_id,)).fetchall()
+        else:
+            rows = con.execute("SELECT * FROM window_grades").fetchall()
+    out: dict[str, list[dict]] = {}
+    for r in rows:
+        out.setdefault(r["video_id"], []).append(dict(r))
+    return out
+
+
+@router.get("/videos/{video_id}/grade_recommendation")
+def grade_recommendation(video_id: str, all_clips: int = 1):
+    """Sweep serve-gate thresholds against the USER GRADES and recommend the one
+    with the best keep/drop accuracy. Read-only — apply via POST
+    /refine/config/override. Pools grades across clips by default."""
+    from ..refine.config import load_config, override_path
+    from ..refine.recommend import recommend
+    grades_by_clip = _grades_by_clip(None if all_clips else video_id)
+    total = sum(len(v) for v in grades_by_clip.values())
+    if total < 8:
+        return {"ready": False,
+                "reason": f"need >= 8 graded windows to recommend, have {total}"}
+    try:
+        rec = recommend(load_config(override_path()), grades_by_clip)
+    except Exception as exc:
+        log.exception("grade recommendation failed")
+        return {"ready": False, "reason": str(exc)}
+    return {"ready": True, "n_graded": total, **rec}
+
+
+class RefineOverrideIn(BaseModel):
+    serve_gate_min: float | None = None
+    mean_p_live_min: float | None = None
+
+
+@router.post("/refine/config/override")
+def write_refine_override(body: RefineOverrideIn):
+    """Write the refine override YAML (merged onto any existing overrides). These
+    knobs live outside the learned_params system, so this file is their single
+    writable surface. Reprocess Pass 2 for it to take effect."""
+    import yaml
+    from ..refine.config import override_path
+    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not updates:
+        raise HTTPException(400, "no override values provided")
+    path = override_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    current = {}
+    if path.exists():
+        current = yaml.safe_load(path.read_text()) or {}
+    current.update(updates)
+    path.write_text(yaml.safe_dump(current, sort_keys=False))
+    return {"written": updates, "path": str(path),
+            "note": "reprocess Pass 2 to apply"}
 
 
 @router.put("/videos/{video_id}/labels/human")
