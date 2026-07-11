@@ -155,6 +155,55 @@ def refine_window(window: Pass1Window, td: TrackingData, cfg: RefineConfig,
     return dbg
 
 
+class IncrementalRefiner:
+    """Refine Pass 1 windows one at a time, as soon as Pass 2 has written the
+    overlay span covering them — so the UI sees verdicts + refined boundaries
+    grow live during the pass instead of all-at-once at the end.
+
+    ``advance(upto_frame)`` refines every not-yet-done window whose span is
+    fully covered and rewrites the output JSON with ``partial: true``; the
+    normal full refine after the pass (:func:`run_refine_json`) replaces it
+    with the canonical final artifact. Construction drops any stale JSON from
+    a previous run so old verdicts never linger while the new pass scans.
+    """
+
+    def __init__(self, video_id: str, cfg: RefineConfig | None = None,
+                 p1_source: str = "pass1"):
+        self.video_id = video_id
+        self.cfg = cfg or RefineConfig()
+        self.classifier = make_classifier(self.cfg)
+        video = load_video(video_id)
+        self.fps = float(video["fps"])
+        self.last_frame = int(video["frame_count"]) - 1
+        self.windows = load_pass1_windows(video_id, p1_source)
+        self.records: list[dict] = []
+        self._done: set[str] = set()
+        self.out = resolve_path(self.cfg.out_dir) / f"{video_id}.json"
+        self.out.unlink(missing_ok=True)
+
+    def advance(self, upto_frame: int) -> None:
+        margin = int(round(self.cfg.window_margin_s * self.fps))
+        new = [w for w in self.windows
+               if w.id not in self._done and w.end_frame <= upto_frame]
+        if not new:
+            return
+        for w in new:
+            f0 = max(0, w.start_frame - margin)
+            f1 = min(self.last_frame, w.end_frame + margin)
+            td = load_tracking(self.video_id, f0, f1, fps=self.fps,
+                               reconstruct_3d=self.cfg.use_ballistic_3d,
+                               max_rms_px=self.cfg.ballistic_max_rms_px)
+            dbg = refine_window(w, td, self.cfg, self.classifier)
+            self.records.extend(dbg.records)
+            self._done.add(w.id)
+        self.out.parent.mkdir(parents=True, exist_ok=True)
+        self.out.write_text(json.dumps(
+            {"video_id": self.video_id, "partial": True,
+             "records": self.records}, indent=2))
+        log.info("incremental refine %s: %d/%d windows",
+                 self.video_id, len(self._done), len(self.windows))
+
+
 def refine_video(video_id: str, cfg: RefineConfig | None = None,
                  classifier: LiveClassifier | None = None,
                  p1_source: str = "pass1") -> tuple[list[dict], list[WindowDebug]]:

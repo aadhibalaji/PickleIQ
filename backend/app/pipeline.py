@@ -39,6 +39,28 @@ def effective_calibration(video_id: str):
     return H, cam, cal["id"]
 
 
+def _window_refiner(video_id: str):
+    """Best-effort per-window refine hook for run_pass2: refines each Pass 1
+    window as soon as its overlays land, so verdicts + refined boundaries show
+    up in the UI while the pass is still scanning. Calling the hook with -1
+    just clears any stale refine JSON (done before the pass starts). The full
+    refine after the pass remains the canonical output. Never fails the pass."""
+    state: dict = {"r": None}
+
+    def hook(upto_frame: int) -> None:
+        try:
+            if state["r"] is None:
+                from .refine.config import load_config, override_path
+                from .refine.refine import IncrementalRefiner
+                state["r"] = IncrementalRefiner(video_id,
+                                                load_config(override_path()))
+            state["r"].advance(upto_frame)
+        except Exception:
+            log.exception("incremental refine failed (non-fatal)")
+
+    return hook
+
+
 def _refine_after_pass2(video_id: str) -> None:
     """Rally refinement over the fresh Pass 2 tracking data (pass2/refine
     module). JSON-only output for now — it writes data/refine/<id>.json plus
@@ -71,7 +93,9 @@ def start_processing(video_id: str) -> dict:
 
     def do_pass2(handle: JobHandle) -> None:
         H, cam, _ = effective_calibration(video_id)
-        run_pass2(video_id, params, H, cam, handle)
+        on_window = _window_refiner(video_id)
+        on_window(-1)   # drop stale refine JSON before the pass starts
+        run_pass2(video_id, params, H, cam, handle, on_window=on_window)
         _refine_after_pass2(video_id)
 
     job_id = runner.submit(video_id, "pass1", do_pass1)
@@ -87,7 +111,9 @@ def reprocess(video_id: str, which: str) -> dict:
 
     def do_pass2(handle: JobHandle) -> None:
         H, cam, _ = effective_calibration(video_id)
-        run_pass2(video_id, params, H, cam, handle)
+        on_window = _window_refiner(video_id)
+        on_window(-1)   # drop stale refine JSON before the pass starts
+        run_pass2(video_id, params, H, cam, handle, on_window=on_window)
         _refine_after_pass2(video_id)
 
     job_id = runner.submit(video_id, "pass2", do_pass2)

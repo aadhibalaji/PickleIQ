@@ -236,6 +236,9 @@ export default function Workspace({ videoId, onBack }) {
       spans: (refined.windows || []).map((w) => ({
         start_frame: w.pass1_start_frame, end_frame: w.pass1_end_frame,
         verdict: w.ai_verdict, human_verdict: w.human_verdict })) },
+    // Refined track: the snapped (shortened/adjusted) rally boundaries Pass 2
+    // settled on inside each kept window — grows live while Pass 2 scans.
+    { name: 'Refined', color: '#b58cff', spans: refined.rallies || [] },
   ]
 
   return (
@@ -357,7 +360,8 @@ export default function Workspace({ videoId, onBack }) {
         )}
         {tab === 'pass2' && (
           <PassTab source="pass2" windows={refined.windows || []} exists={refined.exists}
-                   error={refined.error} fps={video.fps || 30} onSeek={seek}
+                   partial={refined.partial} error={refined.error}
+                   fps={video.fps || 30} onSeek={seek}
                    onGrade={gradeWindow} videoId={videoId} note={note} />
         )}
       </div>
@@ -405,7 +409,7 @@ function ServeDatasetPanel({ videoId, note }) {
 }
 
 function PassTab({ source, rallies = [], windows = [], fps, onSeek, exists = true,
-                  error, onGrade, videoId, note }) {
+                  partial = false, error, onGrade, videoId, note }) {
   if (source !== 'pass2') {
     return (
       <div>
@@ -464,11 +468,16 @@ function PassTab({ source, rallies = [], windows = [], fps, onSeek, exists = tru
   return (
     <div>
       <div className="muted">
-        Each Pass 1 window with Pass 2’s keep/drop verdict. Grade 👍 (real rally,
+        Each Pass 1 window with Pass 2’s keep/drop verdict and the refined
+        (snapped) rally boundaries inside kept windows. Grade 👍 (real rally,
         should keep) or 👎 (not a rally, should drop) — the score below updates
-        live and drives the serve-gate recommendation. Keep/drop only; boundaries
-        are out of scope here.
+        live and drives the serve-gate recommendation.
       </div>
+      {partial && (
+        <div className="panel" style={{ padding: 8, marginTop: 8, borderColor: '#58a6ff' }}>
+          ⏳ Pass 2 is still scanning — windows appear here as each one finishes.
+        </div>
+      )}
       <div className="row spread" style={{ marginTop: 8, alignItems: 'baseline' }}>
         <div>
           {graded.length ? (
@@ -486,7 +495,7 @@ function PassTab({ source, rallies = [], windows = [], fps, onSeek, exists = tru
       <table style={{ marginTop: 10 }}>
         <thead><tr>
           <th>#</th><th>Start</th><th>End</th><th>Length</th>
-          <th>AI verdict</th><th>gate</th><th>Grade</th><th></th>
+          <th>AI verdict</th><th>Refined</th><th>gate</th><th>Grade</th><th></th>
         </tr></thead>
         <tbody>
           {windows.map((w, i) => {
@@ -501,6 +510,18 @@ function PassTab({ source, rallies = [], windows = [], fps, onSeek, exists = tru
                 <td style={{ color: kept ? '#58a6ff' : '#b08' }}>
                   {kept ? 'KEPT' : `dropped: ${w.rejection_reason || '—'}`}
                   {w.is_split ? ' (split)' : ''}
+                </td>
+                <td>
+                  {(w.segments || []).map((s, k) => (
+                    <div key={k} style={{ whiteSpace: 'nowrap', color: '#b58cff' }}>
+                      {fmt(s.start_frame, fps)} → {fmt(s.end_frame, fps)}
+                      {' '}<span className="muted">
+                        ({((s.end_frame - s.start_frame) / fps).toFixed(1)}s)
+                      </span>
+                      {' '}<button onClick={() => onSeek(s.start_frame)}>▶</button>
+                    </div>
+                  ))}
+                  {!(w.segments || []).length && <span className="muted">—</span>}
                 </td>
                 <td className="muted">{w.serve_gate_score != null ? w.serve_gate_score.toFixed(2) : '—'}</td>
                 <td>
@@ -517,7 +538,7 @@ function PassTab({ source, rallies = [], windows = [], fps, onSeek, exists = tru
             )
           })}
           {windows.length === 0 && (
-            <tr><td colSpan="8" className="muted">Pass 2 produced no windows here.</td></tr>
+            <tr><td colSpan="9" className="muted">Pass 2 produced no windows here.</td></tr>
           )}
         </tbody>
       </table>

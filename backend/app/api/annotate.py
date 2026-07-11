@@ -52,29 +52,39 @@ def get_rallies(video_id: str):
 # current windows by best-IoU. Grades feed a live accuracy readout + a serve-gate
 # recommendation (see recommend.py). No rally_labels rows are involved.
 
-def _refine_records(video_id: str, regenerate: bool = False) -> tuple[list[dict], str | None]:
+def _refine_records(video_id: str, regenerate: bool = False) -> tuple[list[dict], bool, str | None]:
     """The refiner's per-window records, self-healing when the JSON is missing
-    but Pass 2 overlays exist. Returns (records, error). error is set only on a
-    genuine failure; a not-yet-processed clip returns ([], None)."""
+    but Pass 2 overlays exist. Returns (records, partial, error). partial=True
+    while Pass 2 is mid-run and the incremental refiner is still appending;
+    error is set only on a genuine failure; a not-yet-processed clip returns
+    ([], False, None)."""
     from ..refine.config import load_config, override_path
     from ..refine.refine import resolve_path, run_refine_json
     cfg = load_config(override_path())
     path = resolve_path(cfg.out_dir) / f"{video_id}.json"
-    if regenerate or not path.exists():
+    with db.connect() as con:
+        # While a Pass 2 job is queued/running the incremental refiner owns the
+        # JSON — a full self-heal here would refine half-written overlays and
+        # race the writer. Serve whatever partial output exists instead.
+        pass2_running = con.execute(
+            "SELECT 1 FROM jobs WHERE video_id=? AND kind='pass2'"
+            " AND status IN ('queued','running') LIMIT 1", (video_id,)).fetchone()
+    if (regenerate or not path.exists()) and not pass2_running:
         with db.connect() as con:
             has_overlays = con.execute(
                 "SELECT 1 FROM overlays WHERE video_id=? AND source='pass2' LIMIT 1",
                 (video_id,)).fetchone()
         if not has_overlays:
-            return [], None  # not processed yet — not an error
+            return [], False, None  # not processed yet — not an error
         try:
             run_refine_json(video_id, cfg, plot=False)
         except Exception as exc:  # never 500 the grading UI over a refine failure
             log.exception("on-demand refine failed for %s", video_id)
-            return [], str(exc)
+            return [], False, str(exc)
     if not path.exists():
-        return [], None
-    return json.loads(path.read_text()).get("records", []), None
+        return [], False, None
+    data = json.loads(path.read_text())
+    return data.get("records", []), bool(data.get("partial")), None
 
 
 def _group_windows(records: list[dict]) -> list[dict]:
@@ -105,6 +115,12 @@ def _group_windows(records: list[dict]) -> list[dict]:
             "rejection_reason": reason,
             "serve_gate_score": max(scores) if scores else None,
             "is_split": len(recs) > 1,
+            # the refined (snapped) boundaries of each surviving rally — what
+            # the UI shows as the adjusted timestamps inside the Pass 1 window
+            "segments": [
+                {"start_frame": r["refined_start_frame"],
+                 "end_frame": r["refined_end_frame"]}
+                for r in kept if r.get("refined_start_frame") is not None],
         })
     return windows
 
@@ -144,7 +160,8 @@ def get_refined(video_id: str, regenerate: int = 0):
     returns the kept-rally spans (`rallies`) for the existing Pass 2 timeline
     track, for back-compat."""
     try:
-        records, error = _refine_records(video_id, regenerate=bool(regenerate))
+        records, partial, error = _refine_records(video_id,
+                                                  regenerate=bool(regenerate))
     except Exception as exc:  # defensive — never 500 the workspace
         log.exception("get_refined failed for %s", video_id)
         return {"exists": False, "windows": [], "rallies": [], "rejected": 0,
@@ -164,8 +181,9 @@ def get_refined(video_id: str, regenerate: int = 0):
         if r.get("verdict") == "rally" and r.get("refined_start_frame") is not None
     ]
     rejected = sum(1 for w in windows if w["ai_verdict"] != "rally")
-    return {"exists": True, "windows": windows, "rallies": rallies,
-            "rejected": rejected, "n_stale_grades": len(stale)}
+    return {"exists": True, "partial": partial, "windows": windows,
+            "rallies": rallies, "rejected": rejected,
+            "n_stale_grades": len(stale)}
 
 
 class WindowGradeIn(BaseModel):

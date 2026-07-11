@@ -72,7 +72,11 @@ def _foot_points(obs) -> list[tuple[float, float]]:
 
 def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
               handle: JobHandle, source: str = "pass2",
-              p1_source: str = "pass1") -> list[dict]:
+              p1_source: str = "pass1",
+              on_window=None) -> list[dict]:
+    """``on_window(last_covered_frame)`` fires after each processing window's
+    overlays land — the pipeline hooks the incremental refiner here so Pass 2
+    results stream into the UI per window instead of arriving all at the end."""
     if H is None or cam is None:
         raise RuntimeError(
             "Pass 2 needs a court calibration (homography). Calibrate the "
@@ -427,6 +431,8 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                         e["evt"] = {"kind": ev.kind, "in": ev.in_court, "side": ev.side,
                                     "cx": round(ev.court_x, 2), "cy": round(ev.court_y, 2)}
         overlays.write_entries(video_id, source, list(entries.values()))
+        if on_window is not None:
+            on_window(we)
 
     handle.update(progress=1.0,
                   message=f"Pass 2 done: detection overlays for {len(windows)} window(s)")

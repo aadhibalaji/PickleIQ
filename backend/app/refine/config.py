@@ -66,17 +66,29 @@ class RefineConfig:
     model_path: str = "data/models/refine/xgb.json"
     # RulesClassifier weights (feature -> weight); bias chosen so an idle
     # court sits well below 0.5 and rhythmic crossings push well above.
-    rules_bias: float = -1.6
+    #
+    # 2026-07-10 reweight (merged-window split fix): weights re-derived from
+    # measured live-vs-gap separability over the 55 labeled Pass 1 windows
+    # (AUC: ball_speed_n 0.88, ball_in_court 0.84, mean_pspeed_n 0.77 vs
+    # cross_recency only 0.64 — between-point ball knocks refresh crossings,
+    # so cross recency barely separates a rally from its dead gap). Leaning
+    # on ball speed / ball-in-court / player motion and dropping the bias to
+    # -2.0 lets P(live) fall below exit_thresh between points: merged Pass 1
+    # windows now split into their component rallies (benchmark F1
+    # 0.700 -> 0.750, recall 0.593 -> 0.661, precision/rejection held).
+    rules_bias: float = -2.0
     rules_weights: dict = field(default_factory=lambda: {
-        "cross_recency": 3.2,       # exp-decayed time since last net crossing
+        "cross_recency": 1.0,       # exp-decayed time since last net crossing
         "crossings_3s": 0.8,
-        "ball_speed_n": 1.2,
+        "ball_speed_n": 3.0,        # strongest live/dead discriminator
+        "ball_in_court": 1.5,
         "frac_visible_1s": 0.6,
         "reactivity": 0.8,
+        "mean_pspeed_n": 1.5,       # players run during a point, stop between
         "max_pspeed_n": 0.7,
         "near_player_time_n": -1.4, # ball parked near one player = dead
-        "ready_frac": 0.6,
-        "out_of_court_time_n": -1.0,
+        "ready_frac": 0.2,
+        "out_of_court_time_n": -1.4,
     })
     cross_recency_tau_s: float = 2.5    # decay constant for cross_recency
 
