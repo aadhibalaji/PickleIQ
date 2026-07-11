@@ -1,6 +1,17 @@
 """Rally Analysis & Coaching endpoints. Read-only against rally_labels,
 overlays, ball_corrections/ball_tracks and calibration data — never writes
-to those tables. New tables only: contact_events, coaching_reports."""
+to those tables. New tables only: contact_events, coaching_reports.
+
+Endpoints:
+  GET  /rally-analysis/health                       liveness check
+  POST /rally-analysis/{video_id}/detect-contacts    pose-based contact detection -> contact_events
+  GET  /rally-analysis/{video_id}/contact-events     list stored contact_events
+  GET  /rally-analysis/{video_id}/position-metrics   Kitchen Arrival % / Forward Pressure per player
+  GET  /rally-analysis/{video_id}/shot-metrics       shot side split / rally length buckets
+  GET  /rally-analysis/{video_id}/highlights         rule-based rally tags (Long Rally/Firefight/Poach)
+  POST /rally-analysis/{video_id}/coaching-report    generate report (1 Anthropic call) -> coaching_reports
+  GET  /rally-analysis/{video_id}/coaching-report    cached report, or {"report": null}
+"""
 from __future__ import annotations
 
 from dataclasses import asdict

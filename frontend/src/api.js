@@ -99,7 +99,11 @@ export const api = {
   getLearningCurve: (kind) => fetch(`/api/models/learning_curve${kind ? `?kind=${kind}` : ''}`).then(j),
 
   getRallyHighlights: (id) => fetch(`/api/rally-analysis/${id}/highlights`).then(j),
+  getPositionMetrics: (id) => fetch(`/api/rally-analysis/${id}/position-metrics`).then(j),
+  getShotMetrics: (id) => fetch(`/api/rally-analysis/${id}/shot-metrics`).then(j),
   getCoachingReport: (id) => fetch(`/api/rally-analysis/${id}/coaching-report`).then(j),
+  generateCoachingReport: (id) =>
+    fetch(`/api/rally-analysis/${id}/coaching-report`, { method: 'POST' }).then(j),
 
   chat: (videoId, messages) =>
     fetch('/api/chat', {
