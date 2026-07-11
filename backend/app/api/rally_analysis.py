@@ -35,7 +35,7 @@ def health():
 
 
 @router.post("/rally-analysis/{video_id}/detect-contacts")
-def detect_contacts(video_id: str, source: str = "pass2"):
+def detect_contacts(video_id: str, source: str | None = None):
     """Runs pose-only contact detection for every rally of `source` on this
     video and persists the result to contact_events (replacing any prior run
     for this video)."""
@@ -130,7 +130,7 @@ def readiness(video_id: str):
 
 
 @router.post("/rally-analysis/{video_id}/coaching-report")
-def generate_coaching_report(video_id: str, source: str = "pass2"):
+def generate_coaching_report(video_id: str, source: str | None = None):
     """Triggers coaching report generation (one Anthropic API call) and
     persists it to coaching_reports, replacing any prior report for this
     video. Not run automatically anywhere — explicit user action only."""

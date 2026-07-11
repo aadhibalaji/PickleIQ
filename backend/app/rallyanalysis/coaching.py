@@ -20,6 +20,7 @@ from ..config import ANTHROPIC_API_KEY, ANTHROPIC_REPORT_MODEL
 from ..cv import overlays
 from ..cv.court import NET_Y
 from .contracts import CoachingReport, ShotFeatureVector
+from .position_metrics import _default_overlay_source
 from .readiness import get_analyzable_rallies
 
 log = logging.getLogger("rallyanalysis.coaching")
@@ -472,14 +473,17 @@ def build_report(video_id: str, vectors_meta: list[tuple[ShotFeatureVector, dict
                            worst_shots=worst, best_shots=best, narrative=narrative or "")
 
 
-def generate_coaching_report(video_id: str, rally_source: str = "pass2",
+def generate_coaching_report(video_id: str, rally_source: str | None = None,
                               overlay_source: str | None = None) -> CoachingReport:
     """Only builds feature vectors for contacts belonging to a rally
     readiness.get_analyzable_rallies() currently clears (Pass 2 done, overlay
     coverage still matches the rally's current frame range) — a stale/partial
     rally is excluded from both the active-rally-seconds denominator and the
     contacts fed into compute_feature_vector."""
-    overlay_source = overlay_source or rally_source
+    # rally_source can be None by default (see contact_detect.py's matching
+    # fix) — resolve overlay_source the same way here so the read_range calls
+    # below aren't left with an unresolved None.
+    overlay_source = overlay_source or rally_source or _default_overlay_source(video_id)
     rallies = get_analyzable_rallies(video_id, rally_source=rally_source, overlay_source=overlay_source)
     ready_rally_ids = {r["id"] for r in rallies}
     with db.connect() as con:
