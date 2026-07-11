@@ -9,6 +9,7 @@ from fastapi import APIRouter
 
 from .. import db
 from ..rallyanalysis import contact_detect
+from ..rallyanalysis.position_metrics import compute_video_metrics
 
 router = APIRouter()
 
@@ -36,3 +37,35 @@ def list_contact_events(video_id: str):
             "SELECT * FROM contact_events WHERE video_id=? ORDER BY frame_idx",
             (video_id,)).fetchall()
     return {"video_id": video_id, "events": db.rows_to_dicts(rows)}
+
+
+@router.get("/rally-analysis/{video_id}/position-metrics")
+def position_metrics(video_id: str):
+    """Per-player Kitchen Arrival % and Forward Pressure, video-level, plus
+    a 0-1 'dominance' share per metric (each player's value / sum of all
+    players' values) sized for a gradient/dominance-bar UI."""
+    data = compute_video_metrics(video_id)
+    players = data["players"]
+
+    def shares(key: str) -> dict:
+        vals = {pid: p[key] for pid, p in players.items() if p[key] is not None}
+        total = sum(vals.values())
+        return {pid: (v / total if total else None) for pid, v in vals.items()}
+
+    kitchen_dom, pressure_dom = shares("kitchen_arrival_pct"), shares("forward_pressure_avg_m")
+    return {
+        "video_id": video_id,
+        "overlay_source": data["overlay_source"],
+        "players": {
+            str(pid): {
+                "team": p["team"],
+                "kitchen_arrival_pct": p["kitchen_arrival_pct"],
+                "kitchen_serving_rallies": p["kitchen_serving_rallies"],
+                "kitchen_dominance": kitchen_dom.get(pid),
+                "forward_pressure_avg_m": p["forward_pressure_avg_m"],
+                "forward_pressure_rallies": p["forward_pressure_rallies"],
+                "forward_pressure_dominance": pressure_dom.get(pid),
+            }
+            for pid, p in players.items()
+        },
+    }
