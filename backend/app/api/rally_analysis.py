@@ -8,7 +8,7 @@ from dataclasses import asdict
 from fastapi import APIRouter
 
 from .. import db
-from ..rallyanalysis import contact_detect
+from ..rallyanalysis import coaching, contact_detect
 from ..rallyanalysis.position_metrics import compute_video_metrics
 from ..rallyanalysis.shot_metrics import compute_video_shot_metrics
 
@@ -97,3 +97,20 @@ def shot_metrics(video_id: str):
             for pid, p in data["players"].items()
         },
     }
+
+
+@router.post("/rally-analysis/{video_id}/coaching-report")
+def generate_coaching_report(video_id: str, source: str = "pass2"):
+    """Triggers coaching report generation (one Anthropic API call) and
+    persists it to coaching_reports, replacing any prior report for this
+    video. Not run automatically anywhere — explicit user action only."""
+    report = coaching.generate_coaching_report(video_id, rally_source=source)
+    return asdict(report)
+
+
+@router.get("/rally-analysis/{video_id}/coaching-report")
+def get_coaching_report(video_id: str):
+    """Returns the cached report, or null if none has been generated yet —
+    regeneration only happens via the POST endpoint."""
+    report = coaching.get_report(video_id)
+    return {"video_id": video_id, "report": asdict(report) if report else None}
