@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from .. import db
 from .contracts import ContactEvent, RallyMetrics
+from .readiness import get_analyzable_rallies
 
 # Rally length bucket thresholds (inclusive upper bounds on shot_count).
 # short: 1-5, medium: 6-10, long: 11+
@@ -78,7 +79,13 @@ def compute_video_shot_metrics(video_id: str) -> dict:
     shot_count, rally_length_bucket) plus a per-player video-level rollup.
 
     Returns {video_id, rally_metrics: [RallyMetrics], players:
-    {player_id: {team, shot_count, shot_side_pct: {left, right}}}}."""
+    {player_id: {team, shot_count, shot_side_pct: {left, right}}}}.
+
+    Only contacts belonging to a rally readiness.get_analyzable_rallies()
+    currently clears are included — contact_events itself carries no Pass 2
+    freshness signal, so this is the only place that filter can be applied
+    when reading it back."""
+    ready_rally_ids = {r["id"] for r in get_analyzable_rallies(video_id)}
     with db.connect() as con:
         rows = db.rows_to_dicts(con.execute(
             "SELECT * FROM contact_events WHERE video_id=? ORDER BY rally_id, frame_idx",
@@ -86,6 +93,8 @@ def compute_video_shot_metrics(video_id: str) -> dict:
 
     by_rally: dict[str, list[ContactEvent]] = {}
     for row in rows:
+        if row["rally_id"] not in ready_rally_ids:
+            continue
         by_rally.setdefault(row["rally_id"], []).append(_row_to_event(row))
 
     rally_metrics = [compute_rally_shot_metrics(rally_id, video_id, events)

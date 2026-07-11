@@ -76,6 +76,27 @@ def _refine_after_pass2(video_id: str) -> None:
         log.exception("rally refinement failed (non-fatal)")
 
 
+def _detect_contacts_after_pass2(video_id: str) -> None:
+    """Contact detection over the fresh Pass 2 overlays. Readiness-gated (see
+    rallyanalysis/readiness.py) on the jobs table showing this video's most
+    recent pass2 job as 'done' — but JobRunner only flips jobs.status to
+    'done' AFTER the do_pass2 closure returns, so this must NOT be called
+    synchronously inside do_pass2 (it would always see 'running' and detect
+    nothing). Instead it's submitted as its own chained job (same pattern
+    do_pass1 already uses to chain do_pass2), so by the time the single
+    worker thread gets to it, the pass2 job row is already finalized to
+    'done'. Never fails the pass — a bug here must not take down someone's
+    Pass 2 job, and running as a separate job (rather than inline) makes
+    that structurally true, not just try/except-shaped."""
+    try:
+        from .rallyanalysis import contact_detect
+        events = contact_detect.detect_contacts_for_video(video_id)
+        contact_detect.save_events(video_id, events)
+        log.info("contact detection stored %d events for %s", len(events), video_id)
+    except Exception:
+        log.exception("contact detection failed (non-fatal)")
+
+
 def start_processing(video_id: str) -> dict:
     """Kick off Pass 1 immediately (background); Pass 2 chains after it."""
     version, params = learned_params.get_latest()
@@ -97,6 +118,11 @@ def start_processing(video_id: str) -> dict:
         on_window(-1)   # drop stale refine JSON before the pass starts
         run_pass2(video_id, params, H, cam, handle, on_window=on_window)
         _refine_after_pass2(video_id)
+        # Chained as its own job (not called inline) so it only runs once the
+        # jobs table shows this pass2 job as 'done' — see
+        # _detect_contacts_after_pass2's docstring.
+        if not handle.cancelled():
+            runner.submit(video_id, "contacts", lambda h: _detect_contacts_after_pass2(video_id))
 
     job_id = runner.submit(video_id, "pass1", do_pass1)
     return {"job_id": job_id, "learned_params_version": version}
@@ -115,6 +141,11 @@ def reprocess(video_id: str, which: str) -> dict:
         on_window(-1)   # drop stale refine JSON before the pass starts
         run_pass2(video_id, params, H, cam, handle, on_window=on_window)
         _refine_after_pass2(video_id)
+        # Chained as its own job (not called inline) so it only runs once the
+        # jobs table shows this pass2 job as 'done' — see
+        # _detect_contacts_after_pass2's docstring.
+        if not handle.cancelled():
+            runner.submit(video_id, "contacts", lambda h: _detect_contacts_after_pass2(video_id))
 
     job_id = runner.submit(video_id, "pass2", do_pass2)
     return {"job_id": job_id, "learned_params_version": version}

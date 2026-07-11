@@ -9,6 +9,7 @@ Endpoints:
   GET  /rally-analysis/{video_id}/position-metrics   Kitchen Arrival % / Forward Pressure per player
   GET  /rally-analysis/{video_id}/shot-metrics       shot side split / rally length buckets
   GET  /rally-analysis/{video_id}/highlights         rule-based rally tags (Long Rally/Firefight/Poach)
+  GET  /rally-analysis/{video_id}/readiness          per-rally Pass 2 readiness (waiting/stale/ready)
   POST /rally-analysis/{video_id}/coaching-report    generate report (1 Anthropic call) -> coaching_reports
   GET  /rally-analysis/{video_id}/coaching-report    cached report, or {"report": null}
 """
@@ -22,6 +23,7 @@ from .. import db
 from ..rallyanalysis import coaching, contact_detect
 from ..rallyanalysis.highlights import compute_video_highlights
 from ..rallyanalysis.position_metrics import compute_video_metrics
+from ..rallyanalysis.readiness import readiness_report
 from ..rallyanalysis.shot_metrics import compute_video_shot_metrics
 
 router = APIRouter()
@@ -116,6 +118,15 @@ def highlights(video_id: str):
     """Rule-based rally tags (Long Rally / Firefight / Poach) computed on
     demand from existing RallyMetrics — nothing persisted."""
     return {"video_id": video_id, "highlights": compute_video_highlights(video_id)}
+
+
+@router.get("/rally-analysis/{video_id}/readiness")
+def readiness(video_id: str):
+    """Per-rally Pass 2 readiness, so the frontend can show a 'waiting on
+    Pass 2' state instead of silently showing nothing or stale data.
+    {rally_id: {"ready": bool, "reason": "pass2_not_done"|"pass2_running"|
+    "overlay_stale"|"ready"}}."""
+    return readiness_report(video_id)
 
 
 @router.post("/rally-analysis/{video_id}/coaching-report")

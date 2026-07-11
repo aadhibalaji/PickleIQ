@@ -20,6 +20,7 @@ from ..config import ANTHROPIC_API_KEY, ANTHROPIC_REPORT_MODEL
 from ..cv import overlays
 from ..cv.court import NET_Y
 from .contracts import CoachingReport, ShotFeatureVector
+from .readiness import get_analyzable_rallies
 
 log = logging.getLogger("rallyanalysis.coaching")
 
@@ -473,15 +474,20 @@ def build_report(video_id: str, vectors_meta: list[tuple[ShotFeatureVector, dict
 
 def generate_coaching_report(video_id: str, rally_source: str = "pass2",
                               overlay_source: str | None = None) -> CoachingReport:
+    """Only builds feature vectors for contacts belonging to a rally
+    readiness.get_analyzable_rallies() currently clears (Pass 2 done, overlay
+    coverage still matches the rally's current frame range) — a stale/partial
+    rally is excluded from both the active-rally-seconds denominator and the
+    contacts fed into compute_feature_vector."""
     overlay_source = overlay_source or rally_source
+    rallies = get_analyzable_rallies(video_id, rally_source=rally_source, overlay_source=overlay_source)
+    ready_rally_ids = {r["id"] for r in rallies}
     with db.connect() as con:
         vrow = con.execute("SELECT fps FROM videos WHERE id=?", (video_id,)).fetchone()
         contacts = db.rows_to_dicts(con.execute(
             "SELECT * FROM contact_events WHERE video_id=? ORDER BY frame_idx",
             (video_id,)).fetchall())
-        rallies = db.rows_to_dicts(con.execute(
-            "SELECT start_frame, end_frame FROM rally_labels WHERE video_id=? AND source=?",
-            (video_id, rally_source)).fetchall())
+    contacts = [c for c in contacts if c["rally_id"] in ready_rally_ids]
     fps = float(vrow["fps"]) if vrow and vrow["fps"] else 30.0
     active_rally_seconds = sum((r["end_frame"] - r["start_frame"]) / fps for r in rallies)
 

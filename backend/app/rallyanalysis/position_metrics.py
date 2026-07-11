@@ -200,9 +200,16 @@ def compute_video_metrics(video_id: str, overlay_source: str | None = None) -> d
 
     kitchen_arrival_pct denominator is rallies where the player's OWN team
     was the (heuristically) inferred server; forward_pressure is averaged
-    across every rally the player appears in, serving or not."""
+    across every rally the player appears in, serving or not.
+
+    Only rallies readiness.get_analyzable_rallies() clears (Pass 2 done, and
+    its overlay data still covers the rally's current frame range) are
+    included — imported locally to avoid a circular import (readiness.py
+    itself reuses _get_rallies/_default_overlay_source from this module)."""
+    from .readiness import get_analyzable_rallies
+
     overlay_source = overlay_source or _default_overlay_source(video_id)
-    rallies = _get_rallies(video_id)
+    rallies = get_analyzable_rallies(video_id, overlay_source=overlay_source)
     rally_entries = [(r["id"], read_range(video_id, overlay_source, r["start_frame"], r["end_frame"]))
                       for r in rallies]
     result = _aggregate_rallies(rally_entries)

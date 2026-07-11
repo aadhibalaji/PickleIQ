@@ -30,6 +30,7 @@ from ..cv.court import COURT_W
 from ..cv.players import PlayerObs, is_serve_formation
 from ..cv import overlays
 from .contracts import ContactEvent
+from .readiness import get_analyzable_rallies
 
 L_WRIST, R_WRIST = 9, 10  # COCO-17 keypoint indices
 
@@ -212,14 +213,17 @@ def detect_contacts_for_rally(video_id: str, rally_id: str, entries: list[dict],
 
 def detect_contacts_for_video(video_id: str, rally_source: str = "pass2",
                                overlay_source: str | None = None) -> list[ContactEvent]:
+    """Only rallies readiness.get_analyzable_rallies() clears (Pass 2 done,
+    and its overlay data still covers the rally's current frame range) are
+    processed — a rally whose Pass 2 job is running/missing/errored, or
+    whose overlay coverage has gone stale relative to its current
+    start/end frame, is silently skipped rather than analyzed against
+    partial data."""
     overlay_source = overlay_source or rally_source
     with db.connect() as con:
         vrow = con.execute("SELECT fps FROM videos WHERE id=?", (video_id,)).fetchone()
-        rallies = con.execute(
-            "SELECT id, start_frame, end_frame FROM rally_labels"
-            " WHERE video_id=? AND source=? ORDER BY start_frame",
-            (video_id, rally_source)).fetchall()
     fps = float(vrow["fps"]) if vrow and vrow["fps"] else 30.0
+    rallies = get_analyzable_rallies(video_id, rally_source=rally_source, overlay_source=overlay_source)
 
     events: list[ContactEvent] = []
     for rally in rallies:

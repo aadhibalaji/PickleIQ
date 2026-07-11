@@ -11,7 +11,8 @@ from __future__ import annotations
 from .. import db
 from ..cv.court import COURT_W
 from ..cv.overlays import read_range
-from .position_metrics import _default_overlay_source, _get_rallies, _in_kitchen
+from .position_metrics import _default_overlay_source, _in_kitchen
+from .readiness import get_analyzable_rallies
 from .shot_metrics import bucket_rally_length
 
 # --- Firefight thresholds ---------------------------------------------------
@@ -117,7 +118,7 @@ def compute_video_highlights(video_id: str, overlay_source: str | None = None) -
     shot_counts = {r["rally_id"]: r["n"] for r in contact_rows}
 
     overlay_source = overlay_source or _default_overlay_source(video_id)
-    rallies = _get_rallies(video_id)
+    rallies = get_analyzable_rallies(video_id, overlay_source=overlay_source)
 
     rows: list[dict] = []
     for rally in rallies:
