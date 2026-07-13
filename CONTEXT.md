@@ -65,6 +65,12 @@ Recent landed work (committed):
 
 ## Env / hardware (this machine)
 
+Per-GPU speed knobs (device, precision, OpenVINO, TrackNet, Pass 1 subsampling)
+bundle into one `HW_PROFILE` name — see `backend/app/hw_profiles.json` (add a
+profile there for a new machine, no code change) and `backend/app/hw_profile.py`
+(schema). This is a SPEED setting, not for cross-machine reproducibility;
+unset `HW_PROFILE` keeps the plain `.env` knobs below working unchanged.
+
 From `.env` (do not commit secrets):
 
 | Knob | Current | Meaning |

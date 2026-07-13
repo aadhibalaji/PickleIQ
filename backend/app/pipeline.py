@@ -14,8 +14,24 @@ from .cv.pass1 import run_pass1
 from .cv.pass2 import run_pass2
 from .jobs import JobHandle, runner
 from .learning import params as learned_params
+from .hw_profile import active_profile
 
 log = logging.getLogger("pipeline")
+
+
+def _with_hw_overrides(params: dict) -> dict:
+    """Overlay the active hardware profile's p1_scale/p1_frame_step (if set)
+    onto a COPY of the LearnedParams dict for this run only. Never written
+    back to learned_params — these are speed knobs, not learned tunables
+    (see hw_profile.py); autolearn's stored baseline is untouched."""
+    profile = active_profile()
+    if not profile:
+        return params
+    merged = dict(params)
+    for key in ("p1_scale", "p1_frame_step"):
+        if profile.get(key) is not None:
+            merged[key] = learned_params.clamp(key, profile[key])
+    return merged
 
 
 def effective_calibration(video_id: str):
@@ -100,6 +116,7 @@ def _detect_contacts_after_pass2(video_id: str) -> None:
 def start_processing(video_id: str) -> dict:
     """Kick off Pass 1 immediately (background); Pass 2 chains after it."""
     version, params = learned_params.get_latest()
+    params = _with_hw_overrides(params)
     with db.connect() as con:
         con.execute("UPDATE videos SET learned_params_version=? WHERE id=?",
                     (version, video_id))
@@ -134,6 +151,7 @@ def reprocess(video_id: str, which: str) -> dict:
     if which == "pass1":
         return start_processing(video_id)
     version, params = learned_params.get_latest()
+    params = _with_hw_overrides(params)
 
     def do_pass2(handle: JobHandle) -> None:
         H, cam, _ = effective_calibration(video_id)

@@ -29,7 +29,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ..config import DATA_DIR, TRACKNET_ENABLED, TRACKNET_WEIGHTS
+from ..config import DATA_DIR, TRACKNET_ENABLED, TRACKNET_WEIGHTS, HW_PRECISION, HW_OPENVINO_ENABLED
 from .device import torch_device
 
 log = logging.getLogger("cv.tracknet")
@@ -144,7 +144,10 @@ def _openvino_infer(weights: Path):
     (players._openvino_pose_dir): torch can't drive the Arc from ultralytics
     and eager torch-XPU runs this U-Net at ~110 ms/frame; OpenVINO is the
     production path. Returns infer(x: np.ndarray (1,9,H,W)) -> logits
-    (3,H,W), or None when OpenVINO/GPU is unavailable."""
+    (3,H,W), or None when OpenVINO/GPU is unavailable or the active hardware
+    profile turns OpenVINO off (non-Intel machines)."""
+    if not HW_OPENVINO_ENABLED:
+        return None
     try:
         import openvino as ov
 
@@ -197,6 +200,7 @@ class TrackNetBall:
                 "ball detector")
             return
         self._ov = _openvino_infer(Path(path))
+        self._half = False
         if self._ov is None:
             import torch
 
@@ -210,8 +214,17 @@ class TrackNetBall:
                 log.warning("TrackNet failed to move to %s, using CPU", self.device)
                 self.device = "cpu"
                 self.model.to("cpu")
-        log.info("TrackNet weights loaded from %s (%s)", path,
-                 "openvino-gpu" if self._ov else f"torch-{self.device}")
+            # fp16 only makes sense on an actual GPU backend; CPU fp16 is
+            # unsupported/slow for most torch ops.
+            if HW_PRECISION == "fp16" and self.device != "cpu":
+                try:
+                    self.model.half()
+                    self._half = True
+                except Exception:  # noqa: BLE001
+                    log.warning("TrackNet .half() unsupported on %s, using fp32", self.device)
+        log.info("TrackNet weights loaded from %s (%s%s)", path,
+                 "openvino-gpu" if self._ov else f"torch-{self.device}",
+                 "-fp16" if self._half else "")
 
     def infer_triplet(self, frames_bgr: list[np.ndarray]) -> tuple[float, float, float, float] | None:
         """frames_bgr: 3 consecutive frames, OLDEST FIRST; the prediction is
@@ -234,6 +247,8 @@ class TrackNetBall:
 
             with torch.no_grad():
                 xt = torch.from_numpy(x).to(self.device)
+                if self._half:
+                    xt = xt.half()
                 hm = torch.sigmoid(self.model(xt))[0, -1].float().cpu().numpy()
         conf = float(hm.max())
         yy0, xx0 = np.unravel_index(int(hm.argmax()), hm.shape)
