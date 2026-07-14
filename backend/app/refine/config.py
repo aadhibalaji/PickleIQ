@@ -121,7 +121,18 @@ class RefineConfig:
     live_ratio: float = 0.7
     ratio_window_s: float = 2.0
     merge_gap_s: float = 2.0
-    min_rally_s: float = 2.5
+    # 2026-07-14: raised 2.5 -> 3.0 (this is the "too short" penalty — the
+    # ONLY duration term in the pipeline; it's a hard threshold, not a
+    # continuous weight, applied twice: postprocess.py drops Stage C segments
+    # shorter than this, and refine.py rejects a segment "too_short" if its
+    # snapped [refined_start, refined_end) is still under it after
+    # start/end re-anchoring). +0.5s is a real bump (20%), not a token change,
+    # meant to drop more sub-2.5s noise blips (ball-knock-between-points,
+    # camera-jitter flickers) that were slipping through as false-positive
+    # rallies. No BOUNDS dict exists for RefineConfig (unlike learned_params
+    # p1_*), so nothing to widen here — re-sweep (DEFAULT_GRID) if this value
+    # ever needs revisiting.
+    min_rally_s: float = 3.0
 
     # ---- Stage D: serve gate + snapping ----------------------------------
     serve_search_s: float = 3.0     # search window after the segment rising edge
