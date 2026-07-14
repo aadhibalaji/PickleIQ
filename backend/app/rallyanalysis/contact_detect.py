@@ -30,8 +30,7 @@ from ..cv.court import COURT_W
 from ..cv.players import PlayerObs, is_serve_formation
 from ..cv import overlays
 from .contracts import ContactEvent
-from .position_metrics import _default_overlay_source
-from .readiness import get_analyzable_rallies
+from .readiness import _default_overlay_source, get_analyzable_rallies
 
 L_WRIST, R_WRIST = 9, 10  # COCO-17 keypoint indices
 

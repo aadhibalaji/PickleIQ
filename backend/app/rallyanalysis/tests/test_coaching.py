@@ -1,15 +1,18 @@
-"""Synthetic feature vectors -> ratio math and adaptive-threshold selection.
-No DB, no anthropic import needed: exercises the pure functions directly
-(compute_category_ratios, select_worst_best, build_report with an injected
-fake llm_fn), same pattern as position_metrics/contact_detect tests."""
+"""Synthetic feature vectors -> classify()/adaptive-threshold selection and
+tip-generation wiring. No DB, no anthropic import needed: exercises the pure
+functions directly (_classify, select_worst_best, select_tip_candidates,
+build_report with an injected fake llm_fn), same pattern as contact_detect
+tests."""
 from __future__ import annotations
 
-from ..coaching import (CATEGORIES, _classify, _neutral, build_report,
-                         compute_category_ratios, select_worst_best,
+from ..coaching import (MAX_PRAISE_TIPS, MAX_TIPS, _classify, _neutral, build_report,
+                         select_tip_candidates, select_worst_best,
                          ELBOW_EXTENSION_GOOD_RANGE_DEG, FOLLOW_THROUGH_GOOD_RANGE,
                          KNEE_BEND_GOOD_RANGE_DEG, SHOULDER_ROTATION_GOOD_RANGE_DEG,
                          SPLIT_STEP_GOOD_RANGE_S, WEIGHT_TRANSFER_GOOD_RANGE)
 from ..contracts import ShotFeatureVector
+
+CATEGORIES = ["footwork", "paddle_prep", "contact_point", "follow_through"]
 
 
 def _vec(contact_id, category, deviation_score):
@@ -28,29 +31,10 @@ def _vec(contact_id, category, deviation_score):
         deviation_score=deviation_score)
 
 
-def _contact(contact_id, confidence=0.8, timestamp_s=1.0, rally_id="r1"):
-    return {"contact_id": contact_id, "timestamp_s": timestamp_s, "rally_id": rally_id,
-            "player_id": 1, "team": "near", "shot_side": "left", "is_serve": False,
-            "confidence": confidence}
-
-
-# --------------------------------------------------------------------- ratio
-
-def test_category_ratios_divide_by_active_rally_seconds_not_shot_count():
-    vectors = [_vec("c1", "footwork", 0.5), _vec("c2", "footwork", -0.3),
-               _vec("c3", "footwork", 0.0), _vec("c4", "contact_point", 0.0)]
-    ratios = compute_category_ratios(vectors, active_rally_seconds=20.0)
-    assert ratios["footwork"]["flagged_count"] == 2  # only the two nonzero deviations
-    assert ratios["footwork"]["active_rally_seconds"] == 20.0
-    assert ratios["footwork"]["ratio"] == 2 / 20.0
-    assert ratios["contact_point"]["flagged_count"] == 0
-    assert set(ratios) == set(CATEGORIES)
-
-
-def test_category_ratios_zero_active_seconds_does_not_divide_by_zero():
-    vectors = [_vec("c1", "paddle_prep", 1.0)]
-    ratios = compute_category_ratios(vectors, active_rally_seconds=0.0)
-    assert ratios["paddle_prep"]["ratio"] == 0.0
+def _contact(contact_id, confidence=0.8, timestamp_s=1.0, frame_idx=0, rally_id="r1"):
+    return {"contact_id": contact_id, "frame_idx": frame_idx, "timestamp_s": timestamp_s,
+            "rally_id": rally_id, "player_id": 1, "team": "near", "shot_side": "left",
+            "is_serve": False, "confidence": confidence}
 
 
 # --------------------------------------------------------------- classify()
@@ -111,34 +95,51 @@ def test_best_shots_requires_in_range_and_high_confidence():
     assert "low_conf" not in best_ids          # confidence floor excludes it
 
 
+# ------------------------------------------------------- tip-candidate cap
+
+def test_select_tip_candidates_caps_total_and_reserves_praise_slots():
+    # Many worse-than-threshold shots plus many clean high-confidence
+    # shots -- total surfaced must never exceed MAX_TIPS, and praise never
+    # crowds out more than MAX_PRAISE_TIPS worth of improve tips.
+    worst_meta = [(_vec(f"bad{i}", "footwork", -5.0), _contact(f"bad{i}", confidence=0.9))
+                  for i in range(20)]
+    best_meta = [(_vec(f"good{i}", "footwork", 0.0), _contact(f"good{i}", confidence=0.95))
+                 for i in range(20)]
+    candidates = select_tip_candidates(worst_meta + best_meta)
+    assert len(candidates) == MAX_TIPS
+    n_best = sum(1 for c in candidates if c["deviation_score"] == 0.0)
+    assert n_best <= MAX_PRAISE_TIPS
+
+
 # ----------------------------------------------------------- LLM payload wiring
 
-def test_build_report_passes_ratios_and_shots_to_llm_fn_and_calls_it_once():
+def test_build_report_passes_candidates_to_llm_fn_and_calls_it_once():
     calls = []
 
-    def fake_llm(payload):
-        calls.append(payload)
-        return "mock narrative"
+    def fake_llm(shots):
+        calls.append(shots)
+        return {s["contact_id"]: {"tip": "mock tip", "tone": "improve" if s["deviation_score"] else "praise"}
+                for s in shots}
 
-    vectors_meta = [(_vec("good", "footwork", 0.0), _contact("good", confidence=0.9)),
-                     (_vec("bad", "contact_point", -3.0), _contact("bad", confidence=0.9))]
-    report = build_report("vid1", vectors_meta, active_rally_seconds=15.0, llm_fn=fake_llm)
+    vectors_meta = [(_vec("good", "footwork", 0.0), _contact("good", confidence=0.9, frame_idx=10, timestamp_s=1.5)),
+                     (_vec("bad", "contact_point", -3.0), _contact("bad", confidence=0.9, frame_idx=20, timestamp_s=3.0))]
+    report = build_report("vid1", vectors_meta, llm_fn=fake_llm)
 
     assert len(calls) == 1  # exactly one Anthropic call per video
-    payload = calls[0]
-    assert set(payload) == {"category_ratios", "worst_shots", "best_shots"}
-    assert payload["category_ratios"]["contact_point"]["flagged_count"] == 1
-    assert payload["category_ratios"]["contact_point"]["active_rally_seconds"] == 15.0
-    assert any(s["contact_id"] == "bad" for s in payload["worst_shots"])
-    assert any(s["contact_id"] == "good" for s in payload["best_shots"])
+    contact_ids = {s["contact_id"] for s in calls[0]}
+    assert contact_ids == {"good", "bad"}
     assert report.video_id == "vid1"
-    assert report.narrative == "mock narrative"
+    tips_by_id = {t.contact_id: t for t in report.tips}
+    assert tips_by_id["bad"].tone == "improve"
+    assert tips_by_id["bad"].frame == 20
+    assert tips_by_id["bad"].timestamp_s == 3.0
+    assert tips_by_id["good"].tone == "praise"
 
 
-def test_build_report_degrades_gracefully_when_llm_fn_returns_none():
+def test_build_report_degrades_gracefully_when_llm_fn_returns_empty():
     vectors_meta = [(_vec("c1", "footwork", 0.0), _contact("c1"))]
-    report = build_report("vid1", vectors_meta, active_rally_seconds=5.0, llm_fn=lambda payload: None)
-    assert report.narrative == ""  # never crashes, never fabricates a narrative
+    report = build_report("vid1", vectors_meta, llm_fn=lambda shots: {})
+    assert report.tips == []  # never crashes, never fabricates a tip
 
 
 if __name__ == "__main__":

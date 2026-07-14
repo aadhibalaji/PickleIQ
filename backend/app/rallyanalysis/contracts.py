@@ -46,24 +46,22 @@ class ShotFeatureVector:
 
 
 @dataclass
-class RallyMetrics:
-    """One per rally. Position metrics (Wave 1) and shot metrics (Wave 2)
-    both populate this same shape — see position_metrics.py / shot_metrics.py."""
-    rally_id: str
-    video_id: str
-    kitchen_arrival: dict = field(default_factory=dict)      # {player_id: bool}
-    forward_pressure: dict = field(default_factory=dict)     # {player_id: float}
-    shot_side_pct: dict = field(default_factory=dict)        # {player_id: {"left": float, "right": float}}
-    shot_count: int = 0
-    rally_length_bucket: str | None = None  # 'short' | 'medium' | 'long'
-    active_duration_s: float = 0.0
+class CoachingTip:
+    """One plain-language, per-shot coaching tip, anchored to the contact
+    event it was generated from so the UI can seek the video there and
+    attribute the tip to a player."""
+    contact_id: str
+    frame: int
+    timestamp_s: float
+    category: str  # 'footwork' | 'paddle_prep' | 'contact_point' | 'follow_through'
+    tip: str
+    tone: str  # 'improve' | 'praise'
+    player_id: int
+    player_label: str  # e.g. "Player 1" — display label, derived from player_id
 
 
 @dataclass
 class CoachingReport:
     """One per video, generated once (explicit user action — LLM call)."""
     video_id: str
-    category_ratios: dict = field(default_factory=dict)  # {category: {flagged_count, active_rally_seconds, ratio}}
-    worst_shots: list = field(default_factory=list)  # [{contact_id, category, deviation_score, timestamp_s, rally_id, feature_vector}]
-    best_shots: list = field(default_factory=list)
-    narrative: str = ""
+    tips: list = field(default_factory=list)  # list[CoachingTip]

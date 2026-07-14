@@ -14,7 +14,6 @@ from __future__ import annotations
 
 from .. import db
 from ..cv.overlays import read_range
-from .position_metrics import _default_overlay_source, _get_rallies
 
 # A rally's overlay coverage must reach within this many frames of both
 # start_frame and end_frame to count as "still covers this rally" — Pass 2
@@ -26,6 +25,34 @@ REASON_NOT_DONE = "pass2_not_done"
 REASON_RUNNING = "pass2_running"
 REASON_STALE = "overlay_stale"
 REASON_READY = "ready"
+
+
+def _default_overlay_source(video_id: str) -> str:
+    """Pass 2 overlays carry stable identity slots; prefer them, fall back to
+    Pass 1 spot-check overlays if Pass 2 hasn't run."""
+    with db.connect() as con:
+        row = con.execute(
+            "SELECT 1 FROM overlays WHERE video_id=? AND source='pass2' LIMIT 1",
+            (video_id,)).fetchone()
+    return "pass2" if row else "pass1"
+
+
+def _get_rallies(video_id: str) -> list[dict]:
+    """Human labels win when present (ground truth), else Pass 2, else
+    Pass 1 — same override order the rest of the app treats as canonical
+    (see api/annotate.py get_rallies)."""
+    with db.connect() as con:
+        rows = db.rows_to_dicts(con.execute(
+            "SELECT id, source, start_frame, end_frame FROM rally_labels WHERE video_id=?",
+            (video_id,)).fetchall())
+    by_source: dict[str, list[dict]] = {"human": [], "pass2": [], "pass1": []}
+    for r in rows:
+        if r["source"] in by_source:
+            by_source[r["source"]].append(r)
+    for src in ("human", "pass2", "pass1"):
+        if by_source[src]:
+            return sorted(by_source[src], key=lambda r: r["start_frame"])
+    return []
 
 
 def _latest_pass2_job_status(video_id: str) -> str | None:

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from .. import db, pipeline
 from ..config import VIDEO_DIR
@@ -15,6 +16,10 @@ from ..cv.video_io import probe
 from ..jobs import runner
 
 router = APIRouter()
+
+
+class VideoUpdateIn(BaseModel):
+    match_type: str | None = None
 
 
 @router.post("/videos")
@@ -70,6 +75,20 @@ def get_video(video_id: str):
     # Normalized player-detection exclusion polygons so the overlay can draw them.
     from ..cv.exclusions import zones_as_lists
     return {**dict(row), "jobs": out_jobs, "exclusion_zones": zones_as_lists()}
+
+
+@router.patch("/videos/{video_id}")
+def update_video(video_id: str, body: VideoUpdateIn):
+    """Per-clip metadata that isn't produced by a pass — currently just
+    match_type, used by the coaching layer to defend against player-identity
+    mis-tracking on singles clips (see rallyanalysis/coaching.py)."""
+    if body.match_type not in (None, "singles", "doubles"):
+        raise HTTPException(400, "match_type must be 'singles' or 'doubles'")
+    with db.connect() as con:
+        if con.execute("SELECT 1 FROM videos WHERE id=?", (video_id,)).fetchone() is None:
+            raise HTTPException(404, "video not found")
+        con.execute("UPDATE videos SET match_type=? WHERE id=?", (body.match_type, video_id))
+    return {"id": video_id, "match_type": body.match_type}
 
 
 @router.post("/videos/{video_id}/reprocess")

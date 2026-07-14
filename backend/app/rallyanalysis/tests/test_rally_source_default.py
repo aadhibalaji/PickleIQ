@@ -16,6 +16,7 @@ import pytest
 
 from ... import db
 from ...cv import overlays
+from .. import coaching
 from ..coaching import generate_coaching_report
 from ..contact_detect import detect_contacts_for_video
 
@@ -63,17 +64,23 @@ def test_detect_contacts_for_video_finds_pass1_only_rallies_by_default():
     assert events[0].rally_id == "r1"
 
 
-def test_generate_coaching_report_finds_pass1_only_rallies_by_default():
+def test_generate_coaching_report_finds_pass1_only_rallies_by_default(monkeypatch):
     events = detect_contacts_for_video(VIDEO)
     from ..contact_detect import save_events
     save_events(VIDEO, events)
 
-    # No ANTHROPIC_API_KEY in the test env -> narrative degrades to "" (logged
-    # warning, not a crash) -- see generate_llm_narrative. What this test
-    # guards is that the rally was found at all: active_rally_seconds and the
-    # ratio denominator only come from a non-empty get_analyzable_rallies().
+    # Stub the adaptive selection (its own worst/best cap logic is covered by
+    # test_coaching.py) and the Anthropic call (no ANTHROPIC_API_KEY in the
+    # test env) so this test isolates what it actually guards: that the
+    # pass1-only rally was found and its contact reached feature-vector
+    # extraction and tip generation at all.
+    monkeypatch.setattr(coaching, "select_tip_candidates",
+                         lambda vectors_meta: [coaching._shot_summary(vec, c) for vec, c in vectors_meta])
+    monkeypatch.setattr(coaching, "generate_llm_tips",
+                         lambda shots: {s["contact_id"]: {"tip": "t", "tone": "praise"} for s in shots})
+
     report = generate_coaching_report(VIDEO)
-    assert report.category_ratios["footwork"]["active_rally_seconds"] == pytest.approx(20 / FPS)
+    assert len(report.tips) == 1
 
 
 if __name__ == "__main__":

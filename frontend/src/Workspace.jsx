@@ -367,7 +367,10 @@ export default function Workspace({ videoId, onBack }) {
                    onGrade={gradeWindow} videoId={videoId} note={note} />
         )}
         {tab === 'rally-analysis' && (
-          <RallyAnalysisPanel videoId={videoId} onSeek={seek} />
+          <RallyAnalysisPanel videoId={videoId} video={video}
+                               onUpdateVideo={(patch) => api.updateVideo(videoId, patch)
+                                 .then((v) => setVideo((old) => ({ ...old, ...v })))
+                                 .catch((e) => note(`update failed: ${e.message}`))} />
         )}
       </div>
     </div>

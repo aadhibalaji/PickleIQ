@@ -178,10 +178,7 @@ CREATE TABLE IF NOT EXISTS contact_events (
 
 CREATE TABLE IF NOT EXISTS coaching_reports (
   video_id TEXT PRIMARY KEY,        -- one report per video (latest wins, regenerate on request)
-  category_ratios TEXT NOT NULL,    -- JSON {category: {flagged_count, active_rally_seconds, ratio}}
-  worst_shots TEXT NOT NULL,        -- JSON [{contact_id, category, deviation_score, timestamp_s, rally_id, feature_vector}]
-  best_shots TEXT NOT NULL,         -- JSON same shape as worst_shots
-  narrative TEXT NOT NULL,
+  tips_json TEXT NOT NULL,          -- JSON [{contact_id, frame, timestamp_s, category, tip, tone}]
   created_at REAL NOT NULL
 );
 
@@ -204,6 +201,7 @@ CREATE TABLE IF NOT EXISTS model_registry (
 _ADDED_COLUMNS = [
     ("videos", "last_labels_hash", "TEXT"),
     ("videos", "model_versions", "TEXT"),
+    ("videos", "match_type", "TEXT"),  # 'singles' | 'doubles' | NULL (unset)
     # Ground-truth ball-event marks (viewer marking mode). NULL event_type =
     # legacy row = plain position mark. in_out is the human's call on a bounce;
     # in_out_suggested is what the homography said at save time; disagree=1
@@ -232,6 +230,13 @@ def init_db() -> None:
             have = {r["name"] for r in con.execute(f"PRAGMA table_info({table})")}
             if col not in have:
                 con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+        # coaching_reports moved from one aggregate narrative to per-shot tips
+        # (tips_json) — it's a regeneratable cache, not source data, so drop
+        # and recreate on the old schema rather than migrate columns.
+        cols = {r["name"] for r in con.execute("PRAGMA table_info(coaching_reports)")}
+        if cols and "tips_json" not in cols:
+            con.execute("DROP TABLE coaching_reports")
+            con.executescript(SCHEMA)
 
 
 def new_id() -> str:

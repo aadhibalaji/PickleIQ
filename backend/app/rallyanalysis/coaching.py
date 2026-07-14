@@ -19,13 +19,10 @@ from .. import db
 from ..config import ANTHROPIC_API_KEY, ANTHROPIC_REPORT_MODEL
 from ..cv import overlays
 from ..cv.court import NET_Y
-from .contracts import CoachingReport, ShotFeatureVector
-from .position_metrics import _default_overlay_source
-from .readiness import get_analyzable_rallies
+from .contracts import CoachingReport, CoachingTip, ShotFeatureVector
+from .readiness import _default_overlay_source, get_analyzable_rallies
 
 log = logging.getLogger("rallyanalysis.coaching")
-
-CATEGORIES = ["footwork", "paddle_prep", "contact_point", "follow_through"]
 
 # COCO-17 keypoint indices (same convention as contact_detect.py / players.py).
 L_SHOULDER, R_SHOULDER = 5, 6
@@ -65,6 +62,9 @@ WORST_DEVIATION_THRESHOLD = 1.0  # |deviation_score| >= this many reference-rang
                                    # 0-1 shots, a rough one can clear many.
 K_STD_BEST = 0.5          # best-shot z-score threshold over confidence (in-range shots only)
 MIN_BEST_CONFIDENCE = 0.3
+
+MAX_TIPS = 8       # keeps the UI list short and readable regardless of rally count
+MAX_PRAISE_TIPS = 3  # reserves most of the cap for actionable ("improve") tips
 
 
 # ---------------------------------------------------------------------------
@@ -311,22 +311,11 @@ def _classify(knee_bend_deg, shoulder_rotation_deg, elbow_extension_deg,
 
 
 # ---------------------------------------------------------------------------
-# Aggregation + adaptive worst/best selection — pure, unit-tested directly.
+# Adaptive worst/best selection — pure, unit-tested directly.
 # ---------------------------------------------------------------------------
 
-def compute_category_ratios(vectors: list[ShotFeatureVector], active_rally_seconds: float) -> dict:
-    flagged = {cat: 0 for cat in CATEGORIES}
-    for vec in vectors:
-        if vec.deviation_score != 0.0:
-            flagged[vec.category] += 1
-    return {
-        cat: {
-            "flagged_count": flagged[cat],
-            "active_rally_seconds": active_rally_seconds,
-            "ratio": (flagged[cat] / active_rally_seconds) if active_rally_seconds > 0 else 0.0,
-        }
-        for cat in CATEGORIES
-    }
+def player_label(player_id) -> str:
+    return f"Player {player_id}"
 
 
 def _shot_summary(vec: ShotFeatureVector, contact: dict) -> dict:
@@ -334,9 +323,11 @@ def _shot_summary(vec: ShotFeatureVector, contact: dict) -> dict:
         "contact_id": vec.contact_id,
         "category": vec.category,
         "deviation_score": vec.deviation_score,
+        "frame_idx": contact.get("frame_idx"),
         "timestamp_s": contact.get("timestamp_s"),
         "rally_id": contact.get("rally_id"),
         "player_id": contact.get("player_id"),
+        "player_label": player_label(contact.get("player_id")),
         "team": contact.get("team"),
         "shot_side": contact.get("shot_side"),
         "is_serve": bool(contact.get("is_serve")),
@@ -375,52 +366,121 @@ def select_worst_best(vectors_meta: list[tuple[ShotFeatureVector, dict]]) -> tup
     return worst, best
 
 
+def select_tip_candidates(vectors_meta: list[tuple[ShotFeatureVector, dict]]) -> list[dict]:
+    """Bounds select_worst_best's adaptive output to at most MAX_TIPS shots so
+    the tip list stays short — worst shots (the actionable ones) get
+    priority, with at most MAX_PRAISE_TIPS praise slots reserved so a clean
+    session still surfaces some encouragement rather than an empty list.
+
+    Budget is split as evenly as practical across the distinct players
+    present (not hardcoded to 2 or 4 — a video may carry any count,
+    especially before Part 0's singles-merge stopgap runs). A player short on
+    notable contacts simply yields their unused share back to the pool
+    rather than getting a padded/fabricated tip."""
+    worst, best = select_worst_best(vectors_meta)
+    worst = sorted(worst, key=lambda s: -abs(s["deviation_score"]))
+    best = sorted(best, key=lambda s: -(s.get("confidence") or 0.0))
+    players = sorted({s["player_id"] for s in worst + best})
+    if not players:
+        return []
+
+    per_player = max(1, MAX_TIPS // len(players))
+    per_player_praise = max(1, MAX_PRAISE_TIPS // len(players))
+    selected: list[dict] = []
+    used_ids: set[str] = set()
+    for pid in players:
+        p_best = [s for s in best if s["player_id"] == pid][:per_player_praise]
+        p_worst = [s for s in worst if s["player_id"] == pid][:max(0, per_player - len(p_best))]
+        for s in p_worst + p_best:
+            selected.append(s)
+            used_ids.add(s["contact_id"])
+
+    # Fill any budget left by players who didn't have enough candidates to
+    # fill their share, worst-first, then praise (still capped by MAX_TIPS
+    # and MAX_PRAISE_TIPS overall).
+    n_praise = sum(1 for s in selected if s["deviation_score"] == 0.0)
+    for s in worst:
+        if len(selected) >= MAX_TIPS:
+            break
+        if s["contact_id"] not in used_ids:
+            selected.append(s)
+            used_ids.add(s["contact_id"])
+    for s in best:
+        if len(selected) >= MAX_TIPS or n_praise >= MAX_PRAISE_TIPS:
+            break
+        if s["contact_id"] not in used_ids:
+            selected.append(s)
+            used_ids.add(s["contact_id"])
+            n_praise += 1
+
+    return selected[:MAX_TIPS]
+
+
 # ---------------------------------------------------------------------------
 # Anthropic API call — same client/schema/degrade pattern as
 # analysis/reporter.py's generate_llm_report. Called at most once per video.
 # ---------------------------------------------------------------------------
 
-COACHING_SCHEMA = {
+TIPS_SCHEMA = {
     "type": "object",
     "properties": {
-        "narrative": {
-            "type": "string",
-            "description": "Coaching narrative in markdown: specific, actionable advice "
-                           "per flagged category (grounded in the worst_shots evidence), "
-                           "and explicit reinforcement of what's already working, grounded "
-                           "in the best_shots evidence.",
+        "tips": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "contact_id": {"type": "string"},
+                    "tip": {"type": "string", "description": "2-3 short sentences, plain "
+                            "rec-player coaching language — no joint angles, degrees, or "
+                            "anatomical terms. Give a little of the why, not just the "
+                            "instruction, while staying scannable."},
+                    "tone": {"type": "string", "enum": ["improve", "praise"]},
+                },
+                "required": ["contact_id", "tip", "tone"],
+                "additionalProperties": False,
+            },
         },
     },
-    "required": ["narrative"],
+    "required": ["tips"],
     "additionalProperties": False,
 }
 
-SYSTEM = """You are a pickleball coach reviewing one player's session, based on
-pose-derived shot mechanics (not video) that a computer-vision pipeline
-extracted at each detected contact/swing.
+SYSTEM = """You are a pickleball coach giving quick, spoken-style tips on
+individual shots from one player's session, based on pose-derived shot
+mechanics (not video) that a computer-vision pipeline extracted at each
+detected contact/swing.
 
-You receive: category_ratios (flagged shots per minute of active rally play,
-per category — footwork, paddle_prep, contact_point, follow_through),
-worst_shots (the shots whose mechanics deviated most from reference ranges,
-with full feature vectors and rally context), and best_shots (in-range,
-high-confidence shots showing good mechanics).
+You receive a list of shots, each with a category (footwork, paddle_prep,
+contact_point, or follow_through), a deviation_score (negative/positive =
+outside the good-form range and needs work; 0 = solid, in-range shot), and a
+feature_vector of raw pose measurements (joint angles in degrees, 0-1 scores,
+seconds). These raw numbers are internal signal only — NEVER mention degrees,
+angles, or anatomical terms (no "elbow extension", "shoulder rotation", "knee
+bend angle", etc.) in your output. Translate them into plain language a
+rec/intermediate pickleball player would actually understand and act on
+(e.g. "you're rushing your paddle back" instead of "delayed unit turn", or
+"plant your feet before you swing" instead of "insufficient weight
+transfer").
 
-Give specific, actionable coaching advice for each category that shows
-meaningful flagged-ratio, citing the concrete metric(s) that were off (e.g.
-"knee_bend_deg was X, outside the Y-Z reference range") rather than generic
-tips. Then explicitly call out what's working well, grounded in the
-best_shots data, so the player knows what to keep doing. Keep it concrete and
-encouraging, not a wall of hedging — but do not overstate certainty: this is
+For each shot given a deviation_score != 0, write one "improve" tip: what to
+change and a bit of why it matters, in 2-3 short sentences, concrete and
+encouraging. For each shot with deviation_score == 0, write one "praise" tip:
+what they're doing well and why it works, so they know what to keep doing.
+Return exactly one tip per shot you were given, each referencing that shot's
+contact_id so it can be matched back up. Do not overstate certainty — this is
 computer-vision-derived pose data, not a substitute for in-person coaching."""
 
 
-def generate_llm_narrative(payload: dict) -> str | None:
-    """Returns the narrative markdown, or None (with a logged reason) when
-    the API key is missing or the call fails — degrades gracefully, same as
-    analysis/reporter.py."""
+def generate_llm_tips(shots: list[dict]) -> dict[str, dict]:
+    """Returns {contact_id: {tip, tone}}, or {} (with a logged reason) when
+    the API key is missing, the call fails, or the response can't be parsed —
+    degrades gracefully, same as analysis/reporter.py. Never trusted for
+    frame/timestamp — those are attached from our own contact_events data."""
+    if not shots:
+        return {}
     if not ANTHROPIC_API_KEY:
-        log.warning("ANTHROPIC_API_KEY not set — skipping coaching narrative")
-        return None
+        log.warning("ANTHROPIC_API_KEY not set — skipping coaching tips")
+        return {}
     import anthropic
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -430,29 +490,35 @@ def generate_llm_narrative(payload: dict) -> str | None:
             max_tokens=4000,
             thinking={"type": "enabled", "budget_tokens": 1500},
             system=SYSTEM,
-            output_config={"format": {"type": "json_schema", "schema": COACHING_SCHEMA}},
-            messages=[{"role": "user", "content": db.dumps(payload)}],
+            output_config={"format": {"type": "json_schema", "schema": TIPS_SCHEMA}},
+            messages=[{"role": "user", "content": db.dumps({"shots": shots})}],
         )
     except anthropic.RateLimitError:
         log.error("Anthropic rate limit — try generating the coaching report again shortly")
-        return None
+        return {}
     except anthropic.AuthenticationError:
         log.error("Anthropic API key invalid — check .env")
-        return None
+        return {}
     except anthropic.APIStatusError as exc:
         log.error("Anthropic API error %s: %s", exc.status_code, exc.message)
-        return None
+        return {}
     except anthropic.APIConnectionError:
         log.error("network error reaching the Anthropic API")
-        return None
+        return {}
 
     text = next((b.text for b in response.content if b.type == "text"), "")
     try:
         data = db.loads(text, {})
     except Exception:  # noqa: BLE001
         log.error("LLM returned unparseable JSON")
-        return None
-    return data.get("narrative")
+        return {}
+
+    out: dict[str, dict] = {}
+    for t in data.get("tips") or []:
+        cid, tip, tone = t.get("contact_id"), t.get("tip"), t.get("tone")
+        if cid and tip and tone in ("improve", "praise"):
+            out[cid] = {"tip": tip, "tone": tone}
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -462,15 +528,53 @@ def generate_llm_narrative(payload: dict) -> str | None:
 # ---------------------------------------------------------------------------
 
 def build_report(video_id: str, vectors_meta: list[tuple[ShotFeatureVector, dict]],
-                  active_rally_seconds: float, llm_fn=None) -> CoachingReport:
-    llm_fn = llm_fn or generate_llm_narrative
-    vectors = [vec for vec, _ in vectors_meta]
-    ratios = compute_category_ratios(vectors, active_rally_seconds)
-    worst, best = select_worst_best(vectors_meta)
-    payload = {"category_ratios": ratios, "worst_shots": worst, "best_shots": best}
-    narrative = llm_fn(payload)  # the one Anthropic call for this video
-    return CoachingReport(video_id=video_id, category_ratios=ratios,
-                           worst_shots=worst, best_shots=best, narrative=narrative or "")
+                  llm_fn=None) -> CoachingReport:
+    llm_fn = llm_fn or generate_llm_tips
+    candidates = select_tip_candidates(vectors_meta)
+    tip_text = llm_fn(candidates)  # the one Anthropic call for this video
+    # Player attribution is our own data (contact_events.player_id), not
+    # trusted from the model's echoed output — attach it here regardless of
+    # what the LLM response contains.
+    tips = [
+        CoachingTip(contact_id=c["contact_id"], frame=c["frame_idx"], timestamp_s=c["timestamp_s"],
+                    category=c["category"], tip=tip_text[c["contact_id"]]["tip"],
+                    tone=tip_text[c["contact_id"]]["tone"],
+                    player_id=c["player_id"], player_label=c["player_label"])
+        for c in candidates if c["contact_id"] in tip_text
+    ]
+    return CoachingReport(video_id=video_id, tips=tips)
+
+
+def merge_singles_players(contacts: list[dict], match_type: str | None) -> list[dict]:
+    """Stopgap for player-identity mis-tracking (see docs/CONTEXT.md TODO):
+    if this clip is tagged singles but contact_events carries more than 2
+    distinct player_ids (spurious/phantom identities from the pose tracker),
+    fold every contact from a non-top-2 player into whichever of the top-2
+    players it's closest to in time. In-memory only, scoped to this report —
+    never writes contact_events back. Doubles / unset clips are untouched."""
+    if match_type != "singles":
+        return contacts
+    player_ids = sorted({c["player_id"] for c in contacts})
+    if len(player_ids) <= 2:
+        return contacts
+
+    counts: dict = {}
+    for c in contacts:
+        counts[c["player_id"]] = counts.get(c["player_id"], 0) + 1
+    top2 = sorted(counts, key=lambda pid: -counts[pid])[:2]
+    top2_frames = {pid: [c["frame_idx"] for c in contacts if c["player_id"] == pid] for pid in top2}
+    log.info("coaching: singles clip has %d distinct players %s — merging extras into top-2 %s",
+              len(player_ids), player_ids, top2)
+
+    merged = []
+    for c in contacts:
+        if c["player_id"] in top2:
+            merged.append(c)
+            continue
+        nearest_pid = min(top2, key=lambda pid: min(
+            (abs(c["frame_idx"] - f) for f in top2_frames[pid]), default=float("inf")))
+        merged.append({**c, "player_id": nearest_pid})
+    return merged
 
 
 def generate_coaching_report(video_id: str, rally_source: str | None = None,
@@ -478,8 +582,7 @@ def generate_coaching_report(video_id: str, rally_source: str | None = None,
     """Only builds feature vectors for contacts belonging to a rally
     readiness.get_analyzable_rallies() currently clears (Pass 2 done, overlay
     coverage still matches the rally's current frame range) — a stale/partial
-    rally is excluded from both the active-rally-seconds denominator and the
-    contacts fed into compute_feature_vector."""
+    rally's contacts are excluded from compute_feature_vector."""
     # rally_source can be None by default (see contact_detect.py's matching
     # fix) — resolve overlay_source the same way here so the read_range calls
     # below aren't left with an unresolved None.
@@ -487,13 +590,13 @@ def generate_coaching_report(video_id: str, rally_source: str | None = None,
     rallies = get_analyzable_rallies(video_id, rally_source=rally_source, overlay_source=overlay_source)
     ready_rally_ids = {r["id"] for r in rallies}
     with db.connect() as con:
-        vrow = con.execute("SELECT fps FROM videos WHERE id=?", (video_id,)).fetchone()
+        vrow = con.execute("SELECT fps, match_type FROM videos WHERE id=?", (video_id,)).fetchone()
         contacts = db.rows_to_dicts(con.execute(
             "SELECT * FROM contact_events WHERE video_id=? ORDER BY frame_idx",
             (video_id,)).fetchall())
     contacts = [c for c in contacts if c["rally_id"] in ready_rally_ids]
+    contacts = merge_singles_players(contacts, vrow["match_type"] if vrow else None)
     fps = float(vrow["fps"]) if vrow and vrow["fps"] else 30.0
-    active_rally_seconds = sum((r["end_frame"] - r["start_frame"]) / fps for r in rallies)
 
     pre_frames, post_frames = int(PRE_WINDOW_S * fps), int(POST_WINDOW_S * fps)
     vectors_meta: list[tuple[ShotFeatureVector, dict]] = []
@@ -505,7 +608,7 @@ def generate_coaching_report(video_id: str, rally_source: str | None = None,
         if vec is not None:
             vectors_meta.append((vec, c))
 
-    report = build_report(video_id, vectors_meta, active_rally_seconds)
+    report = build_report(video_id, vectors_meta)
     save_report(report)
     return report
 
@@ -513,11 +616,8 @@ def generate_coaching_report(video_id: str, rally_source: str | None = None,
 def save_report(report: CoachingReport) -> None:
     with db.connect() as con:
         con.execute(
-            "INSERT OR REPLACE INTO coaching_reports"
-            " (video_id, category_ratios, worst_shots, best_shots, narrative, created_at)"
-            " VALUES (?,?,?,?,?,?)",
-            (report.video_id, db.dumps(report.category_ratios), db.dumps(report.worst_shots),
-             db.dumps(report.best_shots), report.narrative, db.now()))
+            "INSERT OR REPLACE INTO coaching_reports (video_id, tips_json, created_at) VALUES (?,?,?)",
+            (report.video_id, db.dumps([asdict(t) for t in report.tips]), db.now()))
 
 
 def get_report(video_id: str) -> CoachingReport | None:
@@ -527,16 +627,13 @@ def get_report(video_id: str) -> CoachingReport | None:
         return None
     return CoachingReport(
         video_id=row["video_id"],
-        category_ratios=db.loads(row["category_ratios"], {}),
-        worst_shots=db.loads(row["worst_shots"], []),
-        best_shots=db.loads(row["best_shots"], []),
-        narrative=row["narrative"])
+        tips=[CoachingTip(**t) for t in db.loads(row["tips_json"], [])])
 
 
 if __name__ == "__main__":
     # ponytail self-check: a shot with every metric mid-range must land at
-    # deviation_score 0.0 and not be flagged; ratio math must divide by
-    # active_rally_seconds, not shot count.
+    # deviation_score 0.0 and not be flagged; select_tip_candidates must cap
+    # total output at MAX_TIPS even when far more shots clear the bar.
     good = ShotFeatureVector(
         contact_id="c1", category="footwork",
         knee_bend_deg=_neutral(KNEE_BEND_GOOD_RANGE_DEG),
@@ -551,6 +648,33 @@ if __name__ == "__main__":
                           good.weight_transfer_score, good.contact_height_m,
                           good.follow_through_completion_score, good.split_step_delay_s)
     assert dev == 0.0, dev
-    ratios = compute_category_ratios([good], active_rally_seconds=10.0)
-    assert all(r["flagged_count"] == 0 for r in ratios.values())
+
+    bad_vectors_meta = [
+        (ShotFeatureVector(contact_id=f"bad{i}", category="footwork",
+                            knee_bend_deg=0.0, shoulder_rotation_deg=0.0, elbow_extension_deg=0.0,
+                            weight_transfer_score=0.0, contact_height_m=0.0,
+                            follow_through_completion_score=0.0, split_step_delay_s=0.0,
+                            deviation_score=-5.0),
+         {"contact_id": f"bad{i}", "frame_idx": i, "timestamp_s": float(i), "rally_id": "r",
+          "player_id": 1, "team": "near", "shot_side": "left", "is_serve": False, "confidence": 0.9})
+        for i in range(20)
+    ]
+    candidates = select_tip_candidates(bad_vectors_meta)
+    assert len(candidates) == MAX_TIPS, len(candidates)
+
+    # merge_singles_players: 4-player "singles" clip collapses to the 2 most-
+    # active players, each extra contact folded into its nearest (by frame).
+    contacts = (
+        [{"player_id": 1, "frame_idx": f} for f in (0, 10, 20, 30)]
+        + [{"player_id": 2, "frame_idx": f} for f in (5, 15, 25, 35)]
+        + [{"player_id": 3, "frame_idx": 6}]   # phantom id, nearest to player 1 (f=10, d=4) vs player 2 (f=5, d=1)
+        + [{"player_id": 4, "frame_idx": 31}]  # phantom id, nearest to player 1 (f=30, d=1)
+    )
+    merged = merge_singles_players(contacts, "singles")
+    assert {c["player_id"] for c in merged} == {1, 2}
+    by_frame = {c["frame_idx"]: c["player_id"] for c in merged}
+    assert by_frame[6] == 2
+    assert by_frame[31] == 1
+    assert merge_singles_players(contacts, "doubles") == contacts
+    assert merge_singles_players(contacts, None) == contacts
     print("coaching self-check OK")

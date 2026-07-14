@@ -18,6 +18,10 @@ export const api = {
     }),
   listVideos: () => fetch('/api/videos').then(j),
   getVideo: (id) => fetch(`/api/videos/${id}`).then(j),
+  updateVideo: (id, body) =>
+    fetch(`/api/videos/${id}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    }).then(j),
   reprocess: (id, which) => fetch(`/api/videos/${id}/reprocess?which=${which}`, { method: 'POST' }).then(j),
   cancelJob: (jobId) => fetch(`/api/jobs/${jobId}/cancel`, { method: 'POST' }).then(j),
   cancelVideoJobs: (id) => fetch(`/api/videos/${id}/cancel`, { method: 'POST' }).then(j),
@@ -98,9 +102,6 @@ export const api = {
   rejectModel: (version) => fetch(`/api/models/${version}/reject`, { method: 'POST' }).then(j),
   getLearningCurve: (kind) => fetch(`/api/models/learning_curve${kind ? `?kind=${kind}` : ''}`).then(j),
 
-  getRallyHighlights: (id) => fetch(`/api/rally-analysis/${id}/highlights`).then(j),
-  getPositionMetrics: (id) => fetch(`/api/rally-analysis/${id}/position-metrics`).then(j),
-  getShotMetrics: (id) => fetch(`/api/rally-analysis/${id}/shot-metrics`).then(j),
   getCoachingReport: (id) => fetch(`/api/rally-analysis/${id}/coaching-report`).then(j),
   generateCoachingReport: (id) =>
     fetch(`/api/rally-analysis/${id}/coaching-report`, { method: 'POST' }).then(j),
