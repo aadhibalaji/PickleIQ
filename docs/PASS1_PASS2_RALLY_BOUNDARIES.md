@@ -104,13 +104,34 @@ stages (`refine/refine.py :: refine_window`).
 ### 2.1 Stage B — P(live) per timestep (`feature_hz = 15`)
 Default classifier `rules` (`refine/classifiers.py`):
 `P = σ(bias + Σ wᵢ·featureᵢ)`, `rules_bias = −1.6`.
-- Positive weights: `cross_recency 3.2` (exp-decayed, τ=`cross_recency_tau_s=2.5 s`),
-  `crossings_3s 0.8`, `ball_speed_n 1.2`, `frac_visible_1s 0.6`,
-  `reactivity 0.8`, `max_pspeed_n 0.7`, `ready_frac 0.6`.
+- Positive weights: `cross_recency 1.0` (exp-decayed, τ=`cross_recency_tau_s=2.5 s`),
+  `crossings_3s 0.8`, `ball_speed_n 3.0`, `ball_in_court 1.5`,
+  `frac_visible_1s 0.6`, `reactivity 0.8`, `mean_pspeed_n 1.5`,
+  `max_pspeed_n 0.7`, `ready_frac 0.2` (2026-07-10 reweight — see
+  `refine/config.py` for the measured-separability rationale).
 - Negative weights: `near_player_time_n −1.4` (ball parked on a player = dead),
-  `out_of_court_time_n −1.0`.
+  `out_of_court_time_n −1.4`, `facing_away_retreat −1.0` (2026-07-14 — player
+  turning away from the net with sustained motion back toward their own
+  baseline; see §2.1a).
 - An XGBoost backend exists (F1 ~0.52 vs rules ~0.34) but `rules` is the default
   and the permanent fallback if the model artifact is missing/broken.
+
+### 2.1a `facing_away_retreat` — player-motion signal (2026-07-14)
+Documented gap: the rules weights above lean on net-crossing recency and
+static ready-position and under-weight actual player motion, the real
+"play has stopped" tell. `features.facing_away_retreat` (per player, max
+across players) adds one: sustained court-Y motion back toward a player's
+OWN baseline (away from the net), duration-gated like the `p1_on_s`/`p1_off_s`
+hysteresis so a single-frame glance or a quick step back mid-rally (e.g.
+recovering to ready position after a shot) can't fire it — motion must hold
+`≥ baseline_retreat_ratio=0.7` of the trailing `baseline_retreat_hold_s=1.0 s`
+window at `> baseline_retreat_speed_mps=0.5 m/s`. A pose-based orientation
+term (shoulder-line normal, projected through the court homography) softly
+boosts the score when the body also faces away from the net, but is not a
+hard requirement — 2 keypoints alone can't fully resolve the ~180° facing
+ambiguity, so it's a confidence multiplier (`0.5 + 0.5·facing`), not a gate.
+Weight `−1.0` in `rules_weights` (§2.1) — sized to sit alongside the other
+negative terms without dominating `ball_speed_n`'s live evidence.
 
 ### 2.2 DECISION 1 — keep the window at all?
 Stage C (`refine/postprocess.py`) turns P(live) into segments:
@@ -118,7 +139,7 @@ Stage C (`refine/postprocess.py`) turns P(live) into segments:
 - **Trailing live-ratio filter:** a timestep is in-rally only if `≥ live_ratio=0.7`
   of the last `ratio_window_s=2.0 s` were live.
 - **Merge** segments with gaps `≤ merge_gap_s=2.0 s`.
-- **Drop** segments shorter than `min_rally_s=2.5 s`.
+- **Drop** segments shorter than `min_rally_s=3.0 s (raised from 2.5 s, 2026-07-14)`.
 
 Then per segment, accept gates — ANY failure ⇒ record `verdict="rejected"` with
 a reason:
@@ -126,7 +147,7 @@ a reason:
   `too_short`.
 - `mean_p_live < mean_p_live_min=0.25` ⇒ reject `low_live_ratio`.
 - `serve_gate_score < serve_gate_min=0.25` ⇒ reject `no_serve`.
-- refined duration `< min_rally_s=2.5 s` after snapping ⇒ reject `too_short`.
+- refined duration `< min_rally_s=3.0 s (raised from 2.5 s, 2026-07-14)` after snapping ⇒ reject `too_short`.
 
 A single Pass 1 window can **split** into several rally records (one per
 surviving segment) — this un-does Pass 1's under-segmentation/merging.
@@ -275,5 +296,17 @@ currently JSON-only, not yet promoted to `rally_labels`.
   ball_flights`): extrapolate the serve arc back to the untracked strike.
   Benchmark F1 0.643 → 0.673 (precision + recall both up). `ball_seed_on_player`
   Pass 2 toggle added but rejected (no benefit — ball untrackable at the strike).
+- 2026-07-14 — Added `facing_away_retreat` (§2.1a): duration-gated player
+  motion-back-to-baseline + soft pose-orientation boost, weight −1.0 in
+  `rules_weights`, addressing the documented under-weighting of player
+  motion. Also raised `min_rally_s` 2.5 s → 3.0 s (§2.2/§2.4, the only
+  "too short" penalty in the pipeline — a hard threshold, not a continuous
+  weight). Corrected §2.1's weight list, which had drifted from
+  `refine/config.py` since the 2026-07-10 reweight. Could not re-run the
+  labeled 7-clip F1 benchmark in this environment — no `source='human'`
+  rally labels present in the local DB; verified instead via the refine unit
+  suite (32/32 passing, incl. 2 new tests for the sustained-retreat vs.
+  brief-glance cases) and an end-to-end smoke run of `refine_video` on real
+  Pass 1/2 data.
 
-**Last verified against code: 2026-07-10.**
+**Last verified against code: 2026-07-14.**
