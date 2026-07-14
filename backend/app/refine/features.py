@@ -29,7 +29,9 @@ def _quiet():
         yield
 
 from .config import RefineConfig
-from .io_loaders import COURT_L, COURT_W, NET_Y, TrackingData
+from .io_loaders import COURT_L, COURT_W, NET_Y, TrackingData, project_px
+
+LEFT_SHOULDER, RIGHT_SHOULDER = 5, 6   # COCO keypoint indices (cv/players.py)
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +256,67 @@ def formation_score(players_xy: dict[int, np.ndarray],
     return best
 
 
+def facing_away_retreat(td: TrackingData, cfg: RefineConfig, fps: float) -> np.ndarray:
+    """Player-motion "point is probably over" signal in [0,1] per native frame:
+    a player has sustained motion back toward their OWN baseline (away from
+    the net), optionally boosted when their shoulder line also faces away
+    from the net. Two guards keep this from firing on ordinary in-rally
+    repositioning (e.g. recovering to ready position after a shot, which also
+    involves a brief backward step):
+      - the motion must be net-Y speed > baseline_retreat_speed_mps (not
+        noise/jitter), AND
+      - it must hold for >= baseline_retreat_ratio of the trailing
+        baseline_retreat_hold_s window (a single-frame glance or a quick
+        step back mid-point doesn't sustain long enough to cross this).
+    Orientation is a soft multiplier on top, not a separate hard condition:
+    the shoulder-line "chest normal" is inherently ambiguous by ~180 degrees
+    from two keypoints alone, so it boosts confidence when available rather
+    than gating the signal outright.
+    """
+    n = td.n
+    out = np.zeros(n)
+    hold_n = max(1, int(round(cfg.baseline_retreat_hold_s * fps)))
+    for s, xy in td.players.items():
+        y = xy[:, 1]
+        valid = np.isfinite(y)
+        away_dir = np.where(y > NET_Y, 1.0, -1.0)   # own-baseline direction
+        vy = np.full(n, np.nan)
+        vy[1:] = (y[1:] - y[:-1]) * fps
+        retreating = (valid & np.isfinite(vy)
+                      & (vy * away_dir > cfg.baseline_retreat_speed_mps))
+        sustained = (_rolling_mean(retreating.astype(float), hold_n)
+                     >= cfg.baseline_retreat_ratio)
+
+        facing = np.zeros(n)
+        kp = td.player_kp.get(s)
+        if kp is not None and td.H is not None:
+            ls, rs = kp[:, LEFT_SHOULDER, :], kp[:, RIGHT_SHOULDER, :]
+            okkp = np.isfinite(ls[:, 0]) & np.isfinite(rs[:, 0]) & valid
+            idx = np.flatnonzero(okkp)
+            if len(idx):
+                mid = (ls + rs) / 2.0
+                # perpendicular to the shoulder line in image space: an
+                # approximate chest-normal / facing direction. COCO's
+                # left/right shoulder indices are anatomical (the person's
+                # own left/right), so this flips consistently when a player
+                # turns their back to the camera.
+                shoulder_vec = ls - rs
+                normal_px = np.stack([shoulder_vec[:, 1], -shoulder_vec[:, 0]], axis=1)
+                p1c = project_px(td.H, mid[idx])
+                p2c = project_px(td.H, mid[idx] + normal_px[idx])
+                fv = p2c - p1c
+                norm = np.linalg.norm(fv, axis=1)
+                norm[norm < 1e-6] = 1.0
+                fv_unit = fv / norm[:, None]
+                away = np.stack([np.zeros(len(idx)), away_dir[idx]], axis=1)
+                dot = np.sum(fv_unit * away, axis=1)
+                facing[idx] = np.clip(dot, 0.0, 1.0)
+
+        combined = sustained.astype(float) * (0.5 + 0.5 * facing)
+        out = np.maximum(out, combined)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # main entry
 # ---------------------------------------------------------------------------
@@ -397,6 +460,8 @@ def compute_features(td: TrackingData, cfg: RefineConfig) -> Features:
 
     appear_t, appear_xy, appear_speed = _detect_appearances(td, cfg, t)
 
+    facing_retreat = facing_away_retreat(td, cfg, fps)
+
     # ---- assemble columns @ native rate, then stride to feature_hz ---------
     cap = cfg.time_cap_s
     native_cols: dict[str, np.ndarray] = {
@@ -417,6 +482,7 @@ def compute_features(td: TrackingData, cfg: RefineConfig) -> Features:
         "ready_frac": ready_frac,
         "formation_valid": formation,
         "reactivity": reactivity,
+        "facing_away_retreat": facing_retreat,
     }
     hist = max(1, int(cfg.history_s * fps))
     for name in ("cross_recency", "ball_speed_n", "frac_visible_1s",

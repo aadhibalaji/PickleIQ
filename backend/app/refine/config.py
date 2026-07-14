@@ -61,6 +61,20 @@ class RefineConfig:
     ball_speed_norm_mps: float = 12.0   # normalization for rules classifier
     max_speed_mps: float = 45.0         # physically plausible cap; above = noise
 
+    # Player-motion signal: turning away from the net and retreating toward
+    # one's own baseline is real evidence a point just ended (the documented
+    # gap — the rules classifier over-leans on cross_recency/ready_frac and
+    # under-weights actual player motion). Two parts, both required to avoid
+    # misreading a brief in-rally glance/step-back as "point over":
+    #   1. sustained court-Y motion away from the net, held for
+    #      baseline_retreat_hold_s (hysteresis-style duration guard, same
+    #      spirit as p1_on_s/p1_off_s) — a single-frame blip can't fire it;
+    #   2. shoulder-line body orientation (from pose keypoints) facing away
+    #      from the net, as a confidence booster on top of #1.
+    baseline_retreat_hold_s: float = 1.0     # retreat motion must sustain this long
+    baseline_retreat_speed_mps: float = 0.5  # min court-Y speed toward own baseline
+    baseline_retreat_ratio: float = 0.7      # frac of the hold window that must show it
+
     # ---- Stage B: classifier ---------------------------------------------
     classifier: str = "rules"       # "rules" | "xgboost"
     model_path: str = "data/models/refine/xgb.json"
@@ -89,6 +103,13 @@ class RefineConfig:
         "near_player_time_n": -1.4, # ball parked near one player = dead
         "ready_frac": 0.2,
         "out_of_court_time_n": -1.4,
+        # 2026-07-14: player-motion signal (see baseline_retreat_* above).
+        # Magnitude picked to sit alongside the other negative evidence
+        # (near_player_time_n / out_of_court_time_n at -1.4) without
+        # dominating them or the strongest positive term (ball_speed_n 3.0) —
+        # meaningful enough to move borderline P(live) calls near a rally's
+        # true end, not big enough to override live ball evidence by itself.
+        "facing_away_retreat": -1.0,
     })
     cross_recency_tau_s: float = 2.5    # decay constant for cross_recency
 

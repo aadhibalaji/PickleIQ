@@ -80,6 +80,12 @@ class TrackingData:
     ball_flights: list = field(default_factory=list)  # ballistic.Flight per fitted arc
                                              # (lets the serve gate extrapolate the
                                              # serve arc back to the untracked strike)
+    H: np.ndarray | None = None              # homography used to build this span (image
+                                             # px -> court m); lets features re-project
+                                             # auxiliary image-space points (e.g. pose)
+    player_kp: dict = field(default_factory=dict)  # slot -> [N,17,2] full-res image px
+                                             # COCO pose keypoints, NaN where undetected
+                                             # (see cv/players.py PoseTracker)
 
     @property
     def n(self) -> int:
@@ -177,6 +183,7 @@ def load_tracking(video_id: str, f0: int, f1: int,
         video_id=video_id,
         ball_px=np.full((n, 2), np.nan),
         player_box={},
+        H=H,
     )
     for e in overlays.read_range(video_id, "pass2", f0, f1):
         i = e["f"] - f0
@@ -201,6 +208,13 @@ def load_tracking(video_id: str, f0: int, f1: int,
                 if bx is None:
                     bx = td.player_box[slot] = np.full((n, 4), np.nan)
                 bx[i] = p["box"]
+            kp = p.get("kp")
+            if kp:
+                kpa = td.player_kp.get(slot)
+                if kpa is None:
+                    kpa = td.player_kp[slot] = np.full((n, 17, 2), np.nan)
+                m = min(len(kp), 17)
+                kpa[i, :m] = kp[:m]
             if p.get("cxy") is None:
                 continue
             arr = td.players.get(slot)

@@ -77,6 +77,45 @@ def test_deadzone_proximity_keeps_accumulating():
     assert near[i_mid] >= 2.5 / 4.0 - 0.15        # ~3 s accumulated (norm /4 s)
 
 
+def test_facing_away_retreat_fires_on_sustained_baseline_retreat():
+    """A near-side player who stands still then steadily retreats toward
+    their own baseline (y increasing, away from NET_Y) for several seconds
+    should trip the signal once the retreat has sustained past the
+    baseline_retreat_hold_s duration guard."""
+    td = blank(6.0)
+    start_y = NET_Y + 1.0
+
+    def pos(t):
+        y = start_y + 1.5 * max(0.0, t - 1.0)   # stationary 1s, then 1.5 m/s retreat
+        return (3.0, min(y, COURT_L - 0.1))
+
+    set_player(td, 1, pos)
+    feats = compute_features(td, CFG)
+    col = feats.col("facing_away_retreat")
+    i_early = np.searchsorted(feats.t, 0.5)     # before any retreat motion
+    i_late = np.searchsorted(feats.t, 4.5)      # well past the hold duration
+    assert col[i_early] == 0.0
+    assert col[i_late] >= 0.5                   # no pose kp -> motion-only credit
+
+
+def test_facing_away_retreat_ignores_brief_mid_rally_step_back():
+    """A player jittering back and forth (recovering to ready position after
+    a shot, then moving up again) never sustains retreat for
+    baseline_retreat_hold_s, so the signal must stay near zero — this is the
+    false-positive case the duration guard exists to reject."""
+    td = blank(4.0)
+
+    def pos(t):
+        phase = t % 0.6
+        y = NET_Y + 1.0 + (0.6 if phase < 0.2 else 0.0)   # quick step back, step up
+        return (3.0, y)
+
+    set_player(td, 1, pos)
+    feats = compute_features(td, CFG)
+    col = feats.col("facing_away_retreat")
+    assert col.max() < 0.5
+
+
 def test_ball_in_court_and_speed():
     td = blank(4.0)
     set_ball(td, lambda t: (3.0, 2.0 + 6.0 * (t - 1.0)), 1.0, 2.5)
