@@ -13,11 +13,14 @@ invisible stretch instead of resetting.
 """
 from __future__ import annotations
 
+import logging
 import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import numpy as np
+
+log = logging.getLogger("refine.features")
 
 
 @contextmanager
@@ -108,6 +111,10 @@ class Features:
     native_t: np.ndarray
     formation_native: np.ndarray
     formation_held: np.ndarray      # rolling mean over formation_hold_s
+    formation_pose_native: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    # ^ fraction of tracked players with real shoulder-pose data per frame,
+    # i.e. how much of formation_native's orientation boost is real vs. the
+    # neutral 0.5 fallback — read by score_serve's pre_serve diagnostic
     ball_speed_native: np.ndarray = field(default_factory=lambda: np.zeros(0))
     ball_visible_native: np.ndarray = field(default_factory=lambda: np.zeros(0, bool))
     player_speed: dict[int, np.ndarray] = field(default_factory=dict)
@@ -205,19 +212,82 @@ def _soft_behind(y: np.ndarray, baseline: float, sign: float, m: float) -> np.nd
     return np.clip(1.0 - inside / m, 0.0, 1.0)
 
 
+def _shoulder_away_align(td: TrackingData, slot: int, y: np.ndarray,
+                         valid: np.ndarray,
+                         away_dir: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Per-native-frame dot of a player's shoulder-line normal (approximate
+    body-facing direction, from pose keypoints) with `away_dir` (own-baseline
+    direction, +1/-1 per frame): in [-1,1], 0 where pose data is unavailable.
+    Positive = body faces away from the net (toward own baseline); negative =
+    faces the net. Shared by facing_away_retreat (wants "faces away", so
+    clip(align,0,1)) and formation_score (wants "faces the net", so
+    clip(-align,0,1)) — same ~180-degree-ambiguous shoulder-normal signal,
+    just read in opposite directions.
+
+    Returns (align, has_pose) — has_pose is a bool array marking frames where
+    this came from real shoulder keypoints, vs. the neutral align=0 fallback
+    (no player_kp for this slot, no homography, or missing shoulder
+    detections that frame). Callers that treat align=0 as "neutral" need
+    has_pose to tell "genuinely facing the net" apart from "we have no idea".
+    """
+    n = len(y)
+    align = np.zeros(n)
+    has_pose = np.zeros(n, bool)
+    kp = td.player_kp.get(slot)
+    if kp is None or td.H is None:
+        return align, has_pose
+    ls, rs = kp[:, LEFT_SHOULDER, :], kp[:, RIGHT_SHOULDER, :]
+    okkp = np.isfinite(ls[:, 0]) & np.isfinite(rs[:, 0]) & valid
+    idx = np.flatnonzero(okkp)
+    if not len(idx):
+        return align, has_pose
+    mid = (ls + rs) / 2.0
+    # perpendicular to the shoulder line in image space: an approximate
+    # chest-normal / facing direction. COCO's left/right shoulder indices are
+    # anatomical (the person's own left/right), so this flips consistently
+    # when a player turns their back to the camera.
+    shoulder_vec = ls - rs
+    normal_px = np.stack([shoulder_vec[:, 1], -shoulder_vec[:, 0]], axis=1)
+    p1c = project_px(td.H, mid[idx])
+    p2c = project_px(td.H, mid[idx] + normal_px[idx])
+    fv = p2c - p1c
+    norm = np.linalg.norm(fv, axis=1)
+    norm[norm < 1e-6] = 1.0
+    fv_unit = fv / norm[:, None]
+    away = np.stack([np.zeros(len(idx)), away_dir[idx]], axis=1)
+    align[idx] = np.sum(fv_unit * away, axis=1)
+    has_pose[idx] = True
+    return align, has_pose
+
+
 def formation_score(players_xy: dict[int, np.ndarray],
                     speeds: dict[int, np.ndarray],
-                    cfg: RefineConfig, n: int) -> np.ndarray:
+                    cfg: RefineConfig, n: int,
+                    td: TrackingData | None = None
+                    ) -> tuple[np.ndarray, np.ndarray]:
     """Soft serve-formation score in [0,1] per native frame.
 
     Best over the two server-end hypotheses of:
     server stationary at/behind a baseline in one service half x diagonal
     opponent deep in the mirrored half behind the opposite baseline x (in
-    doubles) remaining players roughly stationary. Works with 2 or 4 players.
+    doubles) remaining players roughly stationary x both server and receiver
+    oriented toward the net/each other. Works with 2 or 4 players.
+
+    Orientation is a soft multiplier (0.5-1.0), not a hard veto — the
+    shoulder-line "chest normal" is ambiguous by ~180 degrees from two
+    keypoints alone (same caveat as facing_away_retreat), and `td` is None
+    for pose-less inputs (e.g. synthetic tests), in which case it's a no-op
+    (neutral 0.5 everywhere, matching facing_away_retreat's fallback).
+
+    Returns (score, pose_coverage) — pose_coverage[i] is the fraction of
+    tracked players with real shoulder-keypoint data at frame i (as opposed
+    to the neutral 0.5 fallback). A low pose_coverage means the orientation
+    boost is mostly/entirely uninformative there, not actually vetoing
+    badly-oriented players — surfaced so that's visible instead of silent.
     """
     slots = list(players_xy)
     if not slots:
-        return np.zeros(n)
+        return np.zeros(n), np.zeros(n)
     X = np.stack([players_xy[s][:, 0] for s in slots])       # [P,N]
     Y = np.stack([players_xy[s][:, 1] for s in slots])
     V = np.stack([np.nan_to_num(speeds[s], nan=1e9) for s in slots])
@@ -227,18 +297,39 @@ def formation_score(players_xy: dict[int, np.ndarray],
     behind_near = np.where(np.isfinite(Y), _soft_behind(Y, COURT_L, -1.0, m), 0.0)
     left = np.where(np.isfinite(X), X < COURT_W / 2, False)
 
+    # Facing-the-net boost: server and receiver should be oriented toward
+    # each other across the net, not back-to-back or side-on. Independent of
+    # the server/receiver hypothesis being tested — only depends on a
+    # player's own current half (same as facing_away_retreat's away_dir).
+    facing_net = np.full((len(slots), n), 0.5)
+    has_pose = np.zeros((len(slots), n), bool)
+    if td is not None:
+        for pi, s in enumerate(slots):
+            y = Y[pi]
+            valid = np.isfinite(y)
+            away_dir = np.where(y > NET_Y, 1.0, -1.0)
+            align, pose_ok = _shoulder_away_align(td, s, y, valid, away_dir)
+            facing_net[pi] = 0.5 + 0.5 * np.clip(-align, 0.0, 1.0)
+            has_pose[pi] = pose_ok
+    pose_coverage = has_pose.mean(axis=0)
+    cov = float(pose_coverage.mean()) if n else 0.0
+    if cov < 0.3:
+        log.debug("formation_score: low pose coverage (%.0f%% of frames) — "
+                  "facing_net orientation boost is running on the neutral "
+                  "0.5 fallback most of the time, not real pose data", cov * 100)
+
     best = np.zeros(n)
     for behind_s, behind_r in ((behind_far, behind_near),
                                (behind_near, behind_far)):
         # stationarity discounts rather than vetoes — pose jitter inflates
         # apparent speed, especially for the tiny far-court player.
-        server_q = behind_s * (0.35 + 0.65 * stationary)       # [P,N]
+        server_q = behind_s * (0.35 + 0.65 * stationary) * facing_net  # [P,N]
         si = np.argmax(server_q, axis=0)                       # server per frame
         cols = np.arange(n)
         s_score = server_q[si, cols]
         s_left = left[si, cols]
         # diagonal receiver: opposite baseline, mirrored half
-        recv_q = behind_r * np.where(left != s_left[None, :], 1.0, 0.35)
+        recv_q = behind_r * np.where(left != s_left[None, :], 1.0, 0.35) * facing_net
         recv_q[si, cols] = 0.0                                 # not the server
         r_score = recv_q.max(axis=0) if len(slots) > 1 else np.zeros(n)
         # partners (doubles): everyone else roughly stationary
@@ -253,7 +344,7 @@ def formation_score(players_xy: dict[int, np.ndarray],
         else:
             score = 0.55 * s_score + 0.45 * r_score
         best = np.maximum(best, score)
-    return best
+    return best, pose_coverage
 
 
 def facing_away_retreat(td: TrackingData, cfg: RefineConfig, fps: float) -> np.ndarray:
@@ -287,30 +378,8 @@ def facing_away_retreat(td: TrackingData, cfg: RefineConfig, fps: float) -> np.n
         sustained = (_rolling_mean(retreating.astype(float), hold_n)
                      >= cfg.baseline_retreat_ratio)
 
-        facing = np.zeros(n)
-        kp = td.player_kp.get(s)
-        if kp is not None and td.H is not None:
-            ls, rs = kp[:, LEFT_SHOULDER, :], kp[:, RIGHT_SHOULDER, :]
-            okkp = np.isfinite(ls[:, 0]) & np.isfinite(rs[:, 0]) & valid
-            idx = np.flatnonzero(okkp)
-            if len(idx):
-                mid = (ls + rs) / 2.0
-                # perpendicular to the shoulder line in image space: an
-                # approximate chest-normal / facing direction. COCO's
-                # left/right shoulder indices are anatomical (the person's
-                # own left/right), so this flips consistently when a player
-                # turns their back to the camera.
-                shoulder_vec = ls - rs
-                normal_px = np.stack([shoulder_vec[:, 1], -shoulder_vec[:, 0]], axis=1)
-                p1c = project_px(td.H, mid[idx])
-                p2c = project_px(td.H, mid[idx] + normal_px[idx])
-                fv = p2c - p1c
-                norm = np.linalg.norm(fv, axis=1)
-                norm[norm < 1e-6] = 1.0
-                fv_unit = fv / norm[:, None]
-                away = np.stack([np.zeros(len(idx)), away_dir[idx]], axis=1)
-                dot = np.sum(fv_unit * away, axis=1)
-                facing[idx] = np.clip(dot, 0.0, 1.0)
+        align, _has_pose = _shoulder_away_align(td, s, y, valid, away_dir)
+        facing = np.clip(align, 0.0, 1.0)
 
         combined = sustained.astype(float) * (0.5 + 0.5 * facing)
         out = np.maximum(out, combined)
@@ -400,7 +469,7 @@ def compute_features(td: TrackingData, cfg: RefineConfig) -> Features:
     with np.errstate(invalid="ignore", divide="ignore"):
         ready_frac = np.where(present_cnt > 0, ready_cnt / present_cnt, 0.0)
 
-    formation = formation_score(td.players, pspeeds, cfg, n)
+    formation, formation_pose = formation_score(td.players, pspeeds, cfg, n, td)
     formation_held = _rolling_mean(formation,
                                    max(1, int(cfg.formation_hold_s * fps)))
 
@@ -502,6 +571,7 @@ def compute_features(td: TrackingData, cfg: RefineConfig) -> Features:
         bounces_t=bounces_t, bounces_xy=np.asarray(bxy).reshape(-1, 2),
         appear_t=appear_t, appear_xy=appear_xy, appear_speed=appear_speed,
         native_t=t, formation_native=formation, formation_held=formation_held,
+        formation_pose_native=formation_pose,
         ball_speed_native=speed_f, ball_visible_native=visible,
         player_speed=pspeeds, td=td,
     )

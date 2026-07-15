@@ -35,7 +35,7 @@ from .features import compute_features
 from .io_loaders import (clips_with_human_labels, load_pass1_windows,
                          load_tracking, load_video)
 from .labels import load_ground_truth
-from .refine import refine_video
+from .refine import refine_video, refine_video_fast
 from .serve_gate import score_serve
 from .train import is_holdout
 
@@ -117,10 +117,16 @@ class EvalResult:
 
 
 def evaluate_clip(video_id: str, cfg: RefineConfig,
-                  classifier: LiveClassifier | None = None) -> EvalResult:
-    """Refine one clip and score it against the human rally labels."""
+                  classifier: LiveClassifier | None = None,
+                  fast: bool = False) -> EvalResult:
+    """Refine one clip and score it against the human rally labels. ``fast``
+    reuses cached Stage A tracking across sweep combos (see refine_video_fast)
+    — only valid when the sweep never varies ballistic/window_margin_s."""
     gt = load_ground_truth(video_id)
-    records, _ = refine_video(video_id, cfg, classifier)
+    if fast:
+        records = refine_video_fast(video_id, cfg, classifier or make_classifier(cfg))
+    else:
+        records, _ = refine_video(video_id, cfg, classifier)
     pred = [(r["refined_start"], r["refined_end"]) for r in records
             if r["verdict"] == "rally"]
     matches = match_segments(pred, gt, cfg.eval_iou)
@@ -146,7 +152,8 @@ def evaluate_clip(video_id: str, cfg: RefineConfig,
 
 def evaluate(cfg: RefineConfig, clip_ids: list[str] | None = None,
              classifier: LiveClassifier | None = None,
-             include_holdout: bool = False, verbose: bool = True) -> EvalResult:
+             include_holdout: bool = False, verbose: bool = True,
+             fast: bool = False) -> EvalResult:
     """Pooled evaluation over labeled clips (holdout excluded by default)."""
     clips = clips_with_human_labels()
     if clip_ids:
@@ -157,7 +164,7 @@ def evaluate(cfg: RefineConfig, clip_ids: list[str] | None = None,
     classifier = classifier or make_classifier(cfg)
     total = EvalResult()
     for c in clips:
-        r = evaluate_clip(c["id"], cfg, classifier)
+        r = evaluate_clip(c["id"], cfg, classifier, fast=fast)
         if verbose:
             log.info("clip %s (%s): %s", c["id"][:8], c["filename"], r.summary())
         total.add(r)
@@ -175,8 +182,18 @@ DEFAULT_GRID: dict[str, list] = {
     "exit_thresh": [0.25, 0.35],
     "live_ratio": [0.7, 0.8],
     "merge_gap_s": [1.5, 2.0, 3.0],
-    "min_rally_s": [1.5, 2.5],
+    # 2026-07-14: 2.5 is the current default (was 3.5 — diagnostics on real
+    # drops showed the early Stage C filter and pre_roll_s anchor clamp, not
+    # actual duration, were the cause of most too_short false rejects; see
+    # min_rally_s_early). Added 2.0/3.0 to re-validate the choice against
+    # labeled data now that those two bugs are fixed and won't confound the
+    # sweep.
+    "min_rally_s": [1.5, 2.0, 2.5, 3.0],
     "serve_gate_min": [0.25, 0.30, 0.35, 0.40],
+    # 2026-07-14: Stage C early noise-blip filter (postprocess.py), current
+    # default 1.25 — re-validate now that window_grades has enough labeled
+    # windows to catch a filter that's too aggressive or too permissive.
+    "min_rally_s_early": [0.75, 1.0, 1.25, 1.5],
 }
 
 
@@ -193,7 +210,7 @@ def sweep(cfg: RefineConfig, grid: dict[str, list] | None = None,
     for combo in combos:
         overrides = dict(zip(keys, combo))
         r = evaluate(cfg.copy(**overrides), classifier=classifier,
-                     verbose=False)
+                     verbose=False, fast=True)
         results.append((overrides, r))
     results.sort(key=lambda x: (-x[1].f1,
                                 x[1].boundary_stats()["start_median_s"]

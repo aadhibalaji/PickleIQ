@@ -14,7 +14,7 @@ RECORD_KEYS = {
     "pass1_start_frame", "pass1_end_frame",
     "verdict", "rejection_reason",
     "refined_start", "refined_end", "refined_start_frame", "refined_end_frame",
-    "confidence", "splits",
+    "confidence", "splits", "diagnostics",
 }
 CONFIDENCE_KEYS = {"mean_p_live", "serve_gate_score", "net_crossings_per_10s"}
 
@@ -58,7 +58,13 @@ def test_output_contract():
             assert r["refined_start"] < r["refined_end"]
         else:
             assert r["rejection_reason"] is not None
-            assert r["refined_start"] is None and r["refined_end"] is None
+            if r["rejection_reason"] == "too_short":
+                # carries the refined (trimmed) span it was measured against,
+                # so the UI can show raw-vs-trimmed duration for a drop
+                assert r["refined_start"] is not None and r["refined_end"] is not None
+                assert r["refined_start"] < r["refined_end"]
+            else:
+                assert r["refined_start"] is None and r["refined_end"] is None
 
 
 def test_rejected_window_carries_reason():

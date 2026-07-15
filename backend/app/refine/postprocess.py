@@ -88,6 +88,11 @@ def postprocess(p_live: np.ndarray, cfg: RefineConfig,
                               max(1, int(round(cfg.ratio_window_s * hz))))
     segs = to_segments(state)
     segs = merge_segments(segs, max(1, int(round(cfg.merge_gap_s * hz))))
-    min_len = int(round(cfg.min_rally_s * hz))
+    # Noise-blip filter only — NOT the real duration gate (that's min_rally_s,
+    # applied post-trim in refine.py after serve gate / anchor / snap_end have
+    # run). Using the full min_rally_s here would kill a real rally that a
+    # brief mid-point confidence dip fractured into two still-substantial
+    # pieces, each individually under the final threshold.
+    min_len = int(round(cfg.min_rally_s_early * hz))
     segs = [s for s in segs if len(s) >= min_len]
     return segs, state

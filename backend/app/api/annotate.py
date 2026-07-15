@@ -121,6 +121,16 @@ def _group_windows(records: list[dict]) -> list[dict]:
                 {"start_frame": r["refined_start_frame"],
                  "end_frame": r["refined_end_frame"]}
                 for r in kept if r.get("refined_start_frame") is not None],
+            # full per-record diagnostic breakdown for the "why" expander —
+            # usually one entry, more if the window split into siblings
+            "records": [
+                {"verdict": r.get("verdict"),
+                 "rejection_reason": r.get("rejection_reason"),
+                 "refined_start": r.get("refined_start"),
+                 "refined_end": r.get("refined_end"),
+                 "confidence": r.get("confidence"),
+                 "diagnostics": r.get("diagnostics")}
+                for r in recs],
         })
     return windows
 

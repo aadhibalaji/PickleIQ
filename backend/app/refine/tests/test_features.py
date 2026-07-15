@@ -52,13 +52,14 @@ def test_formation_triggers_only_in_serve_setup():
     td = blank(3.0)
     add_doubles_players(td)
     speeds = {s: np.zeros(td.n) for s in td.players}
-    good = formation_score(td.players, speeds, CFG, td.n)
+    good, good_pose = formation_score(td.players, speeds, CFG, td.n)
     assert good.mean() > 0.5
+    assert (good_pose == 0).all()  # no player_kp/H in this synthetic scene
 
     # warm-up toss positions (everyone mid-court) -> low score
     toss = toss_scene(4.0)
     speeds = {s: np.zeros(toss.n) for s in toss.players}
-    bad = formation_score(toss.players, speeds, CFG, toss.n)
+    bad, _bad_pose = formation_score(toss.players, speeds, CFG, toss.n)
     assert bad.mean() < 0.3
     assert good.mean() > bad.mean() + 0.3
 

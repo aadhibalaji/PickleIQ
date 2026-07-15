@@ -16,7 +16,9 @@ import logging
 from .classifiers import LiveClassifier, make_classifier
 from .config import RefineConfig
 from .evaluate import iou            # reuse the harness IoU (frame-span safe)
-from .refine import refine_video
+from .io_loaders import load_video
+from .refine import refine_video_fast
+from .train import is_holdout
 
 log = logging.getLogger("refine.recommend")
 
@@ -27,6 +29,12 @@ MIN_GRADED = 8      # below this the recommendation is not trustworthy
 # follow-up; v1 recommends the scalar threshold(s).
 DEFAULT_GRID: dict[str, list] = {
     "serve_gate_min": [0.15, 0.20, 0.25, 0.30, 0.35, 0.40],
+    # 2026-07-14: serve-gate component floors hand-patched this session on
+    # single flagged rallies — re-validate against the grown window_grades set.
+    "serve_contact_min": [0.25, 0.30, 0.35],
+    "serve_contact_near_floor_min": [0.20, 0.25, 0.30],
+    "serve_pre_serve_min": [0.30, 0.35, 0.40],
+    "serve_pre_serve_compensate_min": [0.45, 0.55, 0.65],
 }
 
 
@@ -54,7 +62,7 @@ def score_against_grades(cfg: RefineConfig, grades_by_clip: dict[str, list[dict]
     for vid, grades in grades_by_clip.items():
         if not grades:
             continue
-        records, _ = refine_video(vid, cfg, classifier)
+        records = refine_video_fast(vid, cfg, classifier)
         windows = _windows_from_records(records)
         for g in grades:
             gspan = (g["pass1_start_frame"], g["pass1_end_frame"])
@@ -85,11 +93,19 @@ def score_against_grades(cfg: RefineConfig, grades_by_clip: dict[str, list[dict]
 
 
 def recommend(base_cfg: RefineConfig, grades_by_clip: dict[str, list[dict]],
-              grid: dict[str, list] | None = None) -> dict:
+              grid: dict[str, list] | None = None,
+              include_holdout: bool = False) -> dict:
     """Grid-search serve-gate knobs against the grades; return current vs best.
     Ranks by keep/drop accuracy, then F1. Reuses one classifier across cfgs (the
     swept knobs don't affect P(live), only the serve gate), exactly as
-    evaluate.sweep does."""
+    evaluate.sweep does. Excludes cfg.holdout_clips by default — mirrors
+    evaluate.py's is_holdout filtering, which this module lacked (grades from
+    every clip were pooled unconditionally, so a graded holdout clip silently
+    leaked into tuning)."""
+    if not include_holdout and base_cfg.holdout_clips:
+        grades_by_clip = {vid: g for vid, g in grades_by_clip.items()
+                          if not is_holdout({"id": vid, "filename": load_video(vid)["filename"]},
+                                            base_cfg)}
     grid = grid or DEFAULT_GRID
     keys = sorted(grid)
     combos = list(itertools.product(*(grid[k] for k in keys)))
@@ -103,8 +119,9 @@ def recommend(base_cfg: RefineConfig, grades_by_clip: dict[str, list[dict]],
     results.sort(key=lambda x: (-x[1]["accuracy"], -x[1]["f1"]))
     current = score_against_grades(base_cfg, grades_by_clip, classifier)
     best_ov, best = results[0]
+    current_values = {k: getattr(base_cfg, k) for k in keys}
     return {
-        "current": {"serve_gate_min": base_cfg.serve_gate_min, **current},
+        "current": {**current_values, **current},
         "recommended": {"overrides": best_ov,
                         "delta": round(best["accuracy"] - current["accuracy"], 4),
                         **best},

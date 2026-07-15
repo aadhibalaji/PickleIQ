@@ -104,12 +104,13 @@ class RefineConfig:
         "ready_frac": 0.2,
         "out_of_court_time_n": -1.4,
         # 2026-07-14: player-motion signal (see baseline_retreat_* above).
-        # Magnitude picked to sit alongside the other negative evidence
-        # (near_player_time_n / out_of_court_time_n at -1.4) without
-        # dominating them or the strongest positive term (ball_speed_n 3.0) —
-        # meaningful enough to move borderline P(live) calls near a rally's
-        # true end, not big enough to override live ball evidence by itself.
-        "facing_away_retreat": -1.0,
+        # Raised -1.0 -> -1.6: now the strongest negative term (above
+        # near_player_time_n / out_of_court_time_n at -1.4), since a
+        # sustained turn-and-retreat is harder to trigger falsely (needs both
+        # baseline_retreat_hold_s sustain AND ratio, orientation is a bonus
+        # multiplier) than "ball happens to be near a player" — still well
+        # under ball_speed_n (3.0) so live ball evidence isn't overridden.
+        "facing_away_retreat": -1.6,
     })
     cross_recency_tau_s: float = 2.5    # decay constant for cross_recency
 
@@ -121,18 +122,26 @@ class RefineConfig:
     live_ratio: float = 0.7
     ratio_window_s: float = 2.0
     merge_gap_s: float = 2.0
-    # 2026-07-14: raised 2.5 -> 3.0 (this is the "too short" penalty — the
-    # ONLY duration term in the pipeline; it's a hard threshold, not a
-    # continuous weight, applied twice: postprocess.py drops Stage C segments
-    # shorter than this, and refine.py rejects a segment "too_short" if its
-    # snapped [refined_start, refined_end) is still under it after
-    # start/end re-anchoring). +0.5s is a real bump (20%), not a token change,
-    # meant to drop more sub-2.5s noise blips (ball-knock-between-points,
-    # camera-jitter flickers) that were slipping through as false-positive
-    # rallies. No BOUNDS dict exists for RefineConfig (unlike learned_params
-    # p1_*), so nothing to widen here — re-sweep (DEFAULT_GRID) if this value
-    # ever needs revisiting.
-    min_rally_s: float = 3.0
+    # 2026-07-14: min_rally_s history 2.5 -> 3.0 -> 3.5 -> 2.5 (final value).
+    # The 3.0/3.5 bumps were chasing the "too short" penalty as a single
+    # duration term, but diagnostics on real drops showed sub-3.5s Pass 1
+    # windows with p_live_max=1.0 being killed by the EARLY Stage C filter
+    # (postprocess.py) before serve gate / anchor / trim ever ran, plus real
+    # rally time getting clamped off the front by the pre_roll_s anchor
+    # (refine.py) — i.e. trimming, not actual duration, was the cause. Split
+    # into two thresholds: min_rally_s_early (below) kills only obvious noise
+    # blips pre-serve-gate, and this value is now the ONLY real accept/reject
+    # duration gate, applied post-trim in refine.py. Set to 2.5s as a starting
+    # point — a served point can end in one unreturned return and run under
+    # 3s. Re-sweep against labeled data once available (evaluate.py
+    # DEFAULT_GRID currently tests 1.5/2.5; add 2.0/3.0 and pick by F1).
+    min_rally_s: float = 2.5
+    # Early Stage C noise-blip filter (postprocess.py only) — deliberately far
+    # below min_rally_s so a real rally that got fractured by a brief
+    # mid-point confidence dip still reaches serve gate / anchor / trim, where
+    # the real length decision belongs. Only meant to drop sub-second flicker
+    # (a ball knock, a tracking glitch), not to gate rally length.
+    min_rally_s_early: float = 1.25
 
     # ---- Stage D: serve gate + snapping ----------------------------------
     serve_search_s: float = 3.0     # search window after the segment rising edge
@@ -160,6 +169,43 @@ class RefineConfig:
     serve_min_gap_s: float = 0.2    # ball invisible at least this long before "appearance"
     serve_flight_min_s: float = 0.3
     serve_flight_max_s: float = 2.0
+    # 2026-07-14: a net crossing at/near ground height (h < this) doesn't
+    # count as a serve flight — distinguishes a genuinely airborne served
+    # ball from a ball rolling across/near the net line. Only enforced when
+    # ball_height data exists (ballistic 3D fit succeeded); no height data =>
+    # can't verify, not penalized. Well below serve_airborne_h_m (0.7, a
+    # DIFFERENT threshold used for court-projection reliability at contact,
+    # not flight confirmation) since a serve's arc can be shallow well before
+    # its peak — this only needs to rule out "on the ground".
+    serve_flight_min_height_m: float = 0.15
+    # 2026-07-14: independent floors alongside flight_or_landing_ok — a net
+    # crossing or bounce can happen during ordinary rally play too, not just
+    # right after a real serve, so flight/landing evidence alone still isn't
+    # sufficient. A real serve needs genuine pre-serve formation AND genuine
+    # ball-at-player contact evidence as well (confirmed false positive:
+    # contact=0.276, flight=0.8, old gate passed at 0.567). Starting points
+    # from the suggested 0.35-0.4 / ~0.3 ranges; re-sweep once labeled data
+    # can validate them like min_rally_s.
+    serve_pre_serve_min: float = 0.35   # diagnostic floor only, no longer gates alone
+    serve_contact_min: float = 0.3
+    # 2026-07-14: near-floor contact compensation — a directionally-confirmed
+    # flight crossing (flight==1.0, i.e. the crossing matched the expected
+    # direction away from the server's side, not just "some crossing found")
+    # is strong enough evidence that a contact read just under serve_contact_min
+    # shouldn't veto the serve on its own (confirmed false negative: contact
+    # 0.2815 vs 0.3 floor, flight=1.0, pre_serve 0.361).
+    serve_contact_near_floor_min: float = 0.25
+    # 2026-07-14: compensating path — a strong pre-serve formation read PLUS
+    # confirmed flight/landing can pass the gate even when contact is weak
+    # (occluded/missed ball-near-player detection at the moment of contact is
+    # common even for real serves). Set well above serve_pre_serve_min (0.35)
+    # since this branch has no contact corroboration at all, so it needs to
+    # be more confident on its own. Caveat: pre_serve's shoulder-orientation
+    # component is only as trustworthy as pose coverage allows (see
+    # pre_serve_pose_coverage) — this compensation path leans harder on
+    # pre_serve than the direct-contact path does, so it's more exposed to
+    # low pose coverage than the old design was.
+    serve_pre_serve_compensate_min: float = 0.55
     # rally_evidence: sustained net-crossing rate inside the segment. Partial
     # stand-in for a serve the sparse ball tracker never saw — a Pass 1 window
     # with rhythmic crossings almost surely began with a serve. Sweepable.

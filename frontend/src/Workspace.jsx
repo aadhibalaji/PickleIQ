@@ -416,8 +416,42 @@ function ServeDatasetPanel({ videoId, note }) {
   )
 }
 
+function ReprocessButtons({ videoId, note }) {
+  const [busy, setBusy] = useState(null) // 'pass1' | 'pass2' | null
+  const run = async (which) => {
+    setBusy(which)
+    try {
+      await api.reprocess(videoId, which)
+      note(which === 'pass1'
+        ? 'Pass 1 re-queued (Pass 2 chains after it)'
+        : 'Pass 2 re-queued (picks up current serve-gate override)')
+    } catch (e) {
+      note(`reprocess ${which} failed: ${e.message}`)
+    }
+    setBusy(null)
+  }
+  return (
+    <div className="row" style={{ gap: 6 }}>
+      <button disabled={!!busy} onClick={() => run('pass1')}
+              title="Re-run Pass 1; Pass 2 chains automatically after">
+        {busy === 'pass1' ? 'Queuing…' : 'Re-run Pass 1'}
+      </button>
+      <button className="blue" disabled={!!busy} onClick={() => run('pass2')}
+              title="Re-run Pass 2 + refine with current serve_gate_min override">
+        {busy === 'pass2' ? 'Queuing…' : 'Re-run Pass 2'}
+      </button>
+    </div>
+  )
+}
+
 function PassTab({ source, rallies = [], windows = [], fps, onSeek, exists = true,
                   partial = false, error, onGrade, videoId, note }) {
+  const [expanded, setExpanded] = useState(() => new Set())
+  const toggleExpanded = (i) => setExpanded((s) => {
+    const next = new Set(s)
+    next.has(i) ? next.delete(i) : next.add(i)
+    return next
+  })
   if (source !== 'pass2') {
     return (
       <div>
@@ -450,11 +484,15 @@ function PassTab({ source, rallies = [], windows = [], fps, onSeek, exists = tru
   // ---- Pass 2: keep/drop grading -------------------------------------------
   if (!exists) {
     return (
-      <div className="muted">
-        No Pass 2 refinement for this clip yet. Pass 2 judges each Pass 1 window
-        keep-or-drop when it runs — reprocess Pass 2 (save calibration in Setup,
-        or Regenerate in the Report tab) to generate the verdicts.
-        {error ? <div className="error" style={{ marginTop: 4 }}>refine error: {error}</div> : null}
+      <div>
+        <div className="row spread" style={{ alignItems: 'flex-start' }}>
+          <div className="muted">
+            No Pass 2 refinement for this clip yet. Re-run Pass 2 to generate
+            keep/drop verdicts (uses the current serve-gate override if applied).
+            {error ? <div className="error" style={{ marginTop: 4 }}>refine error: {error}</div> : null}
+          </div>
+          <ReprocessButtons videoId={videoId} note={note} />
+        </div>
       </div>
     )
   }
@@ -475,11 +513,14 @@ function PassTab({ source, rallies = [], windows = [], fps, onSeek, exists = tru
 
   return (
     <div>
-      <div className="muted">
-        Each Pass 1 window with Pass 2’s keep/drop verdict and the refined
-        (snapped) rally boundaries inside kept windows. Grade 👍 (real rally,
-        should keep) or 👎 (not a rally, should drop) — the score below updates
-        live and drives the serve-gate recommendation.
+      <div className="row spread" style={{ alignItems: 'flex-start' }}>
+        <div className="muted">
+          Each Pass 1 window with Pass 2’s keep/drop verdict and the refined
+          (snapped) rally boundaries inside kept windows. Grade 👍 (real rally,
+          should keep) or 👎 (not a rally, should drop) — the score below updates
+          live and drives the serve-gate recommendation.
+        </div>
+        <ReprocessButtons videoId={videoId} note={note} />
       </div>
       {partial && (
         <div className="panel" style={{ padding: 8, marginTop: 8, borderColor: '#58a6ff' }}>
@@ -503,14 +544,16 @@ function PassTab({ source, rallies = [], windows = [], fps, onSeek, exists = tru
       <table style={{ marginTop: 10 }}>
         <thead><tr>
           <th>#</th><th>Start</th><th>End</th><th>Length</th>
-          <th>AI verdict</th><th>Refined</th><th>gate</th><th>Grade</th><th></th>
+          <th>AI verdict</th><th>Refined</th><th>gate</th><th>Grade</th><th></th><th></th>
         </tr></thead>
         <tbody>
           {windows.map((w, i) => {
             const kept = w.ai_verdict === 'rally'
             const wrong = w.human_verdict && (kept !== (w.human_verdict === 'keep'))
+            const isOpen = expanded.has(i)
             return (
-              <tr key={i} style={wrong ? { background: '#3a2530' } : undefined}>
+              <React.Fragment key={i}>
+              <tr style={wrong ? { background: '#3a2530' } : undefined}>
                 <td>{i + 1}</td>
                 <td>{fmt(w.pass1_start_frame, fps)}</td>
                 <td>{fmt(w.pass1_end_frame, fps)}</td>
@@ -542,11 +585,84 @@ function PassTab({ source, rallies = [], windows = [], fps, onSeek, exists = tru
                           title="Not a rally — should drop" onClick={() => onGrade(w, 'drop')}>👎</button>
                 </td>
                 <td><button onClick={() => onSeek(w.pass1_start_frame)}>▶</button></td>
+                <td><button onClick={() => toggleExpanded(i)}>{isOpen ? '▲' : '▼'} why</button></td>
               </tr>
+              {isOpen && (
+                <tr>
+                  <td colSpan="10" style={{ background: '#1a1a22', padding: 8 }}>
+                    {(w.records || []).map((r, k) => (
+                      <div key={k} style={{ marginBottom: 8 }}>
+                        <div><b style={{ color: r.verdict === 'rally' ? '#58a6ff' : '#b08' }}>
+                          {r.verdict === 'rally' ? 'KEPT' : `dropped: ${r.rejection_reason || '—'}`}
+                        </b>
+                        {r.diagnostics?.stage && <span className="muted"> — decided at {r.diagnostics.stage}</span>}
+                        </div>
+                        {(r.diagnostics?.checks || []).map((c, ci) => (
+                          <div key={ci} style={{ color: c.pass ? '#4cc38a' : '#ff5470' }}>
+                            {c.pass ? '✓' : '✗'} {c.name}: {String(c.value)} (needs {c.op} {String(c.threshold)})
+                            {c.pose_coverage != null && (
+                              <span className={c.pose_coverage < 0.3 ? undefined : 'muted'}
+                                    style={c.pose_coverage < 0.3 ? { color: '#ffb454' } : undefined}>
+                                {' '}[pose data: {(c.pose_coverage * 100).toFixed(0)}%
+                                {c.pose_coverage < 0.3 ? ' — mostly neutral fallback, not real orientation' : ''}]
+                              </span>
+                            )}
+                          </div>
+                        ))}
+                        {r.diagnostics?.raw_segment && (
+                          <div className="muted">
+                            raw Stage-C segment: {r.diagnostics.raw_segment[0].toFixed(2)}s → {r.diagnostics.raw_segment[1].toFixed(2)}s
+                            {' '}({(r.diagnostics.raw_segment[1] - r.diagnostics.raw_segment[0]).toFixed(2)}s)
+                          </div>
+                        )}
+                        {r.refined_start != null && (
+                          <div className="muted"
+                               style={r.rejection_reason === 'too_short' ? { color: '#ffb454' } : undefined}>
+                            refined (trimmed) span: {r.refined_start.toFixed(2)}s → {r.refined_end.toFixed(2)}s
+                            {' '}({(r.refined_end - r.refined_start).toFixed(2)}s)
+                            {r.rejection_reason === 'too_short' ? ' ← trimming, not raw duration, caused this drop' : ''}
+                          </div>
+                        )}
+                        {r.diagnostics?.anchor_t != null && (
+                          <div className="muted">
+                            anchor: {r.diagnostics.anchor_t.toFixed(2)}s ({r.diagnostics.anchor_source})
+                            {' · '}snap_end: {r.diagnostics.snap_end_t.toFixed(2)}s ({r.diagnostics.snap_end_kind})
+                          </div>
+                        )}
+                        {r.diagnostics?.serve_gate_components && (
+                          <div className="muted">
+                            gate: {Object.entries(r.diagnostics.serve_gate_components)
+                              .map(([k2, v2]) => `${k2}=${v2}`).join(', ')}
+                          </div>
+                        )}
+                        {r.diagnostics?.contact_vs_segment_start?.contact_t != null && (
+                          <div className={r.diagnostics.contact_vs_segment_start.contact_before_segment_start
+                                          ? undefined : 'muted'}
+                               style={r.diagnostics.contact_vs_segment_start.contact_before_segment_start
+                                      ? { color: '#ff5470' } : undefined}>
+                            contact anchor: {r.diagnostics.contact_vs_segment_start.contact_t.toFixed(2)}s
+                            {' '}vs. raw segment start: {r.diagnostics.contact_vs_segment_start.raw_segment_start.toFixed(2)}s
+                            {r.diagnostics.contact_vs_segment_start.contact_before_segment_start
+                              ? ' ← contact anchored BEFORE the segment starts — likely a stray event, not this serve'
+                              : ''}
+                          </div>
+                        )}
+                        {r.diagnostics?.facing_away_retreat_mean != null && (
+                          <div className="muted">
+                            facing-away retreat (mean): {r.diagnostics.facing_away_retreat_mean.toFixed(3)}
+                          </div>
+                        )}
+                        {r.diagnostics?.note && <div className="muted">{r.diagnostics.note}</div>}
+                      </div>
+                    ))}
+                  </td>
+                </tr>
+              )}
+              </React.Fragment>
             )
           })}
           {windows.length === 0 && (
-            <tr><td colSpan="9" className="muted">Pass 2 produced no windows here.</td></tr>
+            <tr><td colSpan="10" className="muted">Pass 2 produced no windows here.</td></tr>
           )}
         </tbody>
       </table>
@@ -568,7 +684,7 @@ function Recommendation({ videoId, note, nGraded }) {
   const apply = async (min) => {
     try {
       await api.writeRefineOverride({ serve_gate_min: min })
-      note(`serve_gate_min = ${min} written — reprocess Pass 2 to apply`)
+      note(`serve_gate_min = ${min} written — click Re-run Pass 2 to apply`)
     } catch (e) { note(`apply failed: ${e.message}`) }
   }
   return (
@@ -597,7 +713,7 @@ function Recommendation({ videoId, note, nGraded }) {
           {rec.recommended.overrides.serve_gate_min !== rec.current.serve_gate_min ? (
             <button style={{ marginTop: 6 }}
                     onClick={() => apply(rec.recommended.overrides.serve_gate_min)}>
-              Apply serve_gate_min = {rec.recommended.overrides.serve_gate_min} (writes config; re-run Pass 2)
+              Apply serve_gate_min = {rec.recommended.overrides.serve_gate_min}
             </button>
           ) : <div className="muted" style={{ marginTop: 6 }}>Current threshold is already best on your grades.</div>}
         </div>

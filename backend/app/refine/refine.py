@@ -45,6 +45,84 @@ log = logging.getLogger("refine.run")
 
 _ROOT = Path(__file__).resolve().parents[3]   # repo root
 
+# ponytail: process-lifetime cache, unbounded — fine for sweep runs (a handful
+# of labeled clips), would leak if used against many distinct videos long-term.
+_STAGE_A_CACHE: dict[tuple, list[tuple[Pass1Window, TrackingData]]] = {}
+
+
+def _stage_a_windows(video_id: str, cfg: RefineConfig,
+                     p1_source: str = "pass1") -> list[tuple[Pass1Window, TrackingData]]:
+    """Pass 1 windows + their Stage A tracking (ballistic reconstruction),
+    cached per (video, ballistic settings). Stage A is ~5s/clip and doesn't
+    depend on Stage C/D/serve-gate knobs, so parameter sweeps over those can
+    reuse it instead of re-reconstructing on every grid point. Keyed on the
+    ballistic settings too — a sweep must not vary those, or grade the cache
+    stale by resetting _STAGE_A_CACHE first."""
+    key = (video_id, cfg.use_ballistic_3d, cfg.ballistic_max_rms_px,
+          cfg.window_margin_s, p1_source)
+    cached = _STAGE_A_CACHE.get(key)
+    if cached is not None:
+        return cached
+    video = load_video(video_id)
+    fps = float(video["fps"])
+    last_frame = int(video["frame_count"]) - 1
+    margin = int(round(cfg.window_margin_s * fps))
+    out = []
+    for w in load_pass1_windows(video_id, p1_source):
+        f0 = max(0, w.start_frame - margin)
+        f1 = min(last_frame, w.end_frame + margin)
+        td = load_tracking(video_id, f0, f1, fps=fps,
+                           reconstruct_3d=cfg.use_ballistic_3d,
+                           max_rms_px=cfg.ballistic_max_rms_px)
+        out.append((w, td))
+    _STAGE_A_CACHE[key] = out
+    return out
+
+
+def refine_video_fast(video_id: str, cfg: RefineConfig, classifier: LiveClassifier,
+                      p1_source: str = "pass1") -> list[dict]:
+    """Like refine_video, but reuses cached Stage A tracking across calls —
+    for sweeps only, where only Stage B/C/D/gate knobs vary between calls."""
+    records: list[dict] = []
+    for w, td in _stage_a_windows(video_id, cfg, p1_source):
+        records.extend(refine_window(w, td, cfg, classifier).records)
+    return records
+
+
+def _gate_checks(gate: ServeGateResult, cfg: RefineConfig, mean_p: float) -> list[dict]:
+    """The mean_p_live + serve-gate hard-check breakdown shared by every
+    per-segment diagnostic (rejected at serve_gate_min, rejected too_short,
+    or kept) — the pass 2 "why" panel renders this list directly."""
+    return [
+        {"name": "mean_p_live", "value": round(mean_p, 4),
+         "threshold": cfg.mean_p_live_min, "op": ">=", "pass": True},
+        {"name": "pre_serve_formation", "value": round(gate.components.get("pre_serve", 0.0), 4),
+         "threshold": cfg.serve_pre_serve_min, "op": ">=", "pass": gate.pre_serve_ok,
+         "pose_coverage": round(gate.pre_serve_pose_coverage, 3)},
+        {"name": "pre_serve_formation (compensation bar)",
+         "value": round(gate.components.get("pre_serve", 0.0), 4),
+         "threshold": cfg.serve_pre_serve_compensate_min, "op": ">=",
+         "pass": gate.pre_serve_compensate_ok},
+        {"name": "contact", "value": round(gate.components.get("contact", 0.0), 4),
+         "threshold": cfg.serve_contact_min, "op": ">=", "pass": gate.contact_ok},
+        {"name": "contact (near-floor compensation bar)",
+         "value": round(gate.components.get("contact", 0.0), 4),
+         "threshold": cfg.serve_contact_near_floor_min, "op": ">=",
+         "pass": gate.contact_near_floor_ok},
+        {"name": "flight", "value": round(gate.components.get("flight", 0.0), 4),
+         "threshold": "0.8 (crossing found, undirected) | 1.0 (direction confirmed)",
+         "op": "==", "pass": gate.flight_directional,
+         "directional": gate.flight_directional},
+        {"name": "flight_or_landing_confirmed", "value": gate.flight_or_landing_ok,
+         "threshold": "landing > 0 or flight directionally confirmed (== 1.0)",
+         "op": "==", "pass": gate.flight_or_landing_ok},
+        {"name": "gate_pass_path", "value": gate.pass_path or "none",
+         "threshold": "contact | formation_compensation | directional_flight_compensation",
+         "op": "in", "pass": gate.pass_path is not None},
+        {"name": "serve_gate_score", "value": round(gate.score, 4),
+         "threshold": cfg.serve_gate_min, "op": ">=", "pass": gate.score >= cfg.serve_gate_min},
+    ]
+
 
 def resolve_path(p: str | Path) -> Path:
     p = Path(p)
@@ -65,7 +143,8 @@ class WindowDebug:
 
 def _record(window: Pass1Window, fps: float, verdict: str,
             reason: str | None, start: float | None, end: float | None,
-            mean_p: float, gate: float, cross10: float) -> dict:
+            mean_p: float, gate: float, cross10: float,
+            diag: dict | None = None) -> dict:
     return {
         "pass1_window_id": window.id,
         "pass1_start": round(window.start_frame / fps, 3),
@@ -82,6 +161,7 @@ def _record(window: Pass1Window, fps: float, verdict: str,
                        "serve_gate_score": round(gate, 4),
                        "net_crossings_per_10s": round(cross10, 3)},
         "splits": [],
+        "diagnostics": diag or {},
     }
 
 
@@ -98,11 +178,24 @@ def refine_window(window: Pass1Window, td: TrackingData, cfg: RefineConfig,
     span_lo, span_hi = float(feats.t[0]), float(feats.t[-1])
 
     if not segs:
-        reason = "low_live_ratio" if float(p.max(initial=0.0)) < cfg.enter_thresh \
-            else "too_short"
+        pmax = float(p.max(initial=0.0))
+        reason = "low_live_ratio" if pmax < cfg.enter_thresh else "too_short"
+        diag = {
+            "checks": [{"name": "p_live_max", "value": round(pmax, 4),
+                        "threshold": cfg.enter_thresh, "op": ">=",
+                        "pass": pmax >= cfg.enter_thresh}],
+            "stage": "enter_thresh (Stage B)" if reason == "low_live_ratio"
+                     else "min_rally_s_early (Stage C, pre-serve-gate)",
+            "note": ("no timestep ever crossed enter_thresh" if reason == "low_live_ratio"
+                     else "P(live) crossed enter_thresh, but postprocess.py's early "
+                          "min_rally_s_early noise-blip filter dropped every Stage C "
+                          "segment before it reached the serve gate / anchor / "
+                          "snap_end stage — the raw segment length that got filtered "
+                          "isn't retained here"),
+        }
         dbg.records.append(_record(window, fps, "rejected", reason,
                                    None, None, float(p.mean()) if len(p) else 0.0,
-                                   0.0, 0.0))
+                                   0.0, 0.0, diag))
         return dbg
 
     accepted: list[dict] = []
@@ -117,14 +210,37 @@ def refine_window(window: Pass1Window, td: TrackingData, cfg: RefineConfig,
                              & (feats.crossings_t <= t_end)))
         dur = max(t_end - t_start, 1e-6)
         cross10 = n_cross / dur * 10.0
+        facing_mean = (float(feats.cols["facing_away_retreat"][seg.start:seg.end].mean())
+                       if seg.end > seg.start else 0.0)
+        raw_seg = [round(t_start, 3), round(t_end, 3)]
+        # Explicit raw-live-segment-start vs. contact-anchor comparison — a
+        # contact anchor sitting well BEFORE the segment even starts is a red
+        # flag that it latched onto a stray ball event unrelated to this
+        # segment's serve (see _formation_window's contact-search
+        # localization), not a legitimately early-detected real contact.
+        contact_vs_segment_start = {
+            "contact_t": round(gate.contact_t, 3) if gate.contact_t is not None else None,
+            "raw_segment_start": round(t_start, 3),
+            "contact_before_segment_start": (gate.contact_t is not None
+                                             and gate.contact_t < t_start),
+        }
 
         if mean_p < cfg.mean_p_live_min:
+            diag = {"checks": [{"name": "mean_p_live", "value": round(mean_p, 4),
+                                 "threshold": cfg.mean_p_live_min, "op": ">=", "pass": False}],
+                    "stage": "mean_p_live_min",
+                    "raw_segment": raw_seg, "facing_away_retreat_mean": round(facing_mean, 4)}
             dbg.records.append(_record(window, fps, "rejected", "low_live_ratio",
-                                       None, None, mean_p, gate.score, cross10))
+                                       None, None, mean_p, gate.score, cross10, diag))
             continue
         if gate.score < cfg.serve_gate_min:
+            diag = {"checks": _gate_checks(gate, cfg, mean_p),
+                    "stage": "serve_gate_min",
+                    "serve_gate_components": {k: round(v, 4) for k, v in gate.components.items()},
+                    "contact_vs_segment_start": contact_vs_segment_start,
+                    "raw_segment": raw_seg, "facing_away_retreat_mean": round(facing_mean, 4)}
             dbg.records.append(_record(window, fps, "rejected", "no_serve",
-                                       None, None, mean_p, gate.score, cross10))
+                                       None, None, mean_p, gate.score, cross10, diag))
             continue
 
         # Start anchor: serve contact when found; else back off from the first
@@ -132,19 +248,44 @@ def refine_window(window: Pass1Window, td: TrackingData, cfg: RefineConfig,
         # real start, a crossing never precedes the serve); else rising edge.
         if gate.contact_t is not None:
             anchor = gate.contact_t
+            anchor_source = "serve_contact"
         else:
             cross = feats.crossings_t[(feats.crossings_t >= t_start - cfg.serve_lookback_s)
                                       & (feats.crossings_t <= t_end)]
-            anchor = min(t_start, float(cross[0]) - 0.9) if len(cross) else t_start
-        start = max(span_lo, anchor - cfg.pre_roll_s)
-        ev_t, _kind = snap_end(feats, max(t_start, start), t_end, cfg)
+            if len(cross):
+                anchor = min(t_start, float(cross[0]) - 0.9)
+                anchor_source = "crossing_fallback"
+            else:
+                anchor = t_start
+                anchor_source = "rising_edge"
+        # A late-detected serve contact (anchor well inside the segment)
+        # shouldn't eat into rally time the segment already established as
+        # live — clamp to whichever is EARLIER: the segment's own detected
+        # start, or the anchor's pre-roll. Previously this always used
+        # anchor - pre_roll_s regardless of t_start, so a contact found e.g.
+        # 2.9s into a 5.0s segment chopped the first 2.4s of real play.
+        start = max(span_lo, min(t_start, anchor - cfg.pre_roll_s))
+        ev_t, snap_kind = snap_end(feats, max(t_start, start), t_end, cfg)
         end = min(span_hi, ev_t + cfg.post_roll_s)
+        diag = {
+            "checks": _gate_checks(gate, cfg, mean_p) + [
+                {"name": "refined_duration_s", "value": round(end - start, 4),
+                 "threshold": cfg.min_rally_s, "op": ">=",
+                 "pass": (end - start) >= cfg.min_rally_s}],
+            "stage": "min_rally_s (post-trim)",
+            "serve_gate_components": {k: round(v, 4) for k, v in gate.components.items()},
+            "contact_vs_segment_start": contact_vs_segment_start,
+            "facing_away_retreat_mean": round(facing_mean, 4),
+            "raw_segment": raw_seg,
+            "anchor_t": round(anchor, 4), "anchor_source": anchor_source,
+            "snap_end_t": round(ev_t, 4), "snap_end_kind": snap_kind,
+        }
         if end - start < cfg.min_rally_s:
             dbg.records.append(_record(window, fps, "rejected", "too_short",
-                                       None, None, mean_p, gate.score, cross10))
+                                       start, end, mean_p, gate.score, cross10, diag))
             continue
         rec = _record(window, fps, "rally", None, start, end,
-                      mean_p, gate.score, cross10)
+                      mean_p, gate.score, cross10, diag)
         accepted.append(rec)
         dbg.records.append(rec)
 
