@@ -202,6 +202,7 @@ _ADDED_COLUMNS = [
     ("videos", "last_labels_hash", "TEXT"),
     ("videos", "model_versions", "TEXT"),
     ("videos", "match_type", "TEXT"),  # 'singles' | 'doubles' | NULL (unset)
+    ("videos", "s3_key", "TEXT"),      # set when STORAGE_BACKEND=s3; NULL in local mode
     # Ground-truth ball-event marks (viewer marking mode). NULL event_type =
     # legacy row = plain position mark. in_out is the human's call on a bounce;
     # in_out_suggested is what the homography said at save time; disagree=1

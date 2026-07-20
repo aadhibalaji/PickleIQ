@@ -23,8 +23,8 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from .. import db
-from ..config import PASS2_BALL_ENABLED
+from .. import db, results_export, storage_s3
+from ..config import PASS2_BALL_ENABLED, STORAGE_BACKEND
 from ..jobs import JobHandle
 from . import overlays
 from . import court
@@ -85,6 +85,24 @@ def _wrist_points(obs) -> list[tuple[float, float]]:
             if x > 0 and y > 0:
                 pts.append((float(x), float(y)))
     return pts
+
+
+def _upload_window_incremental(video_id: str, source: str, window_index: int,
+                                start_frame: int, end_frame: int) -> None:
+    """S3 mode only: as soon as one Pass 2 window's overlays are flushed
+    (just above), ship a scoped snapshot to S3 as results/{video_id}/
+    window_{n}.json — live visibility for the local app (see
+    api/media.py's poll-cloud-windows) without waiting for the whole chain
+    to finish. Never fails the pass: a transient S3 hiccup here must not
+    cost a user their Pass 2 run, and the chain-level export in
+    pipeline._finish_chain still captures everything at the end regardless."""
+    try:
+        payload = results_export.export_window_results(video_id, source, window_index,
+                                                          start_frame, end_frame)
+        storage_s3.upload_window_results(video_id, window_index, payload)
+    except Exception:
+        log.exception("incremental window %d S3 export failed for %s (non-fatal)",
+                      window_index, video_id)
 
 
 def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
@@ -554,6 +572,8 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                         e["evt"] = {"kind": ev.kind, "in": ev.in_court, "side": ev.side,
                                     "cx": round(ev.court_x, 2), "cy": round(ev.court_y, 2)}
         overlays.write_entries(video_id, source, list(entries.values()))
+        if STORAGE_BACKEND == "s3":
+            _upload_window_incremental(video_id, source, wi, ws, we)
         if on_window is not None:
             on_window(we)
 

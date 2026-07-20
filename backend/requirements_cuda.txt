@@ -31,3 +31,29 @@ opencv-python
 ultralytics          # YOLO11-pose + ByteTrack (weights auto-download)
 lapx                 # assignment solver used by the tracker
 anthropic            # discrepancy-analysis report only
+boto3                # EC2: fetches ANTHROPIC_API_KEY from Secrets Manager via instance role
+requests             # EC2: IMDSv2 metadata calls in self_stop.py (already a transitive dep
+                     # of ultralytics, but self_stop.py imports it directly so it's pinned here)
+scipy                # refine/ballistic.py (least_squares) — unguarded top-level import,
+                     # reachable from every real Pass 2 run via refine/refine.py. NOT a
+                     # transitive dep of anything else here — this was the literal missing
+                     # package behind the "No module named 'scipy'" runtime error.
+matplotlib           # refine/diagnostics.py — reachable from every real Pass 2 run too:
+                     # refine.py's run_refine_json() unconditionally does
+                     # `from .diagnostics import write_confidence_log` regardless of its
+                     # plot= flag, and that import alone executes diagnostics.py's
+                     # module-level `import matplotlib.pyplot`. Currently arrives
+                     # transitively via ultralytics, same as scipy did before it didn't —
+                     # pinned explicitly so a future ultralytics version dropping it
+                     # doesn't silently reintroduce this exact class of bug.
+pyyaml                # api/annotate.py and others — same "currently transitive via
+                     # ultralytics, don't rely on that" reasoning as matplotlib above.
+
+# NOT listed on purpose — both are optional, feature-detected at the call site
+# (try/except ImportError, with a real fallback), not required for the app to
+# run correctly:
+#   openvino  - cv/players.py, cv/ball_tracknet.py: Intel-GPU-only acceleration;
+#               falls back to the torch path when absent (this NVIDIA image never
+#               needs it — HW_OPENVINO_ENABLED is off here).
+#   xgboost   - refine/classifiers.py: learned live/dead classifier; falls back to
+#               a pure-numpy logistic regression when absent.

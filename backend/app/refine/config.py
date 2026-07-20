@@ -16,7 +16,9 @@ from pathlib import Path
 
 import yaml
 
-_ROOT = Path(__file__).resolve().parents[3]   # repo root (refine/ -> app -> backend -> root)
+from ..paths import repo_root
+
+_ROOT = repo_root()
 
 
 def override_path() -> Path:

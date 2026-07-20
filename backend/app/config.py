@@ -1,19 +1,49 @@
 """Central configuration. Loads .env from the repo root."""
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 from .hw_profile import active_profile
+from .paths import repo_root
+from .secrets_bootstrap import load_anthropic_key
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = repo_root()
 load_dotenv(REPO_ROOT / ".env")
+load_anthropic_key()
 
 DATA_DIR = Path(os.getenv("DATA_DIR", REPO_ROOT / "data"))
 VIDEO_DIR = DATA_DIR / "videos"
 DB_PATH = DATA_DIR / "app.db"
+
+# local (default, unchanged behavior) | s3 (EC2 deployment: uploads go to S3,
+# triggering the s3:ObjectCreated -> instance-start pipeline). See storage_s3.py.
+STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "local")
+S3_VIDEO_BUCKET = os.getenv("S3_VIDEO_BUCKET", "")
+
+# Whether THIS container is allowed to run Pass 1/2 itself. Default True —
+# unchanged behavior for plain local dev and for the EC2 worker (which must
+# still process what it downloads). Set RUN_PROCESSING=0 on a UI-only
+# container (STORAGE_BACKEND=s3, e.g. the developer's Mac in the hybrid
+# setup): it uploads to S3 and displays/syncs results, but never calls
+# pipeline.start_processing/reprocess — that's left entirely to the EC2
+# worker instance woken by the S3 upload trigger. See api/media.py's
+# upload_video/reprocess (the two gated call sites) and pipeline.py's
+# seed_cloud_placeholder/mirror_cloud_chain_status (how a RUN_PROCESSING=0
+# container still shows meaningful job status despite never running one).
+RUN_PROCESSING = os.getenv("RUN_PROCESSING", "1").strip().lower() not in ("0", "false", "no", "")
+
+if not RUN_PROCESSING and STORAGE_BACKEND != "s3":
+    # Nothing else in this deployment would ever process a locally-stored
+    # video, so this combination silently strands every upload forever.
+    logging.getLogger("config").warning(
+        "RUN_PROCESSING=0 with STORAGE_BACKEND=%r — uploaded videos will "
+        "never be processed by anything (RUN_PROCESSING=0 only makes sense "
+        "with STORAGE_BACKEND=s3, relying on a separate cloud worker)",
+        STORAGE_BACKEND)
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5")

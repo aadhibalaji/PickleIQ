@@ -19,11 +19,13 @@ from typing import Any
 
 from dotenv import load_dotenv
 
+from .paths import repo_root
+
 # Load .env here too (idempotent, doesn't override already-set vars) so
 # active_profile() gives the right answer regardless of whether config.py
 # has been imported yet — relying on import order for this was a real bug
 # (a caller importing this module first got HW_PROFILE cached as unset).
-load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+load_dotenv(repo_root() / ".env")
 
 PROFILES_PATH = Path(__file__).with_name("hw_profiles.json")
 

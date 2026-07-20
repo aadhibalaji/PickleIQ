@@ -24,11 +24,13 @@ LearnedParams / train scripts).
 from __future__ import annotations
 
 import logging
+import time
 
 import cv2
 import numpy as np
 
-from .. import db
+from .. import db, storage_s3
+from ..config import STORAGE_BACKEND
 from ..jobs import JobCancelled, JobHandle
 from . import court
 from . import overlays
@@ -78,6 +80,23 @@ def _match_fast(cands, prev_cands, step: int, smin: float, smax: float = 45.0):
         if smin <= sp <= smax and sp > best_sp:
             best_sp, best, best_prev = sp, c, p
     return best, best_prev
+
+
+def _upload_progress_incremental(video_id: str, progress: float, message: str) -> None:
+    """S3 mode only: live Pass 1 progress snapshot, mirrored by the local
+    UI-only container's poll-cloud-windows (see api/media.py,
+    pipeline.mirror_cloud_progress). Pass 1 has no per-window checkpoints
+    the way Pass 2 does, so this is a single object OVERWRITTEN each call
+    rather than one object per checkpoint — see storage_s3.upload_progress.
+    Never fails the pass: a transient S3 hiccup here must not cost a user
+    their Pass 1 run."""
+    try:
+        storage_s3.upload_progress(video_id, {
+            "video_id": video_id, "stage": "pass1", "status": "running",
+            "progress": progress, "message": message, "updated_at": time.time(),
+        })
+    except Exception:
+        log.exception("incremental pass1 progress S3 export failed for %s (non-fatal)", video_id)
 
 
 def run_pass1(video_id: str, params: dict, H, handle: JobHandle,
@@ -337,8 +356,11 @@ def run_pass1(video_id: str, params: dict, H, handle: JobHandle,
             flushed_chunk = ci - 1
             # update() also raises if cancelled — a long Pass 1 yields the
             # worker promptly so shorter queued jobs can run.
-            handle.update(progress=f / max(meta.frame_count, 1),
-                          message=f"Pass 1: {len(rallies)} rallies so far")
+            progress = f / max(meta.frame_count, 1)
+            message = f"Pass 1: {len(rallies)} rallies so far"
+            handle.update(progress=progress, message=message)
+            if STORAGE_BACKEND == "s3":
+                _upload_progress_incremental(video_id, progress, message)
 
     if active and rally_start is not None:
         close_rally(rally_start, meta.frame_count - 1)

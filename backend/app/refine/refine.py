@@ -40,10 +40,11 @@ from .io_loaders import (Pass1Window, TrackingData, load_pass1_windows,
                          load_tracking, load_video)
 from .postprocess import postprocess
 from .serve_gate import ServeGateResult, score_serve, snap_end
+from ..paths import repo_root
 
 log = logging.getLogger("refine.run")
 
-_ROOT = Path(__file__).resolve().parents[3]   # repo root
+_ROOT = repo_root()
 
 # ponytail: process-lifetime cache, unbounded — fine for sweep runs (a handful
 # of labeled clips), would leak if used against many distinct videos long-term.

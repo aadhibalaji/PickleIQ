@@ -7,11 +7,11 @@ import shutil
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 
-from .. import db, pipeline
-from ..config import VIDEO_DIR
+from .. import db, pipeline, results_export, storage_s3
+from ..config import RUN_PROCESSING, STORAGE_BACKEND, VIDEO_DIR
 from ..cv.video_io import probe
 from ..jobs import runner
 
@@ -25,27 +25,57 @@ class VideoUpdateIn(BaseModel):
 @router.post("/videos")
 async def upload_video(file: UploadFile):
     video_id = db.new_id()
-    dest_dir = VIDEO_DIR / video_id
-    dest_dir.mkdir(parents=True, exist_ok=True)
     safe_name = os.path.basename(file.filename or "video.mp4")
-    dest = dest_dir / safe_name
-    with dest.open("wb") as f:
-        shutil.copyfileobj(file.file, f)
-    try:
-        meta = probe(str(dest))
-    except ValueError as exc:
-        shutil.rmtree(dest_dir, ignore_errors=True)
-        raise HTTPException(400, str(exc)) from exc
+    s3_key = None
+
+    if STORAGE_BACKEND == "s3":
+        # Written straight to the scratch path Pass 1 will read from — the
+        # same file serves both as the S3 upload source and, since it's
+        # already local, Pass 1 doesn't need to download anything back down
+        # for this video (see pipeline._ensure_local_video).
+        dest = storage_s3.scratch_path(video_id)
+        with dest.open("wb") as f:
+            shutil.copyfileobj(file.file, f)
+        try:
+            meta = probe(str(dest))
+        except ValueError as exc:
+            dest.unlink(missing_ok=True)
+            raise HTTPException(400, str(exc)) from exc
+        try:
+            s3_key = storage_s3.upload_video(dest, video_id)
+        except RuntimeError as exc:
+            dest.unlink(missing_ok=True)
+            raise HTTPException(500, str(exc)) from exc
+    else:
+        dest_dir = VIDEO_DIR / video_id
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / safe_name
+        with dest.open("wb") as f:
+            shutil.copyfileobj(file.file, f)
+        try:
+            meta = probe(str(dest))
+        except ValueError as exc:
+            shutil.rmtree(dest_dir, ignore_errors=True)
+            raise HTTPException(400, str(exc)) from exc
+
     with db.connect() as con:
         con.execute(
-            "INSERT INTO videos (id, filename, path, fps, width, height, frame_count, uploaded_at)"
-            " VALUES (?,?,?,?,?,?,?,?)",
-            (video_id, safe_name, str(dest), meta.fps, meta.width, meta.height,
+            "INSERT INTO videos (id, filename, path, s3_key, fps, width, height, frame_count, uploaded_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (video_id, safe_name, str(dest), s3_key, meta.fps, meta.width, meta.height,
              meta.frame_count, db.now()),
         )
-    # Immediately kick off Pass 1 in the background — the user goes straight
-    # to the labeling UI while this runs.
-    job = pipeline.start_processing(video_id)
+    if RUN_PROCESSING:
+        # Immediately kick off Pass 1 in the background — the user goes
+        # straight to the labeling UI while this runs.
+        job = pipeline.start_processing(video_id)
+    else:
+        # This container only uploads/displays/syncs — the S3 write above
+        # (unconditional, happens regardless of RUN_PROCESSING) is what
+        # wakes the EC2 worker; see pipeline.seed_cloud_placeholder for why
+        # this isn't a runner.submit call.
+        pipeline.seed_cloud_placeholder(video_id)
+        job = {"job_id": None, "queued_for_cloud": True}
     return {"id": video_id, "filename": safe_name, "fps": meta.fps,
             "width": meta.width, "height": meta.height,
             "frame_count": meta.frame_count, **job}
@@ -74,7 +104,12 @@ def get_video(video_id: str):
         out_jobs.append(j)
     # Normalized player-detection exclusion polygons so the overlay can draw them.
     from ..cv.exclusions import zones_as_lists
-    return {**dict(row), "jobs": out_jobs, "exclusion_zones": zones_as_lists()}
+    # RUN_PROCESSING=0: jobs rows here are informational mirrors of cloud
+    # state (see pipeline.seed_cloud_placeholder/mirror_cloud_chain_status),
+    # not real jobs.JobRunner entries — cancelling them locally would no-op
+    # silently. The frontend uses this to hide the Cancel button for them.
+    return {**dict(row), "jobs": out_jobs, "exclusion_zones": zones_as_lists(),
+            "run_processing": RUN_PROCESSING}
 
 
 @router.patch("/videos/{video_id}")
@@ -95,10 +130,127 @@ def update_video(video_id: str, body: VideoUpdateIn):
 def reprocess(video_id: str, which: str = "pass2"):
     if which not in ("pass1", "pass2"):
         raise HTTPException(400, "which must be pass1 or pass2")
+    if not RUN_PROCESSING:
+        # This container has no mechanism to ask the cloud worker to
+        # reprocess (no equivalent of the S3-upload trigger for "redo this
+        # video") — refuse loudly rather than silently running it here,
+        # which is exactly what RUN_PROCESSING=0 exists to prevent.
+        raise HTTPException(
+            400, "reprocess is not available on this container (RUN_PROCESSING=0) — "
+                 "there is currently no way to trigger cloud reprocessing from here")
     with db.connect() as con:
         if con.execute("SELECT 1 FROM videos WHERE id=?", (video_id,)).fetchone() is None:
             raise HTTPException(404, "video not found")
     return pipeline.reprocess(video_id, which)
+
+
+@router.post("/videos/{video_id}/sync-from-cloud")
+def sync_from_cloud(video_id: str):
+    """Manual trigger (UI button) — checks S3 for this video's exported
+    cloud-processing results (see results_export.py, pipeline._finish_chain)
+    and merges whatever is there into the local DB. Safe to call repeatedly:
+    merge_video_results upserts, it never blind-inserts.
+
+    Only meaningful on a RUN_PROCESSING=0 (UI-only) container: a
+    RUN_PROCESSING=1 container either ran this itself (nothing to sync — its
+    own DB already has the answer) or is the EC2 worker that WROTE the
+    results in the first place. Rejecting the mismatch here, rather than
+    just no-op'ing, avoids a subtler problem: mirror_cloud_chain_status
+    below writes synthetic jobs rows to fake "active" status for a container
+    that never runs jobs — on a container that DOES run real jobs via
+    jobs.JobRunner, those synthetic rows would sit alongside/shadow the real
+    ones for the same video and confuse Workspace.jsx's newest-row-per-kind
+    display logic."""
+    if STORAGE_BACKEND != "s3":
+        raise HTTPException(400, "sync-from-cloud only applies when STORAGE_BACKEND=s3")
+    if RUN_PROCESSING:
+        raise HTTPException(
+            400, "sync-from-cloud only applies on a RUN_PROCESSING=0 (UI-only) container")
+    with db.connect() as con:
+        if con.execute("SELECT 1 FROM videos WHERE id=?", (video_id,)).fetchone() is None:
+            raise HTTPException(404, "video not found")
+    try:
+        payload = storage_s3.download_results(video_id)
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    if payload is None:
+        return {"found": False, "video_id": video_id,
+                "message": "no cloud results yet — it may still be processing, or hasn't "
+                           "started"}
+    summary = results_export.merge_video_results(video_id, payload)
+    pipeline.mirror_cloud_chain_status(video_id, summary["chain_status"])
+    return {"found": True, **summary}
+
+
+# video_id -> {window_index: etag} already merged. In-memory only, on
+# purpose (see poll_cloud_windows docstring) — this is a cheap "don't
+# re-download what we've already applied" cursor, not a durability
+# guarantee; a process restart just means the next poll re-merges
+# already-seen windows once, which merge_window_results makes harmless.
+_merged_window_etags: dict[str, dict[int, str]] = {}
+
+
+@router.post("/videos/{video_id}/poll-cloud-windows")
+def poll_cloud_windows(video_id: str):
+    """Lightweight incremental pull for live Pass 2 visibility while cloud
+    processing is still in flight (see cv/pass2.py's per-window upload and
+    results_export.merge_window_results). Meant to be called on a short
+    interval (frontend uses the same ~3s tick it already polls job status
+    on) while a video's cloud job looks active; distinct from
+    sync-from-cloud, which merges the one final full export at chain end.
+
+    Tracked by S3 object etag rather than "highest index seen": a
+    reprocessed run's Pass 2 reuses the same window_N.json keys with new
+    content, so an index-only watermark would wrongly skip re-merging a
+    window that changed.
+
+    Also pulls the live Pass 1 progress snapshot (see storage_s3.
+    upload_progress / cv/pass1.py) if one exists — Pass 1 has no per-window
+    checkpoints of its own, so without this the local UI shows nothing but
+    "waiting for cloud worker" for however long Pass 1 takes, even though
+    it's actively running.
+
+    Only meaningful on a RUN_PROCESSING=0 (UI-only) container — same
+    reasoning as sync-from-cloud's docstring: on a container that runs jobs
+    for real, the synthetic activity nudges below (mark_cloud_pass2_active,
+    mirror_cloud_progress) would collide with genuine jobs.JobRunner rows
+    for the same video."""
+    if STORAGE_BACKEND != "s3":
+        raise HTTPException(400, "poll-cloud-windows only applies when STORAGE_BACKEND=s3")
+    if RUN_PROCESSING:
+        raise HTTPException(
+            400, "poll-cloud-windows only applies on a RUN_PROCESSING=0 (UI-only) container")
+    with db.connect() as con:
+        if con.execute("SELECT 1 FROM videos WHERE id=?", (video_id,)).fetchone() is None:
+            raise HTTPException(404, "video not found")
+
+    try:
+        progress_payload = storage_s3.download_progress(video_id)
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    if progress_payload is not None:
+        pipeline.mirror_cloud_progress(video_id, progress_payload)
+
+    try:
+        objects = storage_s3.list_window_objects(video_id)
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
+
+    seen = _merged_window_etags.setdefault(video_id, {})
+    merged = []
+    for obj in objects:
+        idx, etag = obj["index"], obj["etag"]
+        if seen.get(idx) == etag:
+            continue
+        payload = storage_s3.download_window_results(video_id, idx)
+        if payload is None:
+            continue
+        merged.append(results_export.merge_window_results(video_id, payload))
+        seen[idx] = etag
+    if merged:
+        pipeline.mark_cloud_pass2_active(video_id, merged[-1]["window_index"])
+    return {"video_id": video_id, "new_windows": merged,
+            "pass1_progress": progress_payload}
 
 
 @router.post("/jobs/{job_id}/cancel")
@@ -118,9 +270,21 @@ _CHUNK = 1024 * 1024
 @router.get("/videos/{video_id}/stream")
 def stream_video(video_id: str, request: Request):
     with db.connect() as con:
-        row = con.execute("SELECT path FROM videos WHERE id=?", (video_id,)).fetchone()
+        row = con.execute("SELECT path, s3_key FROM videos WHERE id=?", (video_id,)).fetchone()
     if row is None:
         raise HTTPException(404, "video not found")
+
+    if STORAGE_BACKEND == "s3":
+        # 302 to a presigned S3 URL rather than proxying bytes through this
+        # instance: the <video> tag's src is a plain URL (VideoPlayer.jsx),
+        # so the browser follows the redirect transparently — including
+        # subsequent Range requests, which S3 supports natively, so scrubbing
+        # still works with no frontend changes.
+        if not row["s3_key"]:
+            raise HTTPException(404, "video has no S3 object recorded")
+        url = storage_s3.generate_presigned_url(row["s3_key"])
+        return RedirectResponse(url, status_code=302)
+
     path = Path(row["path"])
     if not path.exists():
         raise HTTPException(404, "video file missing on disk")

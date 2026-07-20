@@ -13,7 +13,8 @@ import numpy as np
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from .. import db
+from .. import db, storage_s3
+from ..config import STORAGE_BACKEND
 from ..cv import court
 from ..cv.court import CameraModel
 from ..cv.video_io import iter_frames
@@ -410,12 +411,13 @@ def save_calibration(body: CalibrationIn):
             focal = CameraModel.from_homography(H, v["width"], v["height"]).focal_px
 
     cal_id = db.new_id()
+    created_at = db.now()
     with db.connect() as con:
         con.execute(
             "INSERT INTO calibrations (id, scope, video_id, corner_points, homography,"
             " focal_px, created_at) VALUES (?,?,?,?,?,?,?)",
             (cal_id, body.scope, body.video_id if body.scope == "clip_local" else None,
-             db.dumps(body.corner_points), db.dumps(H.tolist()), focal, db.now()),
+             db.dumps(body.corner_points), db.dumps(H.tolist()), focal, created_at),
         )
         if body.scope == "clip_local":
             if not body.video_id:
@@ -427,6 +429,19 @@ def save_calibration(body: CalibrationIn):
             # on the clip it was calibrated from.
             con.execute("UPDATE videos SET calibration_id=NULL WHERE id=?",
                         (body.video_id,))
+    if STORAGE_BACKEND == "s3" and body.scope == "global":
+        # Mirrors this global calibration to S3 so the separate EC2 worker
+        # instance (which never sees this container's local DB directly)
+        # picks it up on its next cloud_ingest poll — see
+        # cloud_ingest._sync_calibration.
+        try:
+            storage_s3.upload_calibration({
+                "id": cal_id, "scope": "global", "video_id": None,
+                "corner_points": body.corner_points, "homography": H.tolist(),
+                "focal_px": focal, "created_at": created_at,
+            })
+        except Exception:
+            log.exception("failed to sync global calibration to S3 (non-fatal)")
     return {"id": cal_id, "scope": body.scope, "focal_px": focal,
             "homography": H.tolist()}
 

@@ -23,6 +23,8 @@ export const api = {
       method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
     }).then(j),
   reprocess: (id, which) => fetch(`/api/videos/${id}/reprocess?which=${which}`, { method: 'POST' }).then(j),
+  syncFromCloud: (id) => fetch(`/api/videos/${id}/sync-from-cloud`, { method: 'POST' }).then(j),
+  pollCloudWindows: (id) => fetch(`/api/videos/${id}/poll-cloud-windows`, { method: 'POST' }).then(j),
   cancelJob: (jobId) => fetch(`/api/jobs/${jobId}/cancel`, { method: 'POST' }).then(j),
   cancelVideoJobs: (id) => fetch(`/api/videos/${id}/cancel`, { method: 'POST' }).then(j),
   streamUrl: (id) => `/api/videos/${id}/stream`,

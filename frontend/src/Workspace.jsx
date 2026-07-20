@@ -85,9 +85,32 @@ export default function Workspace({ videoId, onBack }) {
   // Poll jobs + streamed results while processing runs in the background.
   useEffect(() => {
     const t = setInterval(() => {
-      api.getVideo(videoId).then((v) => {
+      api.getVideo(videoId).then(async (v) => {
         setVideo(v)
         const active = v.jobs?.some((j) => j.status === 'queued' || j.status === 'running')
+        // Hybrid mode (video went through the S3 upload path): pull any new
+        // Pass 2 window results that landed on S3 since the last tick, same
+        // cadence as the local-mode polling below — and before it, so that
+        // refetch picks up rows this call just merged. Stops the tick after
+        // active goes false, same as the local-mode refetch below: by then
+        // either the final export (normal finish) or the cancel/error
+        // partial export has already landed (both happen before the job
+        // status flip that turns `active` false — see pipeline.py).
+        //
+        // syncFromCloud runs alongside it, not just on the manual button —
+        // poll-cloud-windows alone can only ever nudge the mirrored pass2
+        // job to 'running' (mark_cloud_pass2_active has no terminal status
+        // to report — window payloads carry none). Only a full sync's
+        // mirror_cloud_chain_status ever clears that back to 'done'/'error'/
+        // 'cancelled', and api/annotate.py's refine self-heal (which is what
+        // actually populates the Pass 2 keep/drop bar) explicitly refuses to
+        // regenerate while the local pass2 job still reads 'running' — so
+        // without this, the bar stays empty until someone clicks Sync by
+        // hand, even though the raw overlay/ball data already synced fine.
+        if (v.s3_key && v.run_processing === false && (active || wasActiveRef.current)) {
+          await api.pollCloudWindows(videoId).catch(() => {})
+          await api.syncFromCloud(videoId).catch(() => {})
+        }
         // While a pass is running (and for one tick after it finishes) refetch
         // rallies + overlays: Pass 2 writes overlays per window as it goes.
         if (active || wasActiveRef.current) { loadRallies(); loadRefined(); setOverlayNonce((n) => n + 1) }
@@ -254,6 +277,8 @@ export default function Workspace({ videoId, onBack }) {
           <span className="muted">
             {video.fps?.toFixed(2)} fps · {video.frame_count} frames · params v{video.learned_params_version ?? '—'}
           </span>
+          {video.s3_key && video.run_processing === false &&
+            <SyncFromCloudButton videoId={videoId} note={note} />}
           <button className={gtMode ? 'active' : ''}
                   style={gtMode ? { borderColor: '#c3ce4a', color: '#c3ce4a' } : undefined}
                   onClick={() => { setGtMode((m) => !m); gtReset(); playerRef.current?.video()?.pause() }}
@@ -274,6 +299,13 @@ export default function Workspace({ videoId, onBack }) {
                     <progress value={jb.progress} max="1" />
                     <span className="muted">{Math.round(jb.progress * 100)}% · {jb.message}</span>
                   </>
+                ) : video.run_processing === false ? (
+                  // Informational mirror of cloud state (see
+                  // pipeline.seed_cloud_placeholder/mirror_cloud_chain_status)
+                  // — this container never runs it, so show its message
+                  // (e.g. "waiting for cloud worker...") rather than the
+                  // local-queue wording below, which wouldn't apply.
+                  <span className="muted">{jb.message || 'queued'}</span>
                 ) : (
                   <span className="muted">
                     queued{jb.queue_ahead != null && jb.queue_ahead > 0
@@ -282,9 +314,11 @@ export default function Workspace({ videoId, onBack }) {
                   </span>
                 )}
               </div>
-              <button className="danger" onClick={() => api.cancelJob(jb.id).then(() => note(`${jb.kind} cancelled`))}>
-                Cancel
-              </button>
+              {video.run_processing !== false && (
+                <button className="danger" onClick={() => api.cancelJob(jb.id).then(() => note(`${jb.kind} cancelled`))}>
+                  Cancel
+                </button>
+              )}
             </div>
           ))}
         </div>
@@ -413,6 +447,34 @@ function ServeDatasetPanel({ videoId, note }) {
         </div>
       )}
     </div>
+  )
+}
+
+// Manual pull for the hybrid architecture: EC2 processes a video and uploads
+// results/{id}/result.json to S3, then stops. This is the only way the local
+// app currently learns those results exist — no polling yet, on purpose
+// (see backend results_export.py / api/media.py sync-from-cloud).
+function SyncFromCloudButton({ videoId, note }) {
+  const [busy, setBusy] = useState(false)
+  const [last, setLast] = useState(null)
+  const run = async () => {
+    setBusy(true)
+    try {
+      const r = await api.syncFromCloud(videoId)
+      setLast(r)
+      note(r.found ? 'Cloud results synced' : 'No cloud results yet')
+    } catch (e) {
+      note(`sync failed: ${e.message}`)
+    }
+    setBusy(false)
+  }
+  return (
+    <span className="row" style={{ gap: 6, alignItems: 'baseline' }}>
+      <button onClick={run} disabled={busy} title="Pull this video's cloud-processed results from S3">
+        {busy ? 'Checking…' : '☁ Check for cloud results'}
+      </button>
+      {last && <span className="muted">{last.message}</span>}
+    </span>
   )
 }
 
