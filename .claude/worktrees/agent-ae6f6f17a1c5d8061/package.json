@@ -1,0 +1,15 @@
+{
+  "name": "pickleball-rally-system",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Run the FastAPI backend and the Vite frontend together with `npm run dev`.",
+  "scripts": {
+    "dev": "concurrently -k -n backend,frontend -c blue,green \"npm:dev:backend\" \"npm:dev:frontend\"",
+    "dev:backend": "cd backend && .venv\\Scripts\\python -m uvicorn app.main:app --port 8420 --reload",
+    "dev:frontend": "cd frontend && npm run dev",
+    "build": "cd frontend && npm run build"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}

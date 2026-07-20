@@ -142,8 +142,11 @@ class BallFrameFilter:
                players: list[tuple[object, tuple[float, float, float, float]]]
                ) -> list:
         """Return the candidates that survive stages 1-2. `cands` items expose
-        .x and .y; `players` are (stable key, box) pairs for this frame."""
+        .x and .y; `players` are (stable key, box) pairs for this frame.
+        Per-candidate outcomes land in self.last_reasons ((cand, reason) with
+        reason in kept/foot_zone/persistent/velocity) for diagnostics."""
         kept = []
+        self.last_reasons: list[tuple[object, str]] = []
         for c in cands:
             self.stats.seen += 1
             hit_box = None
@@ -155,13 +158,17 @@ class BallFrameFilter:
                 key, (x1, y1, x2, y2) = hit_box
                 if c.y > y2 - self.foot_frac * (y2 - y1):
                     self.stats.foot_zone += 1
+                    self.last_reasons.append((c, "foot_zone"))
                     continue
                 if self._persistent(frame, key, (x1, y1, x2, y2), c.x, c.y):
                     self.stats.persistent += 1
+                    self.last_reasons.append((c, "persistent"))
                     continue
             if not self._velocity_ok(frame, c.x, c.y):
                 self.stats.velocity += 1
+                self.last_reasons.append((c, "velocity"))
                 continue
+            self.last_reasons.append((c, "kept"))
             kept.append(c)
         return kept
 
@@ -205,15 +212,23 @@ class RefinedTrack:
     points: list[ArcPoint]          # surviving REAL observations, frame-sorted
     interpolated: list[ArcPoint]    # fit-filled misses (interpolated=True)
     arcs: list[Arc]                 # fitted arcs, frame-sorted
-    n_outliers: int = 0             # real points dropped by the RANSAC fits
-    n_fragments: int = 0            # isolated arclet points discarded as noise
+    n_outliers: int = 0             # RANSAC outliers dropped (off every arc)
+    n_fragments: int = 0            # arclet/noise points dropped (no arc match)
+    dropped: list[tuple] = field(default_factory=list)
+    # (frame, x, y, 'ransac_outlier'|'noise_fragment') for diagnostics
 
 
 def _segment(obs: list[tuple], gap_frames: int, split_deg: float,
-             min_speed_px: float) -> list[list[tuple]]:
+             min_speed_px: float, split_dv_px: float = 4.0) -> list[list[tuple]]:
     """Split (frame, x, y, diam) points into per-shot segments at time gaps
     and sharp direction changes. The turning point closes the outgoing
-    segment AND opens the next one, so both arcs stay anchored at the hit."""
+    segment AND opens the next one, so both arcs stay anchored at the hit.
+
+    A split needs BOTH a big angle AND a big velocity-vector change
+    (split_dv_px, px/frame): a real hit/bounce changes velocity by many
+    px/frame, while a slow far-court ball with a couple px of detection noise
+    produces huge spurious angles at tiny |dv| — splitting on angle alone
+    shredded real shots into unfittable fragments."""
     if not obs:
         return []
     cos_split = math.cos(math.radians(split_deg))
@@ -232,7 +247,8 @@ def _segment(obs: list[tuple], gap_frames: int, split_deg: float,
             v2 = ((cur[1] - prev[1]) / dt2, (cur[2] - prev[2]) / dt2)
             s1 = math.hypot(*v1)
             s2 = math.hypot(*v2)
-            if s1 >= min_speed_px and s2 >= min_speed_px:
+            dv = math.hypot(v2[0] - v1[0], v2[1] - v1[1])
+            if s1 >= min_speed_px and s2 >= min_speed_px and dv >= split_dv_px:
                 cosang = (v1[0] * v2[0] + v1[1] * v2[1]) / (s1 * s2)
                 if cosang < cos_split:  # sharp turn at `prev` -> new shot
                     segs.append([prev, cur])
@@ -287,33 +303,46 @@ def _ransac_quadratic(seg: list[tuple], tol_px: float,
 def refine_track(obs: list[tuple], *, split_deg: float = 55.0,
                  min_speed_px: float = 1.5, gap_frames: int = 10,
                  tol_px: float = 6.0, min_arc_pts: int = 4,
-                 join_gap: int = 8, seed: int = 12345) -> RefinedTrack:
+                 join_gap: int = 8, split_dv_px: float = 4.0,
+                 claim_tol_mult: float = 2.5, max_interp_gap: int = 6,
+                 seed: int = 12345) -> RefinedTrack:
     """Stage 3 over one window's selected track. `obs` is the frame-sorted
     (frame, x, y, diameter_px|None) list the per-frame selector produced.
 
-    Segments below min_arc_pts points survive only if they have arc
-    continuity — an accepted arc within join_gap frames on either side (the
-    stub of a shot the detector barely caught near a hit); isolated fragments
-    are discarded as noise. Fitted arcs drop their RANSAC outliers and fill
-    every missed integer frame inside their span from the fit."""
+    Points that end up on no fitted arc (RANSAC outliers, sub-min_arc_pts
+    fragments) get one rescue chance: if an arc within join_gap frames
+    extrapolates to them within a loose tolerance they are the stub of that
+    shot and are kept; otherwise they are noise and discarded — that is the
+    'isolated direction change matching neither' rule. Fitted arcs fill every
+    missed integer frame inside their span from the fit."""
     out = RefinedTrack(points=[], interpolated=[], arcs=[])
     if not obs:
         return out
     rng = np.random.default_rng(seed)
-    segs = _segment(obs, gap_frames, split_deg, min_speed_px)
+    segs = _segment(obs, gap_frames, split_deg, min_speed_px, split_dv_px)
 
     accepted: list[tuple[list[tuple], Arc]] = []
-    fragments: list[list[tuple]] = []
+    leftovers: list[tuple[tuple, bool]] = []  # (point, was_ransac_outlier)
     for seg in segs:
         if len(seg) < max(3, min_arc_pts):
-            fragments.append(seg)
+            leftovers.extend((p, False) for p in seg)
             continue
+        if len(seg) < 5:
+            # A quadratic fits <=4 points (near-)exactly — zero residual says
+            # nothing. Tiny segments only qualify as arcs on ball-like MOTION:
+            # a noise/shoe cluster jitters in place, a real shot travels.
+            span = max(1, seg[-1][0] - seg[0][0])
+            travel = math.hypot(seg[-1][1] - seg[0][1], seg[-1][2] - seg[0][2])
+            if travel / span < 2.0 * min_speed_px:
+                leftovers.extend((p, False) for p in seg)
+                continue
         _, _, mask = _ransac_quadratic(seg, tol_px, rng)
         inliers = [p for p, m in zip(seg, mask) if m]
-        out.n_outliers += len(seg) - len(inliers)
+        outliers = [p for p, m in zip(seg, mask) if not m]
         if len(inliers) < min_arc_pts:
-            fragments.append(inliers if inliers else seg)
+            leftovers.extend((p, False) for p in seg)
             continue
+        leftovers.extend((p, True) for p in outliers)
         # Final fit on the inliers with t=0 anchored at the FIRST INLIER, the
         # origin xy_at/vel_at evaluate against (the RANSAC fit's origin was
         # the segment start, which an outlier may have occupied).
@@ -328,31 +357,52 @@ def refine_track(obs: list[tuple], *, split_deg: float = 55.0,
     accepted.sort(key=lambda ia: ia[1].f0)
     arcs = [a for _, a in accepted]
 
-    # Fragments keep their points only with temporal continuity to a real arc.
-    for seg in fragments:
-        if not seg:
+    # Assemble by frame (adjacent arcs share their turning point — keep one).
+    by_frame: dict[int, ArcPoint] = {}
+    for inliers, _arc in accepted:
+        for p in inliers:
+            by_frame.setdefault(p[0], ArcPoint(p[0], p[1], p[2], p[3]))
+
+    # Rescue pass for off-arc points: kept only if a temporally adjacent arc
+    # extrapolates to them (a shot stub); everything else is noise.
+    claim_tol = claim_tol_mult * tol_px
+    for (pf, px, py, pd), was_outlier in leftovers:
+        if pf in by_frame:
             continue
-        s0, s1 = seg[0][0], seg[-1][0]
-        near_arc = any(0 <= s0 - a.f1 <= join_gap or 0 <= a.f0 - s1 <= join_gap
-                       for a in arcs)
-        if near_arc:
-            out.points.extend(ArcPoint(p[0], p[1], p[2], p[3]) for p in seg)
-        else:
-            out.n_fragments += len(seg)
+        claimed = False
+        for a in arcs:
+            if a.f0 - join_gap <= pf <= a.f1 + join_gap:
+                ax, ay = a.xy_at(pf)
+                if math.hypot(px - ax, py - ay) <= claim_tol:
+                    by_frame[pf] = ArcPoint(pf, px, py, pd)
+                    claimed = True
+                    break
+        if not claimed:
+            if was_outlier:
+                out.n_outliers += 1
+            else:
+                out.n_fragments += 1
+            out.dropped.append(
+                (pf, px, py, "ransac_outlier" if was_outlier else "noise_fragment"))
 
-    for inliers, arc in accepted:
-        have = {p[0] for p in inliers}
-        out.points.extend(ArcPoint(p[0], p[1], p[2], p[3]) for p in inliers)
-        diam_f = [p[0] for p in inliers if p[3]]
-        diam_v = [p[3] for p in inliers if p[3]]
-        for f in range(arc.f0 + 1, arc.f1):
-            if f in have:
+    for _inliers, arc in accepted:
+        diam_f = [p[0] for p in _inliers if p[3]]
+        diam_v = [p[3] for p in _inliers if p[3]]
+        # Fill only SHORT holes between real points. Measured on ground-truth
+        # marks: fills across long holes are the single worst error source
+        # (median 286 px vs 19 px for real picks) — the ball often changed
+        # direction mid-hole, and the quadratic happily bridges the truth gap
+        # with a confident wrong curve.
+        present = sorted(f for f in by_frame if arc.f0 <= f <= arc.f1)
+        for a, b in zip(present, present[1:]):
+            if not (0 < b - a - 1 <= max_interp_gap):
                 continue
-            x, y = arc.xy_at(f)
-            d = float(np.interp(f, diam_f, diam_v)) if len(diam_v) >= 2 else None
-            out.interpolated.append(ArcPoint(f, x, y, d, interpolated=True))
+            for f in range(a + 1, b):
+                x, y = arc.xy_at(f)
+                d = float(np.interp(f, diam_f, diam_v)) if len(diam_v) >= 2 else None
+                out.interpolated.append(ArcPoint(f, x, y, d, interpolated=True))
 
-    out.points.sort(key=lambda p: p.frame)
+    out.points = sorted(by_frame.values(), key=lambda p: p.frame)
     out.interpolated.sort(key=lambda p: p.frame)
     out.arcs = arcs
     return out
@@ -386,12 +436,44 @@ def _near_box(x: float, y: float,
 def classify_arc_events(arcs: list[Arc],
                         boxes_by_frame: dict[int, list],
                         *, join_gap: int = 8, min_angle_deg: float = 25.0,
-                        adjacent_frac: float = 0.30) -> list[ArcEvent]:
-    """One event per adjacent arc pair whose junction is a real direction
-    change: at/near a player box = hit (paddle contact); in open court =
-    bounce. Junctions further apart than join_gap are track restarts, not
-    events; turns shallower than min_angle_deg are segmentation artifacts of
-    a single continuing shot."""
+                        adjacent_frac: float = 0.30,
+                        vertex_min_px: float = 4.0,
+                        plausibility: bool = True,
+                        vy_frames: int = 3, vy_min_px: float = 0.5,
+                        vy_trust_span: int = 7,
+                        merge_frames: int = 6) -> list[ArcEvent]:
+    """Events from two signals:
+
+    1. Arc JUNCTIONS — a real direction change between adjacent arcs: at/near
+       a player box = hit (paddle contact); in open court = bounce. Junctions
+       further apart than join_gap are track restarts, not events; turns
+       shallower than min_angle_deg are segmentation artifacts.
+
+       Bounce junctions additionally pass a PLAUSIBILITY gate (plausibility
+       flag): a physical bounce arrives descending and leaves ascending, so
+       mean image vy over the vy_frames each side of the junction must be
+       >= +vy_min_px going in and <= -vy_min_px going out (image y grows
+       downward). Ghost turns — the track briefly on a non-ball object —
+       are horizontal/other signatures and drop here (measured: 3 of the 4
+       remaining exhaustive-window FPs). Bounce events closer than
+       merge_frames collapse into the strongest one (double-splits of one
+       real event measured 4 frames apart).
+    2. Within-arc y-VERTEX bounces — image y grows downward, so a bounce is a
+       local y MAXIMUM. The RANSAC tolerance lets one quadratic swallow a
+       shallow bounce (measured: most GT bounces had good track but produced
+       no junction), so an arc whose fitted y-curve peaks INSIDE its span,
+       descending then ascending by >= vertex_min_px, is itself a bounce —
+       open court only; near a player the y-max is ambiguous and hit-moment
+       reasoning belongs to the player tracks.
+    """
+    # NOTE(bounce recall, measured 2026-07-07): two structural upgrades were
+    # tried against the 25 GT bounces and neither moved recall — placing the
+    # junction at the arcs' extrapolated crossing (quadratic tails are too
+    # unstable beyond the fitted span) and extending junction reach across
+    # longer holes (admitted no new true events). Per-bounce diagnosis shows
+    # recall is limited by TRACK quality around bounces (the detector loses
+    # the ball for 12+ frames at most of them), not by this logic — that is
+    # Phase 2 (TrackNet) territory, so the junction stays simple.
     events: list[ArcEvent] = []
     for a, b in zip(arcs, arcs[1:]):
         gap = b.f0 - a.f1
@@ -412,6 +494,58 @@ def classify_arc_events(arcs: list[Arc],
         ef = int(round((a.f1 + b.f0) / 2.0))
         near = any(_near_box(ex, ey, boxes_by_frame.get(f, []), adjacent_frac)
                    for f in range(a.f1, b.f0 + 1))
-        events.append(ArcEvent(frame=ef, kind="hit" if near else "bounce",
+        kind = "hit" if near else "bounce"
+        if kind == "bounce" and plausibility:
+            # Mean vy over the last/first vy_frames of the arcs flanking the
+            # junction (sampled from the fits, robust to per-frame jitter).
+            # A side only VOTES when its arc spans >= vy_trust_span frames:
+            # a 4-6 point stub's quadratic vy is noise (both real bounces the
+            # strict gate wrongly rejected failed exactly on a short-stub
+            # side), so short sides abstain instead of vetoing.
+            w = max(1, int(vy_frames))
+            vy_in = float(np.mean([a.vel_at(t)[1]
+                                   for t in range(max(a.f0, a.f1 - w), a.f1 + 1)]))
+            vy_out = float(np.mean([b.vel_at(t)[1]
+                                    for t in range(b.f0, min(b.f1, b.f0 + w) + 1)]))
+            bad_in = (a.f1 - a.f0) >= vy_trust_span and vy_in < vy_min_px
+            bad_out = (b.f1 - b.f0) >= vy_trust_span and vy_out > -vy_min_px
+            if bad_in or bad_out:
+                continue  # a trusted side contradicts descend-then-ascend
+        events.append(ArcEvent(frame=ef, kind=kind,
                                x=ex, y=ey, angle_deg=ang, near_player=near))
-    return events
+
+    for a in arcs:
+        span = a.f1 - a.f0
+        if span < 5 or a.cy[0] >= 0:      # too short, or y-curve opens down-screen
+            continue
+        tv = -a.cy[1] / (2.0 * a.cy[0])   # vertex of y(t) = cy0 t^2 + cy1 t + cy2
+        if not (1.5 <= tv <= span - 1.5):  # edge vertexes are junction territory
+            continue
+        yv = float(np.polyval(a.cy, tv))
+        depth = min(yv - float(np.polyval(a.cy, 0.0)),
+                    yv - float(np.polyval(a.cy, float(span))))
+        if depth < vertex_min_px:          # no real descend-then-ascend V
+            continue
+        vf = int(round(a.f0 + tv))
+        vx, vy = a.xy_at(vf)
+        if _near_box(vx, vy, boxes_by_frame.get(vf, []), adjacent_frac):
+            continue
+        events.append(ArcEvent(frame=vf, kind="bounce", x=vx, y=vy,
+                               angle_deg=0.0, near_player=False))
+
+    # Merge: frame order, junction events win a near-tie with vertex events.
+    # Two BOUNCES within merge_frames are one physical event double-split by
+    # segmentation — keep the stronger (larger turn angle) of the pair.
+    events.sort(key=lambda e: (e.frame, e.angle_deg == 0.0))
+    merged: list[ArcEvent] = []
+    for e in events:
+        if merged:
+            prev = merged[-1]
+            window = merge_frames if (e.kind == "bounce" and prev.kind == "bounce") else 4
+            if e.frame - prev.frame < window:
+                if e.kind == "bounce" and prev.kind == "bounce" \
+                        and e.angle_deg > prev.angle_deg:
+                    merged[-1] = e
+                continue
+        merged.append(e)
+    return merged

@@ -91,6 +91,15 @@ class CameraModel:
     H maps image->world; internally we decompose H_wi = inv(H) = K [r1 r2 t].
     Focal length is self-calibrated from the rotation-column constraints
     (principal point assumed at image centre — fine for consumer cameras).
+
+    HANDEDNESS INVARIANT: the court world frame (x right as seen from the
+    camera, y TOWARD the camera, z up) is LEFT-handed, so `R` here is an
+    improper orthogonal matrix — det(R) = -1, verified on the stored
+    calibration. That is correct-by-construction and safe everywhere R is
+    used only as an orthogonal linear map with R.T as its inverse (all of
+    this file). Do NOT feed R to anything that assumes a proper rotation
+    (cv2.Rodrigues, Euler/quaternion conversion, SLERP) — it will silently
+    produce a mirrored pose.
     """
 
     H: np.ndarray          # image -> court (3x3)
@@ -98,6 +107,10 @@ class CameraModel:
     R: np.ndarray          # world -> camera rotation
     t: np.ndarray          # world -> camera translation
     focal_px: float
+    # True when the focal self-calibration degenerated and focal_px is only
+    # the generic-FOV guess — every height reconstructed from apparent size is
+    # then systematically off, so callers must surface this, not just log it.
+    focal_degenerate: bool = False
 
     @staticmethod
     def from_homography(H: np.ndarray, img_w: int, img_h: int) -> "CameraModel":
@@ -120,6 +133,7 @@ class CameraModel:
             if v > 0:
                 f_sq.append(v)
         # Fallback: a generic ~60 deg horizontal FOV if constraints degenerate.
+        degenerate = not f_sq
         if f_sq:
             f = math.sqrt(np.mean(f_sq))
         else:
@@ -149,7 +163,8 @@ class CameraModel:
         if cam_center[2] < 0:
             R[:, 2] *= -1  # flip handedness choice
             cam_center = -R.T @ t
-        return CameraModel(H=H, K=K, R=R, t=t, focal_px=float(f))
+        return CameraModel(H=H, K=K, R=R, t=t, focal_px=float(f),
+                           focal_degenerate=degenerate)
 
     def ball_world_from_size(self, u: float, v: float, diam_px: float) -> np.ndarray:
         """3D ball centre from pixel position + apparent diameter.
@@ -160,6 +175,51 @@ class CameraModel:
         ray = np.linalg.inv(self.K) @ np.array([u, v, 1.0])
         p_cam = Z * ray  # ray has z=1, so this puts the point at depth Z
         return self.R.T @ (p_cam - self.t)  # world (x, y, height)
+
+    def height_sigma(self, u: float, v: float, diam_px: float,
+                     sigma_px: float = 1.0) -> float:
+        """1-sigma HEIGHT uncertainty of ball_world_from_size for a diameter
+        error of `sigma_px` pixels. Z = f*D/d gives |dZ/dd| = Z^2/(f*D), and
+        the point moves along the pixel ray, so the height error is that depth
+        error times the world-z component of the (unit-per-camera-z) ray.
+        Measured on the stored calibration: ~0.12 m/px near the near baseline
+        but ~0.57 m/px at the far baseline, where the ball is <5 px wide —
+        i.e. far heights are structurally unreliable and must say so."""
+        if diam_px <= 0:
+            return float("inf")
+        Z = self.focal_px * BALL_DIAMETER / diam_px
+        dZ = (Z * Z / (self.focal_px * BALL_DIAMETER)) * sigma_px
+        ray = np.linalg.inv(self.K) @ np.array([u, v, 1.0])
+        ray_w = self.R.T @ ray  # world direction per unit camera-frame depth
+        return float(dZ * abs(ray_w[2]))
+
+
+def implied_person_height(cam: CameraModel, foot_court_xy: tuple[float, float],
+                          head_px: tuple[float, float]) -> tuple[float, float]:
+    """Height of a person standing at `foot_court_xy` (court metres, from the
+    homography) whose head appears at pixel `head_px` — the point on the head
+    ray closest (in the court plane) to the vertical line above the feet.
+
+    Returns (height_m, plane_residual_m). The residual is the ray's horizontal
+    miss distance from the foot point; large residuals mean the box/foot don't
+    belong together (occlusion, bad box) and the sample should be discarded.
+
+    This is the cheap CROSS-CHECK for a bad-but-not-degenerate calibration:
+    reconstructed standing-player heights must land in a plausible human band
+    (~1.2-2.2 m). A wrong self-calibrated focal (e.g. from imperfect corner
+    clicks) shifts every implied height out of that band, which is detectable
+    per clip without any ground truth."""
+    C = -cam.R.T @ cam.t
+    r = cam.R.T @ (np.linalg.inv(cam.K) @ np.array([head_px[0], head_px[1], 1.0]))
+    A = r[:2]
+    denom = float(A @ A)
+    if denom < 1e-12:
+        return float("nan"), float("inf")
+    b = np.array([foot_court_xy[0], foot_court_xy[1]]) - C[:2]
+    s = float(A @ b) / denom
+    X = C + s * r
+    resid = float(np.hypot(X[0] - foot_court_xy[0], X[1] - foot_court_xy[1]))
+    return float(X[2]), resid
 
 
 def _sample_mask(mask: np.ndarray, p0: np.ndarray, p1: np.ndarray, n: int = 60) -> float:

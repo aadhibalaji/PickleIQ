@@ -91,6 +91,15 @@ class PlayerIdentityTracker:
     APP_W = 1.5
     MATCH_MAX = 2.2       # above this a detection prefers a NEW slot (if room)
     HIST_ALPHA = 0.12     # EMA rate for the appearance descriptor
+    # Hard cap on real identity slots per team, for the WHOLE run (this tracker
+    # lives once per run_pass2() call — see PoseTracker.__init__ / run_pass2,
+    # it is never re-created per window). Once both slots for a team exist,
+    # _assign_team's cost-rejection branch is unreachable (only fires while
+    # len(idents) < MAX_PER_TEAM) so every later detection force-binds to the
+    # nearer slot regardless of cost. A 3rd+ same-team detection in one frame
+    # is therefore provably noise, not a real player re-ID failure, and is
+    # left with slot=None (see _assign_team's "over capacity" branch) — the
+    # caller (pass2.py) must not paper over that with a fabricated id.
     MAX_PER_TEAM = 2
 
     def __init__(self) -> None:

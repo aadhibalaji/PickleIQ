@@ -18,10 +18,22 @@ import numpy as np
 from . import court
 from .exclusions import in_excluded
 from .identity import PlayerIdentityTracker
-from ..config import DATA_DIR, POSE_MODEL
+from ..config import DATA_DIR, POSE_MODEL, HW_PRECISION, HW_OPENVINO_ENABLED
 from .device import ultralytics_device
 
 log = logging.getLogger("cv.players")
+
+# Resolved once: passing the bare name "bytetrack.yaml" makes ultralytics
+# re-glob its whole package tree to find it on EVERY .track() call (measured:
+# ~29% of total Pass 2 time going into ultralytics.utils.checks.check_file's
+# recursive glob, called once per frame). An absolute path hits check_file's
+# Path.exists() fast path instead.
+def _bytetrack_yaml() -> str:
+    import ultralytics
+    return str(Path(ultralytics.__file__).parent / "cfg" / "trackers" / "bytetrack.yaml")
+
+
+_BYTETRACK_YAML = _bytetrack_yaml()
 
 
 def _build_model(name: str):
@@ -37,32 +49,39 @@ def _build_model(name: str):
     return YOLO(name)
 
 
-# imgsz -> exported OpenVINO model dir (or None if OV/GPU is unavailable). The
-# export is size-specific (static input shape) and cached to disk, so it runs at
-# most once per size ever, and the in-process dict avoids re-checking each window.
-_OV_CACHE: dict[int, str | None] = {}
+# (imgsz, precision) -> exported OpenVINO model dir (or None if OV/GPU/the
+# hardware profile disables it). The export is size- and precision-specific
+# (static input shape) and cached to disk, so it runs at most once per
+# (imgsz, precision) ever, and the in-process dict avoids re-checking each window.
+_OV_CACHE: dict[tuple[int, str], str | None] = {}
 
 
 def _openvino_pose_dir(imgsz: int) -> str | None:
-    """Export yolo11n-pose to OpenVINO FP16 at `imgsz` (once, cached under
+    """Export yolo11n-pose to OpenVINO at `imgsz` (once, cached under
     data/models/pose) and return the model dir — this is what lets pose run on the
     Intel Arc GPU, which ultralytics' torch path can't drive (device='xpu' throws
     inside .track(), so it silently falls back to CPU at ~6x the latency). Returns
-    None when OpenVINO isn't installed or the export fails, so the caller keeps the
+    None when OpenVINO isn't installed, the export fails, or the active hardware
+    profile turns OpenVINO off (non-Intel machines), so the caller keeps the
     torch model."""
-    if imgsz in _OV_CACHE:
-        return _OV_CACHE[imgsz]
+    if not HW_OPENVINO_ENABLED:
+        return None
+    key = (imgsz, HW_PRECISION)
+    if key in _OV_CACHE:
+        return _OV_CACHE[key]
     result: str | None = None
     try:
         import openvino  # noqa: F401  (presence check)
         from ultralytics import YOLO
 
         # Leaf dir MUST keep the '_openvino_model' suffix — that's how ultralytics
-        # recognises the format; the image size is encoded in the parent instead.
-        dst = DATA_DIR / "models" / "pose" / str(imgsz) / f"{Path(POSE_MODEL).stem}_openvino_model"
+        # recognises the format; size + precision are encoded in the parent path.
+        dst = (DATA_DIR / "models" / "pose" / str(imgsz) / HW_PRECISION /
+               f"{Path(POSE_MODEL).stem}_openvino_model")
         if not (dst / "metadata.yaml").exists():
             dst.parent.mkdir(parents=True, exist_ok=True)
-            src = Path(YOLO(POSE_MODEL).export(format="openvino", imgsz=imgsz, half=True))
+            src = Path(YOLO(POSE_MODEL).export(format="openvino", imgsz=imgsz,
+                                                half=(HW_PRECISION == "fp16")))
             if src.resolve() != dst.resolve():
                 if dst.exists():
                     shutil.rmtree(dst)
@@ -71,7 +90,7 @@ def _openvino_pose_dir(imgsz: int) -> str | None:
         log.info("pose: using OpenVINO model %s on the Intel Arc GPU", dst.name)
     except Exception as exc:  # noqa: BLE001
         log.warning("OpenVINO pose unavailable (%s) — falling back to torch/CPU", exc)
-    _OV_CACHE[imgsz] = result
+    _OV_CACHE[key] = result
     return result
 
 
@@ -124,9 +143,11 @@ class PoseTracker:
             from ultralytics import YOLO
             self._model = YOLO(ov_dir)
             self._device = "intel:gpu"
+            self._half = False  # precision is already baked into the OV export
         else:
             self._model = _build_model(model_name or POSE_MODEL)
             self._device = ultralytics_device()
+            self._half = HW_PRECISION == "fp16" and self._device != "cpu"
 
     def update(self, frame: np.ndarray) -> list[PlayerObs]:
         model = self._model
@@ -134,15 +155,16 @@ class PoseTracker:
         # Pass 1 keeps resetting (sparse), Pass 2 then persists for stable IDs.
         persist = self._track_sequence and self._started
         self._started = True
-        kwargs = dict(persist=persist, tracker="bytetrack.yaml", classes=[0],
+        kwargs = dict(persist=persist, tracker=_BYTETRACK_YAML, classes=[0],
                       conf=self._conf, imgsz=self._imgsz, verbose=False)
         try:
-            res = model.track(frame, device=self._device if self._device_ok else "cpu", **kwargs)
+            res = model.track(frame, device=self._device if self._device_ok else "cpu",
+                              half=self._half, **kwargs)
         except Exception:
             if self._device_ok and self._device not in ("cpu",):
                 log.warning("tracker failed on %s, falling back to CPU", self._device)
                 self._device_ok = False
-                res = model.track(frame, device="cpu", **kwargs)
+                res = model.track(frame, device="cpu", half=False, **kwargs)
             else:
                 raise
         out: list[PlayerObs] = []

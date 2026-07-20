@@ -36,11 +36,11 @@ def _load_human_ai(video_id: str):
         v = con.execute("SELECT fps FROM videos WHERE id=?", (video_id,)).fetchone()
         rows = con.execute(
             "SELECT source, start_frame, end_frame, meta FROM rally_labels"
-            " WHERE video_id=? AND source IN ('human','pass2')", (video_id,)).fetchall()
+            " WHERE video_id=? AND source IN ('human','pass1')", (video_id,)).fetchall()
     fps = (v["fps"] if v else None) or 30.0
     human = [Rally(r["start_frame"], r["end_frame"]) for r in rows if r["source"] == "human"]
     ai = [Rally(r["start_frame"], r["end_frame"], "", db.loads(r["meta"], {}))
-          for r in rows if r["source"] == "pass2"]
+          for r in rows if r["source"] == "pass1"]
     return human, ai, fps
 
 
@@ -85,7 +85,7 @@ def run_learn(video_id: str) -> dict:
 
     human, ai, fps = _load_human_ai(video_id)
     if not human or not ai:
-        return {"skipped": "need both human labels and Pass 2 rallies"}
+        return {"skipped": "need both human labels and Pass 1 rallies"}
 
     version, current = learned_params.get_latest()
     result = compare(human, ai, fps)

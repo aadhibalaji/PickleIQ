@@ -19,11 +19,16 @@ from __future__ import annotations
 # hypotenuse cutting across) — they cover the background / fence-line people in
 # the upper-left and upper-right while leaving the whole court region clear.
 # Tuned from a user-marked frame on 2026-07-07; mirror-symmetric about x=0.5.
+# Lowered 2026-07-07 (round 3): pulled the top-edge (center) vertices in toward
+# x=0.5 (0.40->0.44 left, 0.60->0.56 right) and dropped the side vertices lower
+# (0.56->0.62), which swings the hypotenuse to cover more of the background wedge.
+# The top intercepts stay symmetric about x=0.5 and clear of the real far player
+# at x~0.54 (sits in the 0.44..0.56 gap) so it is NOT excluded.
 EXCLUSION_ZONES: list[list[tuple[float, float]]] = [
     # Top-left corner triangle.
-    [(0.0, 0.0), (0.32, 0.0), (0.0, 0.42)],
+    [(0.0, 0.0), (0.44, 0.0), (0.0, 0.62)],
     # Top-right corner triangle (mirror of the above).
-    [(1.0, 0.0), (0.68, 0.0), (1.0, 0.42)],
+    [(1.0, 0.0), (0.56, 0.0), (1.0, 0.62)],
 ]
 
 

@@ -87,3 +87,28 @@ kbd { background: var(--panel2); border: 1px solid var(--border); border-radius:
   animation: slide 1.3s ease-in-out infinite;
 }
 @keyframes slide { from { left: -35%; } to { left: 100%; } }
+
+/* Rally Analysis: pin-on-video coaching view */
+.clip-list-empty { color: var(--muted); font-size: 12px; }
+
+.rally-video { margin-top: 4px; }
+.rally-video video { display: block; width: 100%; max-height: 46vh; background: #000; border-radius: 8px; }
+.pin-track {
+  position: relative; height: 20px; margin-top: 8px; background: var(--panel2);
+  border: 1px solid var(--border); border-radius: 4px; cursor: pointer;
+}
+.pin {
+  position: absolute; top: 50%; width: 12px; height: 12px; border-radius: 50%;
+  transform: translate(-50%, -50%); border: 2px solid var(--panel);
+  background: var(--border); padding: 0; cursor: pointer;
+}
+.pin.tip-improve { background: var(--warn); }
+.pin.tip-praise { background: var(--accent2); }
+.pin.pin-active { box-shadow: 0 0 0 2px #fff; }
+
+.tip-panel { margin-top: 10px; padding: 10px; background: var(--panel2); border-radius: 6px; border-left: 3px solid var(--border); }
+.tip-panel.tip-improve { border-left-color: var(--warn); }
+.tip-panel.tip-praise { border-left-color: var(--accent2); }
+.tip-panel-player { font-size: 12px; color: var(--muted); font-weight: 600; }
+.tip-card-badge { font-size: 11px; text-transform: capitalize; color: var(--muted); }
+.tip-card-text { font-size: 13px; line-height: 1.4; margin: 6px 0 0; }

@@ -14,7 +14,8 @@ const SKELETON = [
 // Renders the ORIGINAL video with all annotation drawn from stored metadata
 // onto a canvas overlay — the video file is never edited.
 const VideoPlayer = forwardRef(function VideoPlayer(
-  { videoId, meta, overlaySource, courtLines, clickMode, onCanvasClick, onFrame, overlayNonce },
+  { videoId, meta, overlaySource, courtLines, clickMode, onCanvasClick, onFrame, overlayNonce,
+    gtMarks, pendingMark, selectedMarkId },
   ref,
 ) {
   const videoRef = useRef(null)
@@ -23,11 +24,16 @@ const VideoPlayer = forwardRef(function VideoPlayer(
   const lastBoxRef = useRef('')
   const [isFs, setIsFs] = useState(false)
   const [showVideo, setShowVideo] = useState(true)
+  const [showBall, setShowBall] = useState(true)
   const cacheRef = useRef({}) // source -> { fetched:Set(chunk), byFrame:Map }
   const stateRef = useRef({ frame: 0, overlaySource, courtLines })
   stateRef.current.overlaySource = overlaySource
   stateRef.current.courtLines = courtLines
   stateRef.current.exclusionZones = meta.exclusion_zones
+  stateRef.current.gtMarks = gtMarks
+  stateRef.current.pendingMark = pendingMark
+  stateRef.current.selectedMarkId = selectedMarkId
+  stateRef.current.showBall = showBall
 
   useImperativeHandle(ref, () => ({
     seekFrame: (f) => {
@@ -130,7 +136,8 @@ const VideoPlayer = forwardRef(function VideoPlayer(
 
     // Ball trail from recent entries — red so it contrasts with the (often
     // yellow) pickleball itself; current position gets a white outline.
-    for (let d = 24; d >= 0; d--) {
+    // Toggleable from the player controls (🎾).
+    if (stateRef.current.showBall) for (let d = 24; d >= 0; d--) {
       const e = c.byFrame.get(frame - d)
       if (e?.ball) {
         const a = 1 - d / 28
@@ -160,6 +167,50 @@ const VideoPlayer = forwardRef(function VideoPlayer(
                      e.ball[0] + 20, e.ball[1] - 10)
         }
       }
+    }
+
+    // Ground-truth ball marks (marking mode): diamonds at their exact frame,
+    // faded within +/-2 frames so a nearby mark is visible while stepping.
+    const marks = stateRef.current.gtMarks
+    if (marks?.length) {
+      for (const m of marks) {
+        const d = Math.abs(frame - m.frame)
+        if (d > 2) continue
+        const color = m.event_type === 'bounce'
+          ? (m.in_out === 'out' ? 'rgba(255,84,112,1)' : 'rgba(0,229,255,1)')
+          : m.event_type === 'hit' ? 'rgba(229,165,58,1)' : 'rgba(195,206,74,1)'
+        g.globalAlpha = d === 0 ? 1.0 : 0.35
+        g.strokeStyle = color
+        g.lineWidth = 3
+        const r = 11
+        g.beginPath()
+        g.moveTo(m.x, m.y - r); g.lineTo(m.x + r, m.y)
+        g.lineTo(m.x, m.y + r); g.lineTo(m.x - r, m.y)
+        g.closePath(); g.stroke()
+        if (d === 0) {
+          g.fillStyle = color
+          g.font = 'bold 13px system-ui'
+          const label = m.event_type === 'bounce'
+            ? `B ${m.in_out || ''}${m.disagree ? ' ⚠' : ''}`
+            : m.event_type === 'hit' ? 'H' : '·'
+          g.fillText(label, m.x + r + 4, m.y - 4)
+        }
+        if (m.id === stateRef.current.selectedMarkId) {
+          g.strokeStyle = 'rgba(255,255,255,0.95)'
+          g.lineWidth = 2
+          g.beginPath(); g.arc(m.x, m.y, r + 5, 0, Math.PI * 2); g.stroke()
+        }
+        g.globalAlpha = 1.0
+      }
+    }
+    // Pending (unsaved) mark: yellow crosshair where the user just clicked.
+    const pm = stateRef.current.pendingMark
+    if (pm) {
+      g.strokeStyle = 'rgba(255,221,64,0.95)'
+      g.lineWidth = 2
+      g.beginPath(); g.moveTo(pm.x - 14, pm.y); g.lineTo(pm.x + 14, pm.y); g.stroke()
+      g.beginPath(); g.moveTo(pm.x, pm.y - 14); g.lineTo(pm.x, pm.y + 14); g.stroke()
+      g.beginPath(); g.arc(pm.x, pm.y, 7, 0, Math.PI * 2); g.stroke()
     }
 
     // Players: pass2 has them every frame; pass1 only at sparse spot-checks,
@@ -207,7 +258,7 @@ const VideoPlayer = forwardRef(function VideoPlayer(
       g.globalAlpha = 1.0
     }
     // Reconstructed ball height above the court plane (Pass 2 only).
-    if (entry?.world && entry.world[2] != null && entry.ball) {
+    if (stateRef.current.showBall && entry?.world && entry.world[2] != null && entry.ball) {
       g.fillStyle = 'rgba(255,255,255,0.95)'
       g.font = 'bold 13px system-ui'
       g.fillText(`h ${entry.world[2].toFixed(2)}m`, entry.ball[0] + 14, entry.ball[1] + 16)
@@ -288,6 +339,12 @@ const VideoPlayer = forwardRef(function VideoPlayer(
              controlsList="nofullscreen" preload="metadata" />
       <canvas ref={canvasRef} onClick={handleClick} />
       <div className="vpbtns">
+        <button type="button" className="fsbtn" onClick={() => setShowBall((s) => !s)}
+                title={showBall ? 'Hide ball tracking (trail, bounce/hit markers, height)'
+                                : 'Show ball tracking (trail, bounce/hit markers, height)'}
+                style={showBall ? undefined : { opacity: 0.45 }}>
+          🎾
+        </button>
         <button type="button" className="fsbtn" onClick={() => setShowVideo((s) => !s)}
                 title={showVideo ? 'Hide the video — show only the overlay on black'
                                  : 'Show the video behind the overlay'}>

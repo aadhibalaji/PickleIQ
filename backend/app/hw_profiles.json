@@ -1,0 +1,18 @@
+{
+  "cuda": {
+    "_comment": "This machine: NVIDIA GPU via CUDA. No OpenVINO (Intel-only), fp16.",
+    "device": "cuda",
+    "precision": "fp16",
+    "openvino": false,
+    "tracknet": true,
+    "pass2_ball": true
+  },
+  "arc140v": {
+    "_comment": "Partner's machine: Intel Arc 140V. OpenVINO GPU path, fp16. Adjust pass2_ball/p1_scale/p1_frame_step once the partner benchmarks their own speed.",
+    "device": "xpu",
+    "precision": "fp16",
+    "openvino": true,
+    "tracknet": true,
+    "pass2_ball": false
+  }
+}

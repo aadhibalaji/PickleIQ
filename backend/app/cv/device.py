@@ -10,6 +10,7 @@ import functools
 import logging
 
 from ..config import CV_DEVICE
+from ..hw_profile import active_profile
 
 log = logging.getLogger("cv.device")
 
@@ -18,6 +19,9 @@ log = logging.getLogger("cv.device")
 def torch_device() -> str:
     import torch
 
+    profile = active_profile()
+    if profile and profile["device"]:
+        return profile["device"]
     if CV_DEVICE != "auto":
         return CV_DEVICE
     if getattr(torch, "xpu", None) is not None and torch.xpu.is_available():

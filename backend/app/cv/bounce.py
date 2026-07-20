@@ -65,10 +65,21 @@ def _median_filter(v: np.ndarray, k: int) -> np.ndarray:
     return np.array([np.median(padded[i:i + k]) for i in range(len(v))])
 
 
-def reconstruct_world(track: list[TrackPoint], cam: CameraModel) -> list[BallWorld]:
+def reconstruct_world(track: list[TrackPoint], cam: CameraModel,
+                      height_sigma_max: float | None = None) -> list[BallWorld]:
     """Per-frame world position/height. Diameter is the noisy input, so it is
     median-filtered across observed points and interpolated over bridged
-    gaps before the size->depth model is applied."""
+    gaps before the size->depth model is applied.
+
+    `height_sigma_max` (metres): when set, any point whose size->depth HEIGHT
+    uncertainty for a +-1 px diameter error exceeds it gets height=NaN and its
+    court position from the PLANE projection instead of the 3D estimate. On
+    the stored calibration the far-baseline ball is <5 px wide, where 1 px of
+    diameter error is ~2.9 m of depth (~2.85 m of court-y, ~0.57 m of height)
+    — far "heights" there are noise dressed as measurement, and the 3D court
+    position is far worse than the homography projection. Marking them NaN
+    makes downstream honest: the bounce heuristic skips NaN heights and the
+    phantom-out guard already requires height_known."""
     if not track:
         return []
     frames = np.array([p.frame for p in track])
@@ -87,12 +98,30 @@ def reconstruct_world(track: list[TrackPoint], cam: CameraModel) -> list[BallWor
     d[~obs_mask] = np.interp(frames[~obs_mask], frames[obs_mask], d[obs_mask])
 
     out: list[BallWorld] = []
+    unreliable: list[bool] = []
     for p, di in zip(track, d):
-        w = cam.ball_world_from_size(p.x, p.y, max(float(di), 1.0))
-        out.append(BallWorld(p.frame, float(w[0]), float(w[1]), float(w[2]), p.observed))
+        di = max(float(di), 1.0)
+        bad = (height_sigma_max is not None
+               and cam.height_sigma(p.x, p.y, di) > height_sigma_max)
+        if bad:
+            cxy = court.img_to_court(cam.H, np.array([[p.x, p.y]]))[0]
+            out.append(BallWorld(p.frame, float(cxy[0]), float(cxy[1]),
+                                 float("nan"), p.observed))
+        else:
+            w = cam.ball_world_from_size(p.x, p.y, di)
+            out.append(BallWorld(p.frame, float(w[0]), float(w[1]), float(w[2]),
+                                 p.observed))
+        unreliable.append(bad)
     # Smooth height — bounce detection reads local minima off this curve.
+    # NaN-aware so the sigma gate only blanks the points it flagged; a
+    # reliable point next to an unreliable one keeps its own (smoothed) value.
     h = np.array([b.height for b in out])
-    h = _median_filter(h, 5)
+    if len(h) >= 3:
+        pad = 2
+        padded = np.pad(h, pad, mode="edge")
+        h = np.array([float(np.nanmedian(padded[i:i + 5]))
+                      if not np.isnan(h[i]) else float("nan")
+                      for i in range(len(h))])
     for b, hv in zip(out, h):
         b.height = float(hv)
     return out
@@ -105,6 +134,8 @@ def detect_events(
     fps: float,
     model=None,
     entries: dict[int, dict] | None = None,
+    H: np.ndarray | None = None,
+    ball_px: dict[int, tuple[float, float]] | None = None,
 ) -> list[BallEvent]:
     """Find trajectory events and classify bounce vs hit.
 
@@ -114,6 +145,13 @@ def detect_events(
       reversal at height, or right at a player              -> hit
     A gravity sanity check rejects height 'minima' that are just size noise:
     around a real bounce the height curve must actually descend then ascend.
+
+    When `H` and `ball_px` (frame -> observed pixel) are provided, BOUNCE
+    court positions come from the plane homography instead of the size->depth
+    world estimate: a bounce is by definition ON the court plane, where the
+    homography is exact, while the 3D estimate carries metres of far-court
+    diameter noise. This is what makes far-court in/out calls usable. Hits
+    keep the world estimate (the ball is airborne, so neither is exact).
 
     If a trained rally_end model is supplied (with the per-frame `entries`
     trace), it decides WHICH frames are bounces/hits and their class; the WHERE
@@ -143,15 +181,28 @@ def detect_events(
             for px, py in pls
         )
 
+    def court_pos(i: int, kind: str) -> tuple[float, float]:
+        """Court position for the event at index i. Bounces are on the plane,
+        so the homography projection of the observed pixel is exact and beats
+        the size->depth world estimate (metres of far-court noise)."""
+        b = world[i]
+        if kind == "bounce" and H is not None and ball_px is not None:
+            px = ball_px.get(b.frame)
+            if px is not None:
+                cxy = court.img_to_court(H, np.array([[px[0], px[1]]]))[0]
+                return float(cxy[0]), float(cxy[1])
+        return b.court_x, b.court_y
+
     def add(i: int, kind: str, detail: dict) -> None:
         b = world[i]
         if events and b.frame - events[-1].frame < min_gap:
             return
+        cx, cy = court_pos(i, kind)
         events.append(BallEvent(
-            frame=b.frame, kind=kind, court_x=b.court_x, court_y=b.court_y,
+            frame=b.frame, kind=kind, court_x=cx, court_y=cy,
             height=b.height if not np.isnan(b.height) else -1.0,
-            in_court=bool(court.in_court(np.array([[b.court_x, b.court_y]]))[0]),
-            side=court.side_of_net(b.court_y), near_player=near_player(i),
+            in_court=bool(court.in_court(np.array([[cx, cy]]))[0]),
+            side=court.side_of_net(cy), near_player=near_player(i),
             observed=b.observed, height_known=not np.isnan(b.height),
             detail=detail,
         ))
@@ -170,15 +221,16 @@ def detect_events(
                     add(i, "hit", {"reason": "surface-level reversal at player"})
                 else:
                     b = world[i]
-                    ic = bool(court.in_court(np.array([[b.court_x, b.court_y]]))[0])
+                    cx, cy = court_pos(i, "bounce")
+                    ic = bool(court.in_court(np.array([[cx, cy]]))[0])
                     if not ic:
                         # Phantom-out guard (mirrors detect_end): an out-of-court
                         # bounce must be a REAL, height-known detection landing
                         # within out_max of a line. Otherwise it is tracking
                         # noise near a boundary and must not become a "bounce
                         # OUT" (which also stops fake events feeding pass logic).
-                        dx = max(0.0, -b.court_x, b.court_x - court.COURT_W)
-                        dy = max(0.0, -b.court_y, b.court_y - court.COURT_L)
+                        dx = max(0.0, -cx, cx - court.COURT_W)
+                        dy = max(0.0, -cy, cy - court.COURT_L)
                         if (not b.observed or np.isnan(b.height)
                                 or (dx * dx + dy * dy) ** 0.5 > out_max):
                             continue
@@ -302,3 +354,74 @@ def load_bounce_model(path: str | Path = ""):
     m.load_state_dict(torch.load(p, map_location="cpu"))
     m.eval()
     return m
+
+
+def _demo() -> None:
+    """Self-check for the height-uncertainty gate + bounce plane-projection:
+      1. reconstruct_world(height_sigma_max=...): a near-camera point (big
+         apparent diameter, low height uncertainty) keeps its 3D height; a
+         far-camera point (tiny diameter, high uncertainty) gets height=NaN
+         and a plane-projected court position instead of a noisy 3D one.
+      2. detect_events(H=..., ball_px=...): a bounce event's court position
+         comes from the homography plane projection of the observed pixel,
+         not the (possibly noisy) reconstructed world position.
+    """
+    import cv2
+
+    # Synthetic axial-camera homography: far baseline narrow near image top,
+    # near baseline wide near image bottom (typical down-the-court view).
+    img_pts = np.float32([[400, 200], [880, 200], [1180, 700], [100, 700]])
+    court_pts = np.float32([[0, 0], [court.COURT_W, 0],
+                            [court.COURT_W, court.COURT_L], [0, court.COURT_L]])
+    H, _ = cv2.findHomography(img_pts, court_pts)
+    cam = CameraModel.from_homography(H, 1280, 720)
+
+    # --- 1. height_sigma_max NaN gate ---------------------------------------
+    # Separate near/far tracks (not mixed) so the diameter median filter can't
+    # wash out the single differing sample — each track is internally uniform.
+    near_px, near_diam = (640, 650), 40.0   # big blob near the camera/near baseline
+    far_px, far_diam = (640, 210), 3.0      # tiny blob at the far baseline
+    near_track = [TrackPoint(i, near_px[0], near_px[1], 0.0, 0.0, True, near_diam)
+                  for i in range(3)]
+    far_track = [TrackPoint(i, far_px[0], far_px[1], 0.0, 0.0, True, far_diam)
+                 for i in range(3)]
+    near_world = reconstruct_world(near_track, cam, height_sigma_max=0.35)
+    far_world = reconstruct_world(far_track, cam, height_sigma_max=0.35)
+    assert not any(np.isnan(w.height) for w in near_world), \
+        "near, low-uncertainty point wrongly NaN'd"
+    assert all(np.isnan(w.height) for w in far_world), \
+        "far, high-uncertainty point was NOT flagged NaN"
+    # NaN'd point's court position must match the plane projection, not garbage.
+    plane_xy = court.img_to_court(cam.H, np.array([[far_px[0], far_px[1]]]))[0]
+    assert abs(far_world[0].court_x - plane_xy[0]) < 1e-6
+    assert abs(far_world[0].court_y - plane_xy[1]) < 1e-6
+
+    # --- 2. detect_events court_pos: bounce uses the plane, not noisy world -
+    fps = 30.0
+    n = 20
+    mid = n // 2
+    frames = list(range(n))
+    # A height curve that dips to ~0 at `mid` (a bounce candidate) away from
+    # any player, with the WORLD court position at that frame deliberately
+    # noisy/wrong so the test can tell whether court_pos() used it or not.
+    heights = [0.5 - 0.5 * (1 - abs(i - mid) / mid) for i in frames]
+    bogus_world = [
+        BallWorld(frame=i, court_x=999.0, court_y=999.0, height=heights[i], observed=True)
+        for i in frames
+    ]
+    ball_px = {i: (640.0, 450.0) for i in frames}  # a plausible in-court pixel
+    events = detect_events(bogus_world, {}, {}, fps, H=H, ball_px=ball_px)
+    bounces = [e for e in events if e.kind == "bounce"]
+    assert bounces, "expected at least one bounce candidate from the height dip"
+    exp_xy = court.img_to_court(H, np.array([[640.0, 450.0]]))[0]
+    b = bounces[0]
+    assert abs(b.court_x - exp_xy[0]) < 1e-6 and abs(b.court_y - exp_xy[1]) < 1e-6, \
+        "bounce court position did not come from the plane projection"
+    assert (b.court_x, b.court_y) != (999.0, 999.0), \
+        "bounce used the noisy world position instead of the plane"
+
+    print("bounce height-sigma + plane-projection demo OK")
+
+
+if __name__ == "__main__":
+    _demo()

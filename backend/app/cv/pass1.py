@@ -24,15 +24,18 @@ LearnedParams / train scripts).
 from __future__ import annotations
 
 import logging
+import time
 
 import cv2
 import numpy as np
 
-from .. import db
+from .. import db, storage_s3
+from ..config import STORAGE_BACKEND
 from ..jobs import JobCancelled, JobHandle
 from . import court
 from . import overlays
 from .ball_coarse import MotionBallDetector
+from .exclusions import in_excluded
 from .players import PoseTracker, is_serve_formation
 from .video_io import iter_frames, probe
 
@@ -77,6 +80,23 @@ def _match_fast(cands, prev_cands, step: int, smin: float, smax: float = 45.0):
         if smin <= sp <= smax and sp > best_sp:
             best_sp, best, best_prev = sp, c, p
     return best, best_prev
+
+
+def _upload_progress_incremental(video_id: str, progress: float, message: str) -> None:
+    """S3 mode only: live Pass 1 progress snapshot, mirrored by the local
+    UI-only container's poll-cloud-windows (see api/media.py,
+    pipeline.mirror_cloud_progress). Pass 1 has no per-window checkpoints
+    the way Pass 2 does, so this is a single object OVERWRITTEN each call
+    rather than one object per checkpoint — see storage_s3.upload_progress.
+    Never fails the pass: a transient S3 hiccup here must not cost a user
+    their Pass 1 run."""
+    try:
+        storage_s3.upload_progress(video_id, {
+            "video_id": video_id, "stage": "pass1", "status": "running",
+            "progress": progress, "message": message, "updated_at": time.time(),
+        })
+    except Exception:
+        log.exception("incremental pass1 progress S3 export failed for %s (non-fatal)", video_id)
 
 
 def run_pass1(video_id: str, params: dict, H, handle: JobHandle,
@@ -137,6 +157,25 @@ def run_pass1(video_id: str, params: dict, H, handle: JobHandle,
     # param: it used to be hard-floored at 2.0 s, which prevented learning a
     # shorter window to stop adjacent rallies bridging into one candidate.
     cross_window_n = int(params["p1_cross_window_s"] * fps)
+    # Gap-tolerant net-crossing: buffer recent validated-ball net SIDES and flag a
+    # crossing when the ball changes side vs a recent observation, even across
+    # frames where the ball wasn't matched. The old rule required the two
+    # straddling frames to be CONSECUTIVELY matched, which detection gaps broke —
+    # the ball was seen on both sides yet no crossing registered, so short rallies
+    # were missed and the true last crossing (rally end) slipped through.
+    # Wide enough to bridge detection gaps across real crossings (so long rallies,
+    # whose crossings are spaced out, and short rallies are both caught — this is
+    # the recall lever). The END is protected separately: close_rally trims
+    # trailing crossings isolated from the rally's rhythm, so a between-point flip
+    # kept-open by this wide gate can't drag the end out (the decoupling).
+    cross_gap_n = int(params.get("p1_cross_max_gap_s", 1.0) * fps)
+    # Ignore court-Y jitter right at the net line (projection noise makes a ball
+    # near the net flicker sides): a side is only CLEAR beyond this margin.
+    net_margin = float(params.get("p1_net_margin_m", 0.5))
+    prev_side = 0                 # ball's last clear net side: +1 near, -1 far
+    prev_side_frame = -10**9
+    cross_frames: list[int] = []                  # crossing frames (solid-end calc)
+    cross_cluster_n = int(params.get("p1_cross_cluster_gap_s", 2.0) * fps)
     rallies: list[tuple[int, int]] = []
     entries: list[dict] = []
     flushed_chunk = -1
@@ -155,13 +194,21 @@ def run_pass1(video_id: str, params: dict, H, handle: JobHandle,
             return
         # TIGHT end: a point ends just after the last shot crosses the net (the
         # ball's short flight-to-land = end_settle), NOT when the net-crossing
-        # hysteresis finally lapses — that flip is ~p1_cross_window_s + p1_off_s
-        # (~4 s) later and lands the end well past the real one. `last_cross`
-        # holds the last crossing of the rally now closing. Fall back to the raw
-        # flip when no crossing was tracked (uncalibrated / motion-only gate).
-        if last_cross >= start_f:
-            end_tight = min(end_f, last_cross + end_settle)
-            end_src = "last_cross"
+        # hysteresis finally lapses (~4 s later). But the wide gap-tolerant gate
+        # can keep the window open on a between-point flip; using the raw last
+        # crossing would then land the end well past the real one. So take the
+        # last crossing of the rally's SUSTAINED rhythm: walk back over this
+        # window's crossings, trimming any trailing crossing separated from its
+        # predecessor by more than cross_cluster_gap (an isolated dead-time flip).
+        cw = [c for c in cross_frames if start_f <= c <= end_f]
+        end_cross = None
+        if cw:
+            i = len(cw) - 1
+            while i > 0 and cw[i] - cw[i - 1] > cross_cluster_n:
+                i -= 1
+            end_cross = cw[i]
+            end_tight = min(end_f, end_cross + end_settle)
+            end_src = "solid_cross" if i == len(cw) - 1 else "trimmed_cross"
         else:
             end_tight = end_f
             end_src = "hysteresis"
@@ -171,7 +218,8 @@ def run_pass1(video_id: str, params: dict, H, handle: JobHandle,
         s = max(0, start_f - pad)
         e = min(last_frame, max(end_tight, s + 1))
         meta_json = db.dumps({"end_source": end_src, "raw_end": int(end_f),
-                              "last_cross": int(last_cross) if end_src == "last_cross" else None})
+                              "end_cross": int(end_cross) if end_cross is not None else None,
+                              "raw_last_cross": int(cw[-1]) if cw else None})
         if last_row is not None and s <= last_row["end"] + merge_gap:
             new_e = max(e, last_row["end"])
             if new_e != last_row["end"]:
@@ -211,18 +259,34 @@ def run_pass1(video_id: str, params: dict, H, handle: JobHandle,
         if roi is not None:
             cands = [c for c in cands
                      if roi[min(int(c.y), roi.shape[0] - 1), min(int(c.x), roi.shape[1] - 1)] > 0]
-        fast, fast_prev = _match_fast(cands, prev_cands, step, speed_min)
+        else:
+            # No court mask (homography unknown): fall back to the fixed-camera
+            # exclusion zones so background/fence-line motion in the red corner
+            # triangles can't drive the ball gate (see cv/exclusions.py).
+            fh, fw = frame.shape[:2]
+            cands = [c for c in cands if not in_excluded(c.x, c.y, fw, fh)]
+        fast, _ = _match_fast(cands, prev_cands, step, speed_min)
         prev_cands = cands
         crossed = False
         if fast is not None:
             last_ball_frame = f
-            if Hs is not None and fast_prev is not None:
-                cys = court.img_to_court(Hs, np.array(
-                    [[fast.x, fast.y], [fast_prev.x, fast_prev.y]]))[:, 1]
-                # The live-play signature: the fast blob crossed the net line.
-                if (cys[0] - court.NET_Y) * (cys[1] - court.NET_Y) < 0:
-                    crossed = True
-                    last_cross = f
+            if Hs is not None:
+                cy_now = court.img_to_court(Hs, np.array([[fast.x, fast.y]]))[0][1]
+                side_now = (1 if cy_now > court.NET_Y + net_margin
+                            else (-1 if cy_now < court.NET_Y - net_margin else 0))
+                if side_now != 0:
+                    # ONE crossing per genuine side change from the last clear
+                    # observation, across a detection gap up to cross_gap_n. (The
+                    # old rule needed two CONSECUTIVELY matched frames to straddle,
+                    # which gaps broke -> missed rallies + slipped ends. Tracking a
+                    # single current side — not a buffer of all recent sides — fires
+                    # once per transition instead of every frame both sides are seen.)
+                    if (prev_side != 0 and side_now != prev_side
+                            and (f - prev_side_frame) <= cross_gap_n):
+                        crossed = True
+                        last_cross = f
+                        cross_frames.append(f)
+                    prev_side, prev_side_frame = side_now, f
 
         entry: dict = {"f": f, "me": round(motion, 2)}
         if fast is not None:
@@ -292,8 +356,11 @@ def run_pass1(video_id: str, params: dict, H, handle: JobHandle,
             flushed_chunk = ci - 1
             # update() also raises if cancelled — a long Pass 1 yields the
             # worker promptly so shorter queued jobs can run.
-            handle.update(progress=f / max(meta.frame_count, 1),
-                          message=f"Pass 1: {len(rallies)} rallies so far")
+            progress = f / max(meta.frame_count, 1)
+            message = f"Pass 1: {len(rallies)} rallies so far"
+            handle.update(progress=progress, message=message)
+            if STORAGE_BACKEND == "s3":
+                _upload_progress_incremental(video_id, progress, message)
 
     if active and rally_start is not None:
         close_rally(rally_start, meta.frame_count - 1)

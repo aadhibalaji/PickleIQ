@@ -6,13 +6,15 @@ clip, not just the one that triggered it.
 Two modes:
 
   * analytic (offset changes) — boundary offsets are pure post-processing on
-    the raw Pass 2 boundaries stored in each rally's meta (raw_start/raw_end/
-    ws/we). A candidate offset is re-scored across all labeled clips in a few
-    milliseconds, no CV. This gates the autonomous auto-apply of offsets.
+    stored AI boundaries (Pass 1 today; meta raw_start/raw_end/ws/we when
+    present, else the committed start/end). A candidate offset is re-scored
+    across all labeled clips in a few milliseconds, no CV. This gates the
+    autonomous auto-apply of offsets.
 
-  * full re-run (gate / structural changes) — re-runs Pass 1 + Pass 2 with the
-    candidate params on each labeled clip into scratch sources, then compares.
-    Expensive; used only on the human-approval path.
+  * full re-run (gate / structural changes) — re-runs Pass 1 (+ Pass 2 overlay)
+    with the candidate params on each labeled clip into scratch sources, then
+    compares Pass 1_eval boundaries. Expensive; used only on the human-approval
+    path.
 
 The metric pools matched pairs across ALL clips (not an average of per-clip
 averages, which would over-weight clips with few rallies): mean absolute
@@ -24,7 +26,6 @@ import numpy as np
 
 from .. import db
 from ..analysis.metrics import Rally, compare
-from ..cv.pass2 import DETECTION_CODE_VERSION
 
 # A change must not worsen a non-targeted metric by more than this to pass.
 _EPS_FRAMES = 0.5
@@ -80,7 +81,8 @@ def _score(human: list[Rally], ai: list[Rally], fps: float) -> dict:
 # --------------------------------------------------------------- analytic ---
 def _apply_offsets(ai_raw, start_off: int, end_off: int) -> list[Rally]:
     """Recompute each rally's final boundary from its stored raw boundary and a
-    candidate offset — mirrors pass2.py: final = clip(raw + off, ws, we)."""
+    candidate offset — final = clip(raw + off, ws, we). Missing meta falls back
+    to the committed start/end as both raw and window (Pass 1 path)."""
     out = []
     for (cur_s, cur_e, meta) in ai_raw:
         rs, re = meta.get("raw_start"), meta.get("raw_end")
@@ -93,27 +95,17 @@ def _apply_offsets(ai_raw, start_off: int, end_off: int) -> list[Rally]:
     return out
 
 
-def _analytic_stale(ai_raw) -> bool:
-    """True if any stored boundary predates the current detection code (its raw
-    boundary can't be trusted for analytic re-eval — the clip needs a reprocess)."""
-    return any(m.get("code_version") != DETECTION_CODE_VERSION or m.get("raw_start") is None
-               for (_, _, m) in ai_raw)
-
-
 def analytic_metrics(start_off: int, end_off: int,
-                     video_ids: list[str] | None = None, ai_source: str = "pass2") -> dict:
+                     video_ids: list[str] | None = None, ai_source: str = "pass1") -> dict:
     video_ids = video_ids if video_ids is not None else labeled_video_ids()
-    per_clip, stale = [], []
+    per_clip = []
     for vid in video_ids:
         human, ai_raw, fps = _load(vid, ai_source)
         if not human or not ai_raw:
             continue
-        if _analytic_stale(ai_raw):
-            stale.append(vid)
-            continue
         per_clip.append(_score(human, _apply_offsets(ai_raw, start_off, end_off), fps))
     out = _pool(per_clip)
-    out["stale"] = stale
+    out["stale"] = []
     return out
 
 
@@ -192,7 +184,8 @@ def full_rerun_metrics(candidate_params: dict,
             run_pass1(vid, candidate_params, H, _SilentHandle(), source="pass1_eval")
             run_pass2(vid, candidate_params, H, cam, _SilentHandle(),
                       source="pass2_eval", p1_source="pass1_eval")
-            human, ai_raw, fps = _load(vid, "pass2_eval")
+            # Pass 1 is the sole boundary source; Pass 2 writes overlays only.
+            human, ai_raw, fps = _load(vid, "pass1_eval")
             if human:
                 per_clip.append(_score(human, [Rally(s, e, "", m) for (s, e, m) in ai_raw], fps))
         finally:
@@ -200,7 +193,7 @@ def full_rerun_metrics(candidate_params: dict,
     return _pool(per_clip)
 
 
-def existing_metrics(video_ids: list[str] | None = None, ai_source: str = "pass2") -> dict:
+def existing_metrics(video_ids: list[str] | None = None, ai_source: str = "pass1") -> dict:
     """Score the currently-committed labels as-is (the 'before' for a gate change,
     since they were produced by the current params)."""
     video_ids = video_ids if video_ids is not None else labeled_video_ids()

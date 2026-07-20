@@ -23,7 +23,7 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Callable
 
-from . import db
+from . import db, self_stop
 
 log = logging.getLogger("jobs")
 
@@ -146,6 +146,20 @@ class JobRunner:
                 (status, message, db.now(), job_id),
             )
 
+    def _has_pending_work(self) -> bool:
+        """DB-backed, independent of self._q's own in-memory state. submit()
+        writes the jobs row (status='queued') BEFORE putting the Job onto
+        self._q — correct today, but it means self._q.empty() alone is not
+        a sufficient "nothing left to run" guarantee: it's trusting that no
+        code path ever inserts a row without also enqueuing it, forever.
+        Querying the jobs table directly checks the durable, authoritative
+        record instead of that invariant holding by convention — see
+        _loop's self-stop gate below for why this matters."""
+        with db.connect() as con:
+            row = con.execute(
+                "SELECT 1 FROM jobs WHERE status IN ('queued','running') LIMIT 1").fetchone()
+        return row is not None
+
     def _loop(self) -> None:
         while True:
             job = self._q.get()
@@ -166,6 +180,18 @@ class JobRunner:
             finally:
                 with self._lock:
                     self._jobs.pop(job.id, None)
+
+            # Chained Pass1/Pass2/contacts steps for one video all run
+            # INSIDE job.fn() above (each stage's own function body calls
+            # runner.submit() for the next stage before returning — see
+            # pipeline.py's do_pass1/_build_do_pass2), so in the designed
+            # case this only ever fires between distinct queue entries,
+            # never mid-chain. self._q.empty() is checked first as a cheap
+            # short-circuit (skips the DB query on every ordinary busy
+            # tick); _has_pending_work() is the actual authority — see its
+            # docstring for why the two can't be assumed to always agree.
+            if self._q.empty() and not self._has_pending_work():
+                self_stop.stop_this_instance()
 
 
 runner = JobRunner()
