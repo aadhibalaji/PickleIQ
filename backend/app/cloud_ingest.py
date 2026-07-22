@@ -25,9 +25,12 @@ import re
 import threading
 import time
 
+import yaml
+
 from . import db, pipeline, storage_s3
-from .config import S3_VIDEO_BUCKET
+from .config import DATA_DIR, S3_VIDEO_BUCKET
 from .cv.video_io import probe
+from .refine.config import override_path
 
 log = logging.getLogger("cloud_ingest")
 
@@ -115,8 +118,53 @@ def _sync_calibration() -> None:
     log.info("cloud ingest: synced global calibration %s from S3", cal["id"])
 
 
+def _sync_tracknet_weights() -> None:
+    """Mirrors a fine-tuned TrackNet checkpoint from S3 into this instance's
+    own data/models/tracknet_v2.pt — same reasoning as _sync_calibration:
+    the weights are produced/placed on a dev machine
+    (scripts/upload_tracknet_weights.py), not through this worker, so
+    without this it would never pick them up. Cheap no-op once the local
+    file matches (size check, same as download_to_scratch's dedup); only
+    engages ball_tracknet.weights_path() if TRACKNET_ENABLED is also set —
+    this just makes sure the file is THERE when it is."""
+    try:
+        got = storage_s3.download_tracknet_weights(DATA_DIR / "models" / "tracknet_v2.pt")
+    except Exception:
+        log.exception("cloud ingest: tracknet weights S3 fetch failed (non-fatal, retrying next tick)")
+        return
+    if got:
+        log.info("cloud ingest: synced TrackNet weights from S3")
+
+
+def _sync_refine_config() -> None:
+    """Mirrors the applied refine config.override.yaml (serve_gate_min etc.,
+    see api/annotate.py's write_refine_override) from S3 into this instance's
+    own data/refine/config.override.yaml — same reasoning as _sync_calibration:
+    normally applied through a separate RUN_PROCESSING=0 UI-only container.
+    refine.config.load_config re-reads this file on every Pass 2/refine call
+    (see pipeline.py), so no restart is needed once it lands here — just a
+    poll tick. Content-compared (no natural version/id here) so this is a
+    no-op once the local file already matches."""
+    try:
+        remote = storage_s3.download_refine_config()
+    except Exception:
+        log.exception("cloud ingest: refine config S3 fetch failed (non-fatal, retrying next tick)")
+        return
+    if remote is None:
+        return
+    path = override_path()
+    current = yaml.safe_load(path.read_text()) if path.exists() else None
+    if current == remote:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(yaml.safe_dump(remote, sort_keys=False))
+    log.info("cloud ingest: synced refine config override from S3: %s", remote)
+
+
 def _tick() -> None:
     _sync_calibration()
+    _sync_tracknet_weights()
+    _sync_refine_config()
     try:
         keys = storage_s3.list_video_keys()
     except Exception:

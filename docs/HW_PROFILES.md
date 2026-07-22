@@ -35,6 +35,24 @@ Current profiles:
 | `cuda` | this machine (NVIDIA) | `cuda` | `fp16` | off | on | on |
 | `arc140v` | partner's machine (Intel Arc 140V) | `xpu` | `fp16` | on | on | off |
 
+**Note (2026-07-21):** the `cuda` row above has said `tracknet: on` since this
+file was written, but `HW_PROFILE` is not actually set in the EC2 worker's
+deployed env (`scripts/restart-ec2.sh`) — so this row was never the thing
+actually turning TrackNet on there; `TRACKNET_ENABLED` stayed at its
+env-unset default of `False` (see Precedence rules below) until fine-tuned
+weights existed to make enabling it worthwhile. `restart-ec2.sh` now sets
+`TRACKNET_ENABLED=1` directly instead of adopting this profile — simpler
+given the script already sets `CV_DEVICE`/`PASS2_BALL` the same explicit way,
+and `HW_PROFILE=cuda` would also silently pull in `precision`/`openvino`
+overrides this deployment hasn't evaluated. See `PASS1_PASS2_SPEC.md`'s
+"Arc-fit noise filter" / ball-observation section for why this now matters
+and the new S3 sync path for the weights file
+(`storage_s3.upload_tracknet_weights` / `cloud_ingest._sync_tracknet_weights`,
+mirroring how calibration syncs — see those two functions' docstrings, the
+closest thing to written documentation of that mechanism right now; a
+top-level AWS/deploy doc describing the hybrid S3 architecture doesn't
+currently exist in this repo despite being referenced elsewhere).
+
 ## Adding a new profile
 
 Edit `backend/app/hw_profiles.json`, add a block:

@@ -8,6 +8,12 @@
 # S3 for new uploads and runs Pass 1/2 locally on this box). --gpus all for
 # real CUDA, PASS2_BALL=1 to enable ball detection/tracking in Pass 2.
 #
+# TRACKNET_ENABLED=1: a fine-tuned checkpoint for this camera setup now syncs
+# from S3 the same way calibration does — cloud_ingest._sync_tracknet_weights
+# downloads it to $DATA_DIR/models/tracknet_v2.pt on the regular poll tick, no
+# TRACKNET_WEIGHTS override needed (that IS ball_tracknet.py's default path).
+# Upload a new/updated checkpoint with scripts/upload_tracknet_weights.py.
+#
 # DATA_DIR is bind-mounted to a path on this instance's root EBS volume (NOT
 # /tmp or any instance-store-backed path) specifically so it survives both
 # `docker rm`+recreate AND a full instance stop/start — this instance's own
@@ -50,6 +56,7 @@ sudo docker run -d --restart unless-stopped --gpus all -p "$PORT:8420" \
   -e AWS_REGION="$REGION" \
   -e CV_DEVICE=cuda \
   -e PASS2_BALL=1 \
+  -e TRACKNET_ENABLED=1 \
   -v "$DATA_DIR:/app/data" \
   --name "$CONTAINER_NAME" \
   "$IMAGE"

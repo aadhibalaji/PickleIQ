@@ -492,9 +492,20 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                     claim_tol_mult=float(params.get("ball_arc_claim_tol_mult", 2.5)),
                     max_interp_gap=int(params.get("ball_arc_max_interp_gap", 6)))
                 kept = {p.frame for p in refined.points}
-                for bf, _, _, _ in ball_obs:      # picks the fits rejected
-                    if bf not in kept and bf in entries:
-                        entries[bf].pop("ball", None)
+                # Only prune points AGAINST a fitted arc — with zero arcs in
+                # this window (too few/sparse real detections ever cluster
+                # into ball_arc_min_pts within ball_arc_gap_frames, common for
+                # the far-baseline ball) there is no trajectory to judge
+                # "off-arc" against, so every already-picked per-frame
+                # detection would otherwise get wiped here, turning a sparse-
+                # but-real ball track into a silent, indistinguishable-from-
+                # never-detected blank for the whole window (verified: an
+                # EC2 clip with 13-50 raw candidates/window and 0 arcs in
+                # EVERY window ended up with 0/7413 overlay ball entries).
+                if refined.arcs:
+                    for bf, _, _, _ in ball_obs:      # picks the fits rejected
+                        if bf not in kept and bf in entries:
+                            entries[bf].pop("ball", None)
                 for p in refined.interpolated:    # fit-filled misses
                     e = entries.get(p.frame)
                     if e is not None:

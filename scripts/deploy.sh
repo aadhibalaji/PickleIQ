@@ -1,0 +1,72 @@
+#!/bin/bash
+# Run this from the repo root any time you've changed backend/ code and want
+# it live on both the local (UI-only) container and the EC2 GPU worker.
+#
+# What bit us once already, both baked in here so it can't happen again:
+#   1. `docker build` with no -t just makes an orphaned, unpushed image —
+#      always build straight into the final tag.
+#   2. This repo is developed on Apple Silicon (arm64) but EC2 + the CUDA
+#      base image are amd64-only — a plain `docker build` defaults to the
+#      HOST platform and produces an image that silently never runs anywhere
+#      real. Always pass --platform linux/amd64 explicitly.
+# Verification at the end is generic (compares the image ID actually running
+# in each container against the ID we just pushed) rather than grepping for
+# any specific fix, so it stays useful for whatever you changed this time.
+set -euo pipefail
+
+IMAGE="051404302327.dkr.ecr.us-east-2.amazonaws.com/picklecv-pipeline:latest"
+REGION="us-east-2"
+INSTANCE_ID="i-0daa6a28d07139de9"   # pickleCvEC2
+SSH_KEY="$HOME/.ssh/picklecv/picklecv-key.pem"
+SSH_USER="ubuntu"
+
+cd "$(dirname "$0")/.."
+
+echo "==> logging in to ECR"
+aws ecr get-login-password --region "$REGION" \
+  | docker login --username AWS --password-stdin "${IMAGE%%/*}"
+
+echo "==> building (linux/amd64 — host is likely arm64, EC2/CUDA is not)"
+docker build --platform linux/amd64 -t "$IMAGE" .
+NEW_ID="$(docker image inspect "$IMAGE" --format '{{.Id}}')"
+echo "    built $NEW_ID"
+
+echo "==> pushing"
+docker push "$IMAGE"
+
+echo "==> restarting local container"
+./scripts/restart-local.sh
+LOCAL_ID="$(docker inspect picklecv-local --format '{{.Image}}')"
+if [ "$LOCAL_ID" != "$NEW_ID" ]; then
+  echo "!! local container is running $LOCAL_ID, expected $NEW_ID — restart-local.sh may have failed" >&2
+  exit 1
+fi
+echo "    OK — picklecv-local is on the image we just pushed"
+
+echo "==> ensuring EC2 instance is running"
+STATE="$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" \
+  --query 'Reservations[0].Instances[0].State.Name' --output text)"
+if [ "$STATE" != "running" ]; then
+  echo "    instance is '$STATE' — starting it"
+  aws ec2 start-instances --instance-ids "$INSTANCE_ID" --region "$REGION" > /dev/null
+  aws ec2 wait instance-running --instance-ids "$INSTANCE_ID" --region "$REGION"
+  # wait a bit more for sshd, not just the EC2 API's notion of "running"
+  sleep 20
+fi
+IP="$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" \
+  --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)"
+echo "    instance at $IP"
+
+echo "==> restarting EC2 worker container"
+scp -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
+  scripts/restart-ec2.sh "$SSH_USER@$IP:/tmp/restart-ec2.sh"
+ssh -i "$SSH_KEY" "$SSH_USER@$IP" "bash /tmp/restart-ec2.sh"
+
+WORKER_ID="$(ssh -i "$SSH_KEY" "$SSH_USER@$IP" "docker inspect picklecv-worker --format '{{.Image}}'")"
+if [ "$WORKER_ID" != "$NEW_ID" ]; then
+  echo "!! picklecv-worker is running $WORKER_ID, expected $NEW_ID — restart-ec2.sh may have failed" >&2
+  exit 1
+fi
+echo "    OK — picklecv-worker is on the image we just pushed"
+
+echo "==> done. Both containers confirmed running $NEW_ID"

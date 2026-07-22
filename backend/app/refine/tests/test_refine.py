@@ -1,9 +1,11 @@
 """Orchestrator behaviour: splits, end snap, output contract (spec 4-6)."""
 from __future__ import annotations
 
+import numpy as np
+
 from ..classifiers import RulesClassifier
 from ..config import RefineConfig
-from ..io_loaders import Pass1Window
+from ..io_loaders import Pass1Window, TrackingData
 from ..refine import refine_window
 from .synth import FPS, serve_rally_scene, toss_scene, two_rally_scene
 
@@ -75,4 +77,32 @@ def test_rejected_window_carries_reason():
     for r in dbg.records:
         assert r["verdict"] == "rejected"
         assert r["rejection_reason"] in (
-            "no_serve", "low_live_ratio", "too_short")
+            "no_serve", "low_live_ratio", "too_short", "no_tracking_data")
+
+
+def _uncovered(duration_s: float, fps: float = FPS) -> TrackingData:
+    """Pass 1 window with NO matching pass2 overlay at all (present=False
+    throughout) — e.g. Pass 2 was interrupted, or Pass 1 was rerun without a
+    matching Pass 2 pass. Distinct from `synth.blank()`, which is genuinely
+    tracked-but-empty (present=True)."""
+    n = int(round(duration_s * fps))
+    return TrackingData(
+        fps=fps, f0=0, present=np.zeros(n, bool),
+        ball_xy=np.full((n, 2), np.nan), ball_conf=np.zeros(n),
+        ball_interp=np.zeros(n, bool), ball_height=np.full(n, np.nan),
+        players={}, pspeed=np.zeros(n), bounce=np.zeros(n, bool),
+        hit=np.zeros(n, bool), evt_xy=np.full((n, 2), np.nan),
+        video_id="synthetic",
+    )
+
+
+def test_uncovered_window_flagged_not_scored_as_dead():
+    """Windows with no real tracking data must not be silently scored as a
+    fixed, content-independent P(live) indistinguishable from dead play —
+    they should be called out with their own rejection reason instead."""
+    for duration_s in (7.6, 2.7, 6.9):
+        td = _uncovered(duration_s)
+        w = Pass1Window("w-uncovered", 0, td.n - 1)
+        dbg = refine_window(w, td, CFG, RulesClassifier(CFG))
+        assert len(dbg.records) == 1
+        assert dbg.records[0]["rejection_reason"] == "no_tracking_data"

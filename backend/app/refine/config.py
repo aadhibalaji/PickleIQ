@@ -48,6 +48,14 @@ class RefineConfig:
     visible_window_s: float = 1.0   # frac_visible_last_1s
     cross_max_gap_s: float = 1.2    # max invisible gap across which a side flip counts
     crossings_window_s: float = 3.0
+    # Below this fraction of the Pass 1 window with a real pass2 overlay entry
+    # (`TrackingData.present`), Stage A's features are mostly/entirely the
+    # empty-span defaults (no ball, no players) rather than genuine "dead
+    # play" evidence — e.g. Pass 2 was interrupted/never reprocessed after a
+    # later Pass 1 rerun. Shared with train.py's identical guard so a stale
+    # window is never taught as a live/dead label NOR silently scored as
+    # confidently dead at serve time (see refine.py :: refine_window).
+    min_tracking_coverage: float = 0.5
     court_margin_m: float = 0.5     # ball_in_court margin
     near_player_m: float = 1.2      # "ball near player" radius (court metres)
     deadzone_m: float = 1.2         # disappearance within this of a player => near them

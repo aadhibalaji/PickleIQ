@@ -143,11 +143,55 @@ Stage C (`refine/postprocess.py`) turns P(live) into segments:
 
 Then per segment, accept gates — ANY failure ⇒ record `verdict="rejected"` with
 a reason:
+- **Before any of the above:** if the pass2 overlay covers `< min_tracking_coverage
+  =0.5` of the window's own frame range (`TrackingData.present`, checked over
+  `[window.start_frame, window.end_frame]`, not the ± margin) ⇒ reject
+  `no_tracking_data` — see §2.1b below. Stage B/C never run in this case.
 - No segments at all ⇒ reject `low_live_ratio` (if `max P < enter_thresh`) else
   `too_short`.
 - `mean_p_live < mean_p_live_min=0.25` ⇒ reject `low_live_ratio`.
 - `serve_gate_score < serve_gate_min=0.25` ⇒ reject `no_serve`.
 - refined duration `< min_rally_s=3.0 s (raised from 2.5 s, 2026-07-14)` after snapping ⇒ reject `too_short`.
+
+### 2.1b `no_tracking_data` — missing pass2 overlay, not dead play (2026-07-20)
+**Note (2026-07-20, after live verification on EC2):** this section covers a
+real but *secondary* failure mode (Pass 2 never ran for a window at all). The
+originally-reported "identical `p_live_max` across rallies of very different
+length" bug turned out to have a different, more direct root cause: Pass 2
+*did* run and had `td.present=1.0` throughout, but its ball detections were
+silently wiped by an over-eager noise filter — see
+`PASS1_PASS2_SPEC.md`'s "Arc-fit noise filter" note (`ball_filter.refine_track`
+/ `pass2.py`, fixed the same day). Both are real, independent bugs; this
+section's fix (and `min_tracking_coverage`) still stands on its own for the
+"Pass 2 truly never reached these frames" case reproduced locally.
+
+**Root-cause finding.** When a Pass 1 window has no matching pass2 overlay at
+all for its frame range (Pass 2 never reached those frames — interrupted job,
+or Pass 1 rerun without a matching Pass 2 pass), `io_loaders.load_tracking`
+returns a `TrackingData` where every array is the empty default: `ball_xy`
+all-NaN, `players={}`, `pspeed=0`. Every Stage A feature then collapses to
+its no-data constant (e.g. `cross_recency` decays to a fixed floor,
+`ball_in_court`/`mean_pspeed_n`/`ready_frac`/`facing_away_retreat` all read
+`0`), so the rules classifier emits the exact same `P(live)` at every
+timestep — **bit-for-bit identical regardless of the window's actual
+length or content**, because there is no per-timestep signal left to vary.
+Stage C then reports `low_live_ratio` (`max P < enter_thresh`), which reads
+identically to "real tracking data confirmed this was dead" even though no
+tracking was ever attempted. Confirmed on real DB data: two videos with a
+partially-interrupted pass2 rerun showed every window past the last
+processed frame collapsing to one identical `p_live_max`, while windows with
+real (even sparse) tracking data varied normally — `TrackingData.present` is
+strictly binary (`1.0`/`0.0`) per window in practice, no partial-coverage
+middle ground observed.
+- **Fix.** `refine_window` (`refine.py`) now checks `td.present` coverage over
+  the window's own frame span *before* running Stage B/C at all; below
+  `min_tracking_coverage` it rejects with the distinct `no_tracking_data`
+  reason instead of falling through to `low_live_ratio`, so a missing-data run
+  is never silently indistinguishable from a confidently-dead one. The 0.5
+  threshold and its rationale are shared (`RefineConfig.min_tracking_coverage`)
+  with `train.py`'s pre-existing identical guard on the training side
+  (`build_clip_dataset`, added earlier — "stale overlays... don't teach the
+  model that"), which had no equivalent at serve time until now.
 
 A single Pass 1 window can **split** into several rally records (one per
 surviving segment) — this un-does Pass 1's under-segmentation/merging.
@@ -251,6 +295,7 @@ more to the genuine last ball event + 1 s (or holds when they agree).
 `{pass1_window_id, pass1_start/end(_frame), verdict, rejection_reason,
 refined_start/end(_frame), confidence{mean_p_live, serve_gate_score,
 net_crossings_per_10s}, splits[]}` → `data/refine/<video_id>.json`.
+`rejection_reason` ∈ `no_tracking_data | low_live_ratio | no_serve | too_short`.
 
 ---
 
@@ -267,7 +312,8 @@ currently JSON-only, not yet promoted to `rally_labels`.
 ## Key files & symbols
 - `backend/app/cv/pass1.py` — `run_pass1`, `close_rally`, `_match_fast`, `_court_mask`
 - `backend/app/cv/pass2.py` — Pass 2 detection/overlay (no boundaries)
-- `backend/app/refine/refine.py` — `refine_window`, `refine_video`, `run_refine_json`
+- `backend/app/refine/refine.py` — `refine_window` (incl. the `no_tracking_data`
+  coverage gate, §2.1b), `refine_video`, `run_refine_json`
 - `backend/app/refine/classifiers.py` — `RulesClassifier`, `XGBoostClassifier` (P(live))
 - `backend/app/refine/postprocess.py` — Stage C (`hysteresis`, `live_ratio_filter`, segments)
 - `backend/app/refine/serve_gate.py` — `score_serve`, `snap_end`
@@ -309,4 +355,24 @@ currently JSON-only, not yet promoted to `rally_labels`.
   brief-glance cases) and an end-to-end smoke run of `refine_video` on real
   Pass 1/2 data.
 
-**Last verified against code: 2026-07-14.**
+- 2026-07-20 — Added `no_tracking_data` (§2.1b): a Pass 1 window with no
+  matching pass2 overlay (interrupted job, or Pass 1 rerun without a matching
+  Pass 2 pass) was falling through Stage A/B/C as a fixed, content-independent
+  `P(live)` indistinguishable from a confidently-scored dead window
+  (`low_live_ratio`) — reported bug was identical `p_live_max` across rallies
+  of very different length/content. `refine_window` now checks
+  `TrackingData.present` coverage over the window's own frame span before
+  running the classifier at all, mirroring `train.py`'s pre-existing
+  training-side guard (`min_tracking_coverage`, now shared via
+  `RefineConfig`). Verified against real DB data (two videos with a
+  partially-interrupted pass2 rerun) and a new `test_refine.py` case; 33/33
+  refine unit tests passing.
+- 2026-07-20 (same-day follow-up, after live EC2 verification) — Found the
+  actual root cause of the reported bug: not `no_tracking_data` above, but
+  `pass2.py`'s arc-fit noise filter wiping every real ball detection in a
+  window whenever it fit zero arcs (see `PASS1_PASS2_SPEC.md`). Fixed there;
+  no refine-module code changed for this one, but it's the reason
+  `net_crossings_per_10s` was `0.0` and `p_live_max` capped at an identical
+  ceiling across every window of the affected clip.
+
+**Last verified against code: 2026-07-20.**

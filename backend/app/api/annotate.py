@@ -296,6 +296,16 @@ def write_refine_override(body: RefineOverrideIn):
         current = yaml.safe_load(path.read_text()) or {}
     current.update(updates)
     path.write_text(yaml.safe_dump(current, sort_keys=False))
+    if STORAGE_BACKEND == "s3":
+        # Mirrors this override to S3 so the separate EC2 worker instance
+        # (which never sees this container's local filesystem directly)
+        # picks it up on its next cloud_ingest poll — see
+        # cloud_ingest._sync_refine_config. Without this, Apply silently only
+        # ever affected whichever container happened to serve the request.
+        try:
+            storage_s3.upload_refine_config(current)
+        except Exception:
+            log.exception("failed to sync refine config override to S3 (non-fatal)")
     return {"written": updates, "path": str(path),
             "note": "reprocess Pass 2 to apply"}
 

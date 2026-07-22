@@ -26,11 +26,24 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.optimize import least_squares
 
-from ..cv.court import CameraModel
+from ..cv.court import COURT_L, COURT_W, CameraModel
 
 log = logging.getLogger("refine.ballistic")
 
 G = np.array([0.0, 0.0, -9.81])   # m/s², world z up
+
+# Physical plausibility bounds for a fitted arc on THIS court. A degenerate
+# least_squares solve (most often on a segment fragmented down to 2-4 points
+# by a spurious bounce split -- 6 free params on that few observations is
+# underdetermined) can converge to a wildly unphysical P0/V0 that still
+# reprojects with deceptively low pixel RMS on that handful of points. RMS
+# alone doesn't catch this overfit; reject on the fitted trajectory's own
+# physical plausibility too, in the same place the values get written, so
+# every downstream reader (crossings, contact, height filters) sees ground-
+# plane fallback instead of garbage rather than each having to re-guard.
+MAX_HEIGHT_M = 20.0     # highest realistic lob
+MIN_HEIGHT_M = -1.5     # small slack under 0 for fit noise at a bounce
+COURT_MARGIN_M = 5.0    # off-court margin (served/mishit balls still land near it)
 
 
 @dataclass
@@ -121,6 +134,17 @@ def reconstruct(td, cam: CameraModel, max_rms_px: float = 12.0,
         if res is None:
             continue
         xy, h, rms, P0, V0 = res
+        plausible = (np.all(np.isfinite(h)) and np.all(np.isfinite(xy))
+                     and np.all((h >= MIN_HEIGHT_M) & (h <= MAX_HEIGHT_M))
+                     and np.all((xy[:, 0] >= -COURT_MARGIN_M) & (xy[:, 0] <= COURT_W + COURT_MARGIN_M))
+                     and np.all((xy[:, 1] >= -COURT_MARGIN_M) & (xy[:, 1] <= COURT_L + COURT_MARGIN_M)))
+        if not plausible:
+            log.debug("ballistic fit rejected as physically implausible: "
+                      "h range [%.1f, %.1f], frames %d-%d",
+                      float(np.min(h)) if np.isfinite(h).any() else float("nan"),
+                      float(np.max(h)) if np.isfinite(h).any() else float("nan"),
+                      int(frames[0]), int(frames[-1]))
+            continue
         if rms <= max_rms_px:
             td.ball_xy[idx] = xy
             td.ball_height[idx] = h

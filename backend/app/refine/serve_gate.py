@@ -291,20 +291,24 @@ def score_serve(feats: Features, seg_start: float, seg_end: float,
     # tracks near h=0, so require the ball above serve_flight_min_height_m at
     # the crossing when height data is available (ballistic 3D reconstruction
     # off/failed => no height signal => don't penalize, can't verify).
+    # Scan every qualifying crossing in the window rather than stopping at the
+    # first: near the net a real serve can register as two crossings a few
+    # frames apart (net-tape jitter in the pixel track flips the projected
+    # side briefly before settling), and taking the first one indiscriminately
+    # can pick the undirected one when a directionally-confirmed crossing for
+    # the SAME serve sits a fraction of a second later in the same window.
     anchor = contact_t if contact_t is not None else seg_start
+    expected = (1.0 if server_y < NET_Y else -1.0) if server_y is not None else None
     flight = 0.0
     for ct, cd in zip(feats.crossings_t, feats.crossings_dir):
         if cfg.serve_flight_min_s <= ct - anchor <= cfg.serve_flight_max_s:
             h = _ball_height_at(feats, ct)
             if h is not None and h < cfg.serve_flight_min_height_m:
                 continue          # ground-level "crossing" — not a real flight, keep scanning
-            flight = 0.8
-            if server_y is not None:
-                # serve flies away from the server's end
-                expected = 1.0 if server_y < NET_Y else -1.0
-                if cd == expected:
-                    flight = 1.0
-            break
+            flight = max(flight, 0.8)
+            if expected is not None and cd == expected:
+                flight = 1.0
+                break             # strongest possible evidence, nothing left to gain by scanning on
 
     # -- phase 4: landing -------------------------------------------------------
     # landing=1.0 means a bounce CONFIRMED beyond the kitchen on the
