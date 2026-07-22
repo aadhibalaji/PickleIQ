@@ -17,6 +17,7 @@ export const api = {
       xhr.send(form)
     }),
   listVideos: () => fetch('/api/videos').then(j),
+  deleteVideo: (id) => fetch(`/api/videos/${id}`, { method: 'DELETE' }).then(j),
   getVideo: (id) => fetch(`/api/videos/${id}`).then(j),
   updateVideo: (id, body) =>
     fetch(`/api/videos/${id}`, {

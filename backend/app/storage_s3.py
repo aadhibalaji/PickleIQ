@@ -388,6 +388,33 @@ def download_refine_config() -> dict | None:
     return _get_json(refine_config_key())
 
 
+def delete_video_data(video_id: str) -> None:
+    """Removes everything this video wrote to S3: the uploaded video object
+    and every results/{video_id}/* object (result.json, window_N.json,
+    status.json). Best-effort per key — a missing object is not an error,
+    but a client/network failure is (same discipline as the rest of this
+    module: loud failures, not silent no-ops)."""
+    _require_bucket()
+    client = _client()
+    keys = [video_key(video_id)]
+    try:
+        resp = client.list_objects_v2(Bucket=S3_VIDEO_BUCKET, Prefix=f"results/{video_id}/")
+    except Exception as exc:
+        log.error("S3 list_objects_v2 failed: bucket=%s prefix=results/%s/ (%s)",
+                  S3_VIDEO_BUCKET, video_id, exc)
+        raise RuntimeError(f"S3 list failed for results/{video_id}/: {exc}") from exc
+    keys += [obj["Key"] for obj in resp.get("Contents", [])]
+    try:
+        client.delete_objects(
+            Bucket=S3_VIDEO_BUCKET,
+            Delete={"Objects": [{"Key": k} for k in keys]},
+        )
+    except Exception as exc:
+        log.error("S3 delete_objects failed: bucket=%s keys=%s (%s)", S3_VIDEO_BUCKET, keys, exc)
+        raise RuntimeError(f"S3 delete failed for {video_id!r}: {exc}") from exc
+    log.info("deleted %d S3 object(s) for video %s", len(keys), video_id)
+
+
 def cleanup_scratch(video_id: str) -> None:
     dest = scratch_path(video_id)
     try:

@@ -29,6 +29,12 @@ DEFAULTS: dict[str, Any] = {
     "p1_spot_check_s": 2.0,        # serve-formation pose spot-check interval
     "p1_end_settle_s": 0.6,        # rally end = last net crossing + this settle (flight-to-land)
                                    # instead of the hysteresis flip (~cross_window+off later)
+    "p1_cross_max_gap_s": 1.0,     # max gap between the two straddling side-observations for a
+                                   # net crossing to register (a dropout longer than this drops
+                                   # the crossing, feeding the close/tight-end decisions)
+    "p1_net_margin_m": 0.5,        # court-metre deadzone around the net for side classification
+    "p1_cross_cluster_gap_s": 2.0, # trailing crossings farther apart than this are trimmed off
+                                   # the tight rally end (close_rally)
     # ---- Pose detection (players) -----------------------------------------
     "pose_conf": 0.25,             # YOLO-pose confidence floor (lower = catch far players)
     "pose_imgsz": 1920,            # Pass 2 pose inference size. Runs on the Arc GPU via
@@ -176,6 +182,8 @@ BOUNDS: dict[str, tuple[float, float]] = {
     "p1_merge_gap_s": (0.0, 2.0), "p1_cross_window_s": (0.5, 4.0),
     "p1_min_rally_s": (1.0, 5.0), "p1_spot_check_s": (0.5, 5.0),
     "p1_end_settle_s": (0.0, 2.5),
+    "p1_cross_max_gap_s": (0.3, 3.0), "p1_net_margin_m": (0.0, 1.5),
+    "p1_cross_cluster_gap_s": (0.5, 4.0),
     "pose_conf": (0.05, 0.6), "pose_imgsz": (640, 1920), "p1_pose_imgsz": (640, 1920),
     "ball_gate_px": (15.0, 120.0), "ball_accel_px": (0.0, 30.0),
     "ball_acq_px": (40.0, 200.0), "ball_seed_min_px": (1.0, 20.0),

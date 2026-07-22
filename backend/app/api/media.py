@@ -126,6 +126,32 @@ def update_video(video_id: str, body: VideoUpdateIn):
     return {"id": video_id, "match_type": body.match_type}
 
 
+@router.delete("/videos/{video_id}")
+def delete_video(video_id: str):
+    with db.connect() as con:
+        row = con.execute("SELECT path, s3_key FROM videos WHERE id=?", (video_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "video not found")
+        runner.cancel_video(video_id)
+        # Every table that keys off video_id — no FK cascade is declared
+        # (see db.py SCHEMA), so each has to be cleared explicitly.
+        for table in (
+            "jobs", "rally_labels", "overlays", "calibrations", "user_notes",
+            "discrepancies", "reports", "ball_corrections", "ball_tracks",
+            "window_grades", "contact_events", "coaching_reports",
+        ):
+            con.execute(f"DELETE FROM {table} WHERE video_id=?", (video_id,))
+        con.execute("DELETE FROM videos WHERE id=?", (video_id,))
+
+    if STORAGE_BACKEND == "s3":
+        storage_s3.delete_video_data(video_id)
+        storage_s3.cleanup_scratch(video_id)
+    else:
+        path = Path(row["path"])
+        shutil.rmtree(path.parent, ignore_errors=True)
+    return {"deleted": video_id}
+
+
 @router.post("/videos/{video_id}/reprocess")
 def reprocess(video_id: str, which: str = "pass2"):
     if which not in ("pass1", "pass2"):

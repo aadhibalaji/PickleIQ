@@ -30,6 +30,18 @@ export default function App() {
     e.target.value = ''
   }
 
+  const onDelete = async (e, v) => {
+    e.stopPropagation()
+    if (!window.confirm(`Delete "${v.filename}" and all its data? This can't be undone.`)) return
+    setError('')
+    try {
+      await api.deleteVideo(v.id)
+      refresh()
+    } catch (err) {
+      setError(err.message)
+    }
+  }
+
   if (current) {
     return <Workspace videoId={current} onBack={() => { setCurrent(null); refresh() }} />
   }
@@ -70,7 +82,10 @@ export default function App() {
               · uploaded {new Date(v.uploaded_at * 1000).toLocaleString()}
             </div>
           </div>
-          <button className="blue">Open →</button>
+          <div className="row">
+            <button className="blue">Open →</button>
+            <button className="danger" onClick={(e) => onDelete(e, v)}>Delete</button>
+          </div>
         </div>
       ))}
     </div>
