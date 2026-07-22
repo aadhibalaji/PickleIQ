@@ -32,8 +32,11 @@ DEFAULT_USER_ID = "default"   # placeholder until real multi-tenancy exists
 
 
 def _client():
+    import os
     import boto3
-    return boto3.client("s3", region_name=_REGION)
+    profile = os.environ.get("AWS_PROFILE_OVERRIDE")
+    session = boto3.Session(profile_name=profile) if profile else boto3.Session()
+    return session.client("s3", region_name=_REGION)
 
 
 def _require_bucket() -> None:
