@@ -46,7 +46,7 @@ def build_clip_dataset(video_id: str, cfg: RefineConfig,
     for w in load_pass1_windows(video_id):
         td = load_tracking(video_id, max(0, w.start_frame - margin),
                            min(last, w.end_frame + margin), fps=fps)
-        if td.present.mean() < 0.5:
+        if td.present.mean() < cfg.min_tracking_coverage:
             # stale overlays (Pass 1 re-run without Pass 2): the features are
             # empty, not evidence of dead play — don't teach the model that.
             log.warning("skipping window %s of %s: only %.0f%% tracked",

@@ -11,7 +11,7 @@ Output contract (per record)::
     {"pass1_window_id": str, "pass1_start": s, "pass1_end": s,
      "pass1_start_frame": int, "pass1_end_frame": int,
      "verdict": "rally"|"rejected",
-     "rejection_reason": null|"no_serve"|"low_live_ratio"|"too_short",
+     "rejection_reason": null|"no_serve"|"low_live_ratio"|"too_short"|"no_tracking_data",
      "refined_start": s|null, "refined_end": s|null,
      "refined_start_frame": int|null, "refined_end_frame": int|null,
      "confidence": {"mean_p_live": f, "serve_gate_score": f,
@@ -111,7 +111,9 @@ def _gate_checks(gate: ServeGateResult, cfg: RefineConfig, mean_p: float) -> lis
          "threshold": cfg.serve_contact_near_floor_min, "op": ">=",
          "pass": gate.contact_near_floor_ok},
         {"name": "flight", "value": round(gate.components.get("flight", 0.0), 4),
-         "threshold": "0.8 (crossing found, undirected) | 1.0 (direction confirmed)",
+         "threshold": "needs == 1.0 (direction confirmed) to gate alone; "
+                      "0.8 (crossing found, undirected) never passes this check on "
+                      "its own — see flight_or_landing_confirmed",
          "op": "==", "pass": gate.flight_directional,
          "directional": gate.flight_directional},
         {"name": "flight_or_landing_confirmed", "value": gate.flight_or_landing_ok,
@@ -169,6 +171,35 @@ def _record(window: Pass1Window, fps: float, verdict: str,
 def refine_window(window: Pass1Window, td: TrackingData, cfg: RefineConfig,
                   classifier: LiveClassifier) -> WindowDebug:
     """Run stages A-D over one candidate window's tracking span."""
+    lo = max(0, td.frame_index(window.start_frame))
+    hi = min(td.n, td.frame_index(window.end_frame) + 1)
+    coverage = float(td.present[lo:hi].mean()) if hi > lo else 0.0
+    if coverage < cfg.min_tracking_coverage:
+        # No (or almost no) pass2 overlay for this window's own frame range —
+        # e.g. Pass 1 was rerun without a matching Pass 2 pass, or Pass 2 was
+        # interrupted before reaching here. An empty TrackingData collapses
+        # every Stage A feature to its no-data default (ball invisible,
+        # players absent), which the rules classifier scores as a fixed,
+        # content-independent P(live) — indistinguishable from "genuinely
+        # dead play" unless called out here (see train.py's identical guard).
+        feats = compute_features(td, cfg)
+        p = classifier.predict_proba(feats)
+        dbg = WindowDebug(window=window, feats=feats, p_live=p,
+                          state=np.zeros(len(p), bool), segments=[])
+        diag = {
+            "checks": [{"name": "tracking_coverage", "value": round(coverage, 4),
+                        "threshold": cfg.min_tracking_coverage, "op": ">=",
+                        "pass": False}],
+            "stage": "tracking_coverage (Stage A, pre-classifier)",
+            "note": ("pass2 overlay covers only %.0f%% of this window's frames — "
+                     "Stage A features are mostly/entirely no-data defaults, not "
+                     "real evidence of dead play; rerun Pass 2 for this clip/span"
+                     % (coverage * 100)),
+        }
+        dbg.records.append(_record(window, td.fps, "rejected", "no_tracking_data",
+                                   None, None, float(p.mean()) if len(p) else 0.0,
+                                   0.0, 0.0, diag))
+        return dbg
     feats = compute_features(td, cfg)
     p = classifier.predict_proba(feats)
     segs, state = postprocess(p, cfg)

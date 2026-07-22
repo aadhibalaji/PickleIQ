@@ -98,15 +98,49 @@ overlay annotations**.
   per-frame mean player speed. Serve-formation spot-check → `serve_frames`.
 - **Ball observation, in priority order:**
   1. user `ball_corrections` for that frame (confidence 1.0);
-  2. **TrackNet** triplet **if `TRACKNET_ENABLED` + weights present** — *currently
-     OFF by default* (pretrained tennis weights don't transfer to this
-     down-the-line view without fine-tuning; ~5× slower, no gain measured);
+  2. **TrackNet** triplet **if `TRACKNET_ENABLED` + weights present** — off by
+     default in the code (`config.py`'s `TRACKNET_ENABLED` default), but
+     **enabled on the EC2 worker since 2026-07-21** (`restart-ec2.sh` sets
+     `TRACKNET_ENABLED=1`) now that fine-tuned weights for this camera setup
+     exist. Pretrained tennis weights genuinely didn't transfer (~5× slower,
+     no gain) — that finding stands — but the fine-tuned checkpoint is a
+     different measurement: on the same real clip that showed ~0.5% ball-
+     observation with the classical detector, TrackNet gave ~34% (2525/7413
+     frames), real arcs forming in every window (vs. 0 previously) and
+     `net_crossings_per_10s` up to ~31 where it was 0.0 everywhere before —
+     4 of that clip's 13 Pass 1 windows went from rejected to kept `rally`
+     verdicts on that ball evidence alone, no Stage B/C thresholds touched.
+     Weights sync from S3 the same way calibration does — see
+     `storage_s3.upload_tracknet_weights`/`download_tracknet_weights` and
+     `cloud_ingest._sync_tracknet_weights`. Re-run
+     `backend/scripts/upload_tracknet_weights.py` to ship an updated
+     checkpoint; the EC2 worker picks it up on its next ~20s poll tick;
   3. **classical `MotionBallDetector`** run **PERMISSIVE** (no player-box
      exclusion) + a **`TrajectoryBallSelector`** (`ball_track.py`): the selector
      scores each raw blob by fit to the recent ball trajectory and applies the
      velocity-aware foot/shoe suppression (a blob on a foot is kept only if it
      moves ≥ `ball_hit_speed_px`). The **court-region filter** (`_in_court_region`
      — rejects plane-projections > ~2.5 m/3 m outside the court) still applies.
+- **Arc-fit noise filter** (`ball_filter.refine_track`, Stage 3-4, batch per
+  window): segments the window's per-frame selected picks at time gaps
+  (`ball_arc_gap_frames`) and sharp turns, RANSAC-fits a quadratic to each
+  segment of `≥ ball_arc_min_pts=4` points, and drops points that end up on no
+  fitted arc as noise. **2026-07-20 fix:** the caller (`pass2.py`) used to
+  prune every non-arc point unconditionally, including when the window fit
+  ZERO arcs at all (real detections too few/scattered — at ~60fps,
+  `ball_arc_gap_frames=10` is under 0.2s, so a genuinely sparse far-baseline
+  track easily never clusters 4 points that close together) — that silently
+  wiped every real per-frame detection in the window, turning "sparse but
+  real" into "no ball ever" with no trace. Verified on a real EC2 clip: every
+  one of 13 windows logged `0 arcs`, and the overlay had **0/7413** entries
+  with any ball position despite 13-50 raw candidates logged per window.
+  Downstream this reads to refine's Stage B as a fixed, content-independent
+  low `P(live)` ceiling — the actual cause of a "same p_live_max across
+  rallies of very different length" report (see
+  `PASS1_PASS2_RALLY_BOUNDARIES.md` for the refine-side symptom). Fixed by
+  only pruning off-arc points when `refined.arcs` is non-empty — with zero
+  arcs there is no fitted trajectory to judge "off-arc" against, so the raw
+  per-frame picks are left in place instead.
 - **Kalman smoothing** (`smooth_track`, `max_gap` ≈ 0.4 s, `ball_kalman_gate2`
   outlier rejection) bridges short gaps and rejects physically-irregular jumps.
 - **3D reconstruction** (`reconstruct_world`): apparent ball diameter → height
@@ -156,13 +190,15 @@ feature traces and future model training; it just carries no boundary decision.
   `backend/scripts/train_bounce.py`. Cold-start guard: needs ≥3 labeled clips to
   validate/promote.
 - **`serve_start` model** — hook threaded into `detect_start`, not yet built.
-- **TrackNet** — off by default; the real far-ball fix is fine-tuning it on the
-  user's `ball_corrections`.
+- **TrackNet** — off by default in code; **on for the EC2 worker** since
+  2026-07-21 now that a fine-tuned checkpoint exists (see the Pass 2 ball-
+  observation section above). Fine-tuning on the user's `ball_corrections` /
+  `FeatureTraces` was the anticipated path and is what actually happened.
 
 ## Known limitations / open problems
 - **Far-side ball** (size→depth noise) → end detection mostly falls back to
-  `coarse_gate`; neither the pretrained TrackNet nor a global offset fixes it —
-  the trained `rally_end` model + more labeled clips is the path.
+  `coarse_gate`; the pretrained TrackNet didn't fix this, but the **fine-tuned**
+  checkpoint measurably does (see above) — a global offset still doesn't.
 - Classical-detector residual noise can still fabricate a "return", so the pass-
   rejection occasionally keeps a between-point ball movement (false-positive
   rally). The report's gate-tightening learning reduces these over time.
@@ -173,7 +209,8 @@ feature traces and future model training; it just carries no boundary decision.
 - `backend/app/cv/pass1.py` — Pass 1 gate
 - `backend/app/cv/pass2.py` — Pass 2 orchestration, window building, ball filters
 - `backend/app/cv/ball_coarse.py` — classical detector + player-box exclusion
-- `backend/app/cv/ball_tracknet.py` — TrackNet (gated off by default)
+- `backend/app/cv/ball_tracknet.py` — TrackNet (off by default in code; on for
+  the EC2 worker via `TRACKNET_ENABLED=1` — see `scripts/restart-ec2.sh`)
 - `backend/app/cv/bounce.py` — world reconstruction, `detect_events`, phantom-out guard, BounceGRU
 - `backend/app/cv/rally_logic.py` — `detect_rallies`, `detect_start`/`_find_start`, `detect_end`, serve-vs-pass
 - `backend/app/cv/court.py` — geometry, homography, `in_court`, `side_of_net`

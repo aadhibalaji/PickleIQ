@@ -290,9 +290,9 @@
     "semantic_hash": "bbcfa6849a4fa21b97f76e97d7257fc0"
   },
   "backend/app/refine/config.py": {
-    "mtime": 1784243698.6085212,
-    "ast_hash": "dc20ddf61969e51d1ac3e0db81767adc",
-    "semantic_hash": "dc20ddf61969e51d1ac3e0db81767adc"
+    "mtime": 1784575263.2256682,
+    "ast_hash": "7b4ed131e1e7a94fafeeb5016e5a7877",
+    "semantic_hash": ""
   },
   "backend/app/refine/diagnostics.py": {
     "mtime": 1784171554.824082,
@@ -330,9 +330,9 @@
     "semantic_hash": "17e471d996348f0bf8844793d4bd8de9"
   },
   "backend/app/refine/refine.py": {
-    "mtime": 1784243694.6096168,
-    "ast_hash": "13c3bdbc3ea552a583520d3dae64c72d",
-    "semantic_hash": "13c3bdbc3ea552a583520d3dae64c72d"
+    "mtime": 1784575280.8500438,
+    "ast_hash": "3974d52f25203a3654bd23b3fb84d25c",
+    "semantic_hash": ""
   },
   "backend/app/refine/serve_gate.py": {
     "mtime": 1784171554.8249123,
@@ -365,9 +365,9 @@
     "semantic_hash": "d21170cd8211344dc4bfd78403bd441b"
   },
   "backend/app/refine/tests/test_refine.py": {
-    "mtime": 1784171554.826119,
-    "ast_hash": "a2b4985970f5a010e5f1ff070aa3e1ca",
-    "semantic_hash": "a2b4985970f5a010e5f1ff070aa3e1ca"
+    "mtime": 1784575388.99676,
+    "ast_hash": "d69b4891bfd9d05a6b34f6e94bcb11b6",
+    "semantic_hash": ""
   },
   "backend/app/refine/tests/test_serve_gate.py": {
     "mtime": 1784171554.8263106,
@@ -385,9 +385,9 @@
     "semantic_hash": "56e5ac02d1a8ed21e1ef692382a4ee68"
   },
   "backend/app/refine/train.py": {
-    "mtime": 1784171554.8265903,
-    "ast_hash": "47b6181f5e391ab0f83b5a391edd8216",
-    "semantic_hash": "47b6181f5e391ab0f83b5a391edd8216"
+    "mtime": 1784575266.5963764,
+    "ast_hash": "5417a1baba78368bac532dc865ba00e0",
+    "semantic_hash": ""
   },
   "backend/app/results_export.py": {
     "mtime": 1784501486.1702185,
@@ -543,5 +543,85 @@
     "mtime": 1784514889.8620474,
     "ast_hash": "7ce209018a92ca62ff08f105bcdcc81d",
     "semantic_hash": "7ce209018a92ca62ff08f105bcdcc81d"
+  },
+  "CLAUDE.md": {
+    "mtime": 1784573600.5993876,
+    "ast_hash": "82efb97a359f5c7290bf2513d14686be",
+    "semantic_hash": ""
+  },
+  "README.md": {
+    "mtime": 1783525630.472206,
+    "ast_hash": "02aa4077762646ce750859361e131fb8",
+    "semantic_hash": ""
+  },
+  "backend/requirements.txt": {
+    "mtime": 1783525630.4758139,
+    "ast_hash": "b5bf95d1328ccec84433cc01d55f9349",
+    "semantic_hash": ""
+  },
+  "backend/requirements_cuda.txt": {
+    "mtime": 1784514843.0380743,
+    "ast_hash": "814ec5c75d57c6d8e36c1a41e6ac8207",
+    "semantic_hash": ""
+  },
+  "docs/BALL_DETECTION.md": {
+    "mtime": 1784171554.8280964,
+    "ast_hash": "54226725eebc20a8e0a8f4fded6e8f1a",
+    "semantic_hash": ""
+  },
+  "docs/BALL_TRACKER_INTEGRATION.md": {
+    "mtime": 1784171554.8282256,
+    "ast_hash": "aea9571b15f37ea469c52ec7f09222da",
+    "semantic_hash": ""
+  },
+  "docs/CONTEXT.md": {
+    "mtime": 1784171554.8284082,
+    "ast_hash": "ec1fa2ebd05b4069c22901dc58f7f1b7",
+    "semantic_hash": ""
+  },
+  "docs/HW_PROFILES.md": {
+    "mtime": 1784171554.8285308,
+    "ast_hash": "9ac15954e6d840433ea5777e7b8b90be",
+    "semantic_hash": ""
+  },
+  "docs/LABELING_FEEDBACK_AUDIT.md": {
+    "mtime": 1784171554.8287065,
+    "ast_hash": "9fed7a2d40d2b3f59b82a64081ccfd07",
+    "semantic_hash": ""
+  },
+  "docs/LEARNING_TRACKED_VALUES.md": {
+    "mtime": 1784171554.828876,
+    "ast_hash": "7e8039216dcf9659b0b109b57de6bb06",
+    "semantic_hash": ""
+  },
+  "docs/PASS1_PASS2_RALLY_BOUNDARIES.md": {
+    "mtime": 1784575439.2143776,
+    "ast_hash": "1890365e3c11dece23338392cfc0fc55",
+    "semantic_hash": ""
+  },
+  "docs/PASS1_PASS2_SPEC.md": {
+    "mtime": 1784171554.8291128,
+    "ast_hash": "3617672f907883319688d11be192dfd3",
+    "semantic_hash": ""
+  },
+  "docs/RALLY_SYSTEM.md": {
+    "mtime": 1784171554.8292081,
+    "ast_hash": "e956895413b3ad1812b5fd86e63e5f32",
+    "semantic_hash": ""
+  },
+  "docs/SESSION_HANDOFF_2026-07-10.md": {
+    "mtime": 1784171554.8293645,
+    "ast_hash": "302837c8e7b60da82c652640b7c1fb2d",
+    "semantic_hash": ""
+  },
+  "docs/SESSION_HANDOFF_2026-07-15.md": {
+    "mtime": 1784171554.8295376,
+    "ast_hash": "0aeacf29538d5fdcd2094dd6e8a88e5f",
+    "semantic_hash": ""
+  },
+  "frontend/index.html": {
+    "mtime": 1783525630.4971335,
+    "ast_hash": "79577413d74d5ea534d999435cda94b1",
+    "semantic_hash": ""
   }
 }

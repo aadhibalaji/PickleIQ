@@ -312,6 +312,82 @@ def download_calibration() -> dict | None:
     return _get_json(calibration_key())
 
 
+def tracknet_weights_key() -> str:
+    return "models/tracknet_v2.pt"
+
+
+def upload_tracknet_weights(local_path: Path) -> str:
+    """Uploads a (presumably fine-tuned) TrackNet checkpoint to S3 so the EC2
+    worker's cloud_ingest poller can pick it up (see
+    cloud_ingest._sync_tracknet_weights) — mirrors upload_calibration's
+    reasoning: the weights are normally produced/placed on a dev machine, not
+    through the EC2 worker itself, so without this it would never see them."""
+    _require_bucket()
+    key = tracknet_weights_key()
+    try:
+        _client().upload_file(str(local_path), S3_VIDEO_BUCKET, key)
+    except Exception as exc:
+        log.error("S3 upload failed: bucket=%s key=%s (%s)", S3_VIDEO_BUCKET, key, exc)
+        raise RuntimeError(
+            f"S3 upload failed for {key!r} in bucket {S3_VIDEO_BUCKET!r}: {exc}") from exc
+    log.info("uploaded %s to s3://%s/%s", local_path, S3_VIDEO_BUCKET, key)
+    return key
+
+
+def download_tracknet_weights(dest: Path) -> bool:
+    """Downloads the S3 TrackNet checkpoint to `dest` if it's missing or a
+    different size than what's already there. Returns True if a download
+    happened, False if dest was already current or nothing exists in S3 yet
+    (both non-error, expected states — see cloud_ingest._sync_tracknet_weights)."""
+    _require_bucket()
+    key = tracknet_weights_key()
+    client = _client()
+    try:
+        head = client.head_object(Bucket=S3_VIDEO_BUCKET, Key=key)
+    except Exception as exc:
+        code = getattr(exc, "response", {}).get("Error", {}).get("Code")
+        if code in ("404", "NoSuchKey"):
+            return False
+        log.error("S3 head_object failed: bucket=%s key=%s (%s)", S3_VIDEO_BUCKET, key, exc)
+        raise RuntimeError(f"could not check {key!r} in bucket {S3_VIDEO_BUCKET!r}: {exc}") from exc
+
+    if dest.exists() and dest.stat().st_size == head["ContentLength"]:
+        return False
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    log.info("downloading s3://%s/%s to %s", S3_VIDEO_BUCKET, key, dest)
+    try:
+        client.download_file(S3_VIDEO_BUCKET, key, str(dest))
+    except Exception as exc:
+        log.error("S3 download failed: bucket=%s key=%s (%s)", S3_VIDEO_BUCKET, key, exc)
+        raise RuntimeError(f"S3 download failed for {key!r}: {exc}") from exc
+    log.info("download complete: %s (%d bytes)", dest, dest.stat().st_size)
+    return True
+
+
+def refine_config_key() -> str:
+    return "refine/config.override.yaml.json"
+
+
+def upload_refine_config(data: dict) -> str:
+    """Mirrors the current refine config.override.yaml (serve_gate_min etc.)
+    to S3 so the EC2 worker's cloud_ingest poller can pick it up (see
+    cloud_ingest._sync_refine_config) — same gap as calibration/TrackNet
+    weights: this is normally written through a RUN_PROCESSING=0 UI-only
+    container (api/annotate.py's write_refine_override), whose local
+    data/refine/config.override.yaml the separate EC2 worker never otherwise
+    sees. Called on every POST /refine/config/override."""
+    key = refine_config_key()
+    _put_json(key, data)
+    return key
+
+
+def download_refine_config() -> dict | None:
+    """None if no override has ever been applied on any S3-backed container
+    yet — expected, not an error."""
+    return _get_json(refine_config_key())
+
+
 def cleanup_scratch(video_id: str) -> None:
     dest = scratch_path(video_id)
     try:
