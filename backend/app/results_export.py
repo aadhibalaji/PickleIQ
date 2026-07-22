@@ -131,6 +131,21 @@ def describe_chain_status(chain_status: dict[str, dict[str, Any]], rally_labels:
     return ", ".join(parts)
 
 
+def merge_rally_labels(video_id: str, source: str, rows: list[dict]) -> None:
+    """Delete-then-insert this video's rally_labels for one source (pass1/
+    pass2), same pattern cv/pass1.py and merge_video_results below use
+    locally — shared so the live progress-snapshot path (mirror_cloud_progress)
+    and the chain-end full sync (merge_video_results) can't drift apart."""
+    with db.connect() as con:
+        con.execute("DELETE FROM rally_labels WHERE video_id=? AND source=?", (video_id, source))
+        if rows:
+            con.executemany(
+                "INSERT INTO rally_labels (id, video_id, source, start_frame, end_frame, meta)"
+                " VALUES (?,?,?,?,?,?)",
+                [(r["id"], video_id, source, r["start_frame"], r["end_frame"], r["meta"])
+                 for r in rows])
+
+
 def merge_video_results(video_id: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Upserts a downloaded result.json into the local DB. Safe to call
     repeatedly: cloud-authoritative tables (rally_labels sourced from
@@ -160,19 +175,12 @@ def merge_video_results(video_id: str, payload: dict[str, Any]) -> dict[str, Any
     coaching_report = payload.get("coaching_report")
     calibration = payload.get("calibration")
 
-    with db.connect() as con:
-        for source in ("pass1", "pass2"):
-            rows = [r for r in rally_labels if r["source"] == source]
-            if not rows:
-                continue
-            con.execute("DELETE FROM rally_labels WHERE video_id=? AND source=?",
-                        (video_id, source))
-            con.executemany(
-                "INSERT INTO rally_labels (id, video_id, source, start_frame, end_frame, meta)"
-                " VALUES (?,?,?,?,?,?)",
-                [(r["id"], video_id, source, r["start_frame"], r["end_frame"], r["meta"])
-                 for r in rows])
+    for source in ("pass1", "pass2"):
+        rows = [r for r in rally_labels if r["source"] == source]
+        if rows:
+            merge_rally_labels(video_id, source, rows)
 
+    with db.connect() as con:
         for source, chunks in overlays.items():
             con.execute("DELETE FROM overlays WHERE video_id=? AND source=?",
                         (video_id, source))
@@ -218,13 +226,20 @@ def merge_video_results(video_id: str, payload: dict[str, Any]) -> dict[str, Any
 
 
 def export_window_results(video_id: str, source: str, window_index: int,
-                           start_frame: int, end_frame: int) -> dict[str, Any]:
+                           start_frame: int, end_frame: int,
+                           total_windows: int | None = None) -> dict[str, Any]:
     """Same overlays shape as export_video_results, scoped to the overlay
     chunks touched by one Pass 2 window — for live incremental visibility
     while Pass 2 is still running (see cv/pass2.py's per-window upload, right
     after overlays.write_entries() flushes that window). NOT a substitute
     for the full export at chain end: it carries no rally_labels, contacts,
-    coaching, or calibration — just this window's detection overlays."""
+    coaching, or calibration — just this window's detection overlays.
+
+    total_windows (the count Pass 2 built its window list from) rides along
+    so a UI-only container can turn "window N synced" into an actual N/total
+    fraction for its Pass 2 progress bar (see pipeline.mark_cloud_pass2_active)
+    — without it, that container has no way to know how many windows there
+    will be in total, only that one more just landed."""
     c0, c1 = chunk_index(start_frame), chunk_index(end_frame)
     with db.connect() as con:
         overlay_rows = con.execute(
@@ -234,6 +249,7 @@ def export_window_results(video_id: str, source: str, window_index: int,
     payload = {
         "video_id": video_id,
         "window_index": window_index,
+        "total_windows": total_windows,
         "start_frame": start_frame,
         "end_frame": end_frame,
         "exported_at": time.time(),
@@ -275,5 +291,6 @@ def merge_window_results(video_id: str, payload: dict[str, Any]) -> dict[str, An
     log.info("merged window %s results for %s (%d chunk(s))",
               payload.get("window_index"), video_id, n_chunks)
     return {"window_index": payload.get("window_index"),
+            "total_windows": payload.get("total_windows"),
             "start_frame": payload.get("start_frame"), "end_frame": payload.get("end_frame"),
             "overlay_chunks": n_chunks}

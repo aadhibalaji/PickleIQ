@@ -82,18 +82,34 @@ def _match_fast(cands, prev_cands, step: int, smin: float, smax: float = 45.0):
     return best, best_prev
 
 
-def _upload_progress_incremental(video_id: str, progress: float, message: str) -> None:
+def _upload_progress_incremental(video_id: str, progress: float, message: str,
+                                  source: str = "pass1") -> None:
     """S3 mode only: live Pass 1 progress snapshot, mirrored by the local
     UI-only container's poll-cloud-windows (see api/media.py,
     pipeline.mirror_cloud_progress). Pass 1 has no per-window checkpoints
     the way Pass 2 does, so this is a single object OVERWRITTEN each call
     rather than one object per checkpoint — see storage_s3.upload_progress.
+
+    Also carries the rally windows found SO FAR (rally_labels rows already
+    committed to this instance's own DB by close_rally, above). Without
+    this, Pass 1 boundaries only ever reach the UI-only container via the
+    full chain-end result.json (results_export.export_video_results) —
+    which waits for Pass 2 (and contacts) to finish too — so the Pass 1
+    timeline track stayed empty for however long Pass 2 took, even though
+    Pass 1 itself was already done. Piggybacking on this same
+    already-existing 20s-ish snapshot avoids a new S3 object/poll path.
+
     Never fails the pass: a transient S3 hiccup here must not cost a user
     their Pass 1 run."""
     try:
+        with db.connect() as con:
+            rally_labels = db.rows_to_dicts(con.execute(
+                "SELECT id, source, start_frame, end_frame, meta FROM rally_labels"
+                " WHERE video_id=? AND source=?", (video_id, source)).fetchall())
         storage_s3.upload_progress(video_id, {
-            "video_id": video_id, "stage": "pass1", "status": "running",
+            "video_id": video_id, "stage": source, "status": "running",
             "progress": progress, "message": message, "updated_at": time.time(),
+            "rally_labels": rally_labels,
         })
     except Exception:
         log.exception("incremental pass1 progress S3 export failed for %s (non-fatal)", video_id)
@@ -354,13 +370,24 @@ def run_pass1(video_id: str, params: dict, H, handle: JobHandle,
                 overlays.write_entries(video_id, source, done)
                 entries = [e for e in entries if overlays.chunk_index(e["f"]) > flushed_chunk + 1]
             flushed_chunk = ci - 1
+
+        # Progress reporting runs on its OWN cadence, independent of the
+        # overlay-flush cadence above. Flushing only happens once per full
+        # CHUNK_FRAMES (900 = 30s of video), one chunk behind the current
+        # frame — tying progress to it meant the last partial chunk's worth
+        # of real per-frame work (ball/pose detection, not idle time) ran
+        # with no progress tick at all, showing up as a stall pinned near
+        # 99-100% right before "done". Ticking every 100 sampled frames
+        # instead (same cadence cv/pass2.py already uses) keeps updates
+        # flowing through that tail.
+        if f % (100 * step) == 0:
             # update() also raises if cancelled — a long Pass 1 yields the
             # worker promptly so shorter queued jobs can run.
             progress = f / max(meta.frame_count, 1)
             message = f"Pass 1: {len(rallies)} rallies so far"
             handle.update(progress=progress, message=message)
             if STORAGE_BACKEND == "s3":
-                _upload_progress_incremental(video_id, progress, message)
+                _upload_progress_incremental(video_id, progress, message, source=source)
 
     if active and rally_start is not None:
         close_rally(rally_start, meta.frame_count - 1)

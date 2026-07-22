@@ -58,5 +58,22 @@
   "56": "Hardware profiles (`HW_PROFILE`)",
   "57": "Connecting an external ball tracker (e.g. MTI + temporal integration)",
   "58": "Pass 1 & Pass 2 — Current Detection Spec",
-  "59": "CLAUDE.md"
+  "59": "CLAUDE.md",
+  "60": "cloud_ingest.py",
+  "61": "ball_filter.py",
+  "62": "detect_contacts_for_video",
+  "63": "pipeline.py",
+  "64": "io_loaders.py",
+  "65": "overlays.py",
+  "66": "rally_analysis.py",
+  "67": "MotionBallDetector",
+  "68": "_scale_m_per_px",
+  "69": "autolearn.py",
+  "70": "refine/config.py",
+  "71": "BallFrameFilter",
+  "72": "export_manual_tracking.py",
+  "73": "test_ball_filter.py",
+  "74": "deploy.sh",
+  "75": "cv/tests/__init__.py",
+  "76": "app/tests/__init__.py"
 }

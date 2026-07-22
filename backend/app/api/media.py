@@ -274,7 +274,8 @@ def poll_cloud_windows(video_id: str):
         merged.append(results_export.merge_window_results(video_id, payload))
         seen[idx] = etag
     if merged:
-        pipeline.mark_cloud_pass2_active(video_id, merged[-1]["window_index"])
+        pipeline.mark_cloud_pass2_active(video_id, merged[-1]["window_index"],
+                                          merged[-1]["total_windows"])
     return {"video_id": video_id, "new_windows": merged,
             "pass1_progress": progress_payload}
 
