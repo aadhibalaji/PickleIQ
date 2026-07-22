@@ -47,10 +47,8 @@ def _upsert_mirror_job(video_id: str, kind: str, status: str, message: str,
     none exists yet — used only by the RUN_PROCESSING=0 mirroring helpers
     below, never by real job execution (that always goes through
     jobs.JobRunner, which owns its own row per submitted job). progress is
-    optional since most callers (mirror_cloud_chain_status,
-    mark_cloud_pass2_active) only have a coarse status, not a real fraction —
-    only mirror_cloud_progress (Pass 1) has one, from cv/pass1.py's genuine
-    frame-count progress."""
+    optional since mirror_cloud_chain_status has no fraction at all (just a
+    terminal status)."""
     with db.connect() as con:
         row = con.execute(
             "SELECT id FROM jobs WHERE video_id=? AND kind=? ORDER BY created_at DESC LIMIT 1",
@@ -98,14 +96,23 @@ def mirror_cloud_progress(video_id: str, progress_payload: dict) -> None:
     storage_s3.delete_progress) specifically so this never fires again with
     stale 'running' state after the video has moved on — mirror_cloud_progress
     itself always trusts whatever payload it's given without re-checking
-    staleness, by design; that's delete_progress's job, not this function's."""
-    _upsert_mirror_job(video_id, progress_payload.get("stage", "pass1"),
+    staleness, by design; that's delete_progress's job, not this function's.
+
+    Also merges any rally_labels riding along in the same snapshot (see
+    cv/pass1.py's _upload_progress_incremental) — this is what lets the
+    Pass 1 timeline track populate progressively on a UI-only container
+    instead of staying empty until the full chain-end sync."""
+    stage = progress_payload.get("stage", "pass1")
+    rally_labels = progress_payload.get("rally_labels")
+    if rally_labels is not None:
+        results_export.merge_rally_labels(video_id, stage, rally_labels)
+    _upsert_mirror_job(video_id, stage,
                         progress_payload.get("status", "running"),
                         progress_payload.get("message", ""),
                         progress=progress_payload.get("progress", 0.0))
 
 
-def mark_cloud_pass2_active(video_id: str, window_index: int) -> None:
+def mark_cloud_pass2_active(video_id: str, window_index: int, total_windows: int | None) -> None:
     """RUN_PROCESSING=0 only — called from poll-cloud-windows whenever it
     merges at least one new window. Window payloads carry no chain_status
     (see results_export.export_window_results), so unlike
@@ -114,10 +121,21 @@ def mark_cloud_pass2_active(video_id: str, window_index: int) -> None:
     landed, to keep the UI showing real activity in the gap between the
     upload-time placeholder and the eventual definitive status from a full
     sync. sync-from-cloud's mirror_cloud_chain_status always supersedes this
-    once the real result.json lands."""
+    once the real result.json lands.
+
+    total_windows (from the same window payload — see cv/pass2.py's
+    _upload_window_incremental) lets this set a real (window_index+1)/
+    total_windows fraction instead of leaving progress untouched: without
+    it, only the message updated ("window N synced") while the mirrored
+    job's progress column stayed at whatever it was seeded at (0.0),
+    so the local Pass 2 progress bar's width never moved even though
+    windows kept landing. Falls back to leaving progress alone only if a
+    caller genuinely has no total (shouldn't happen once every window
+    payload carries one)."""
     _upsert_mirror_job(video_id, "pass1", "done", "")
-    _upsert_mirror_job(video_id, "pass2", "running",
-                        f"Pass 2 processing in the cloud (window {window_index + 1} synced)")
+    message = f"Pass 2 processing in the cloud (window {window_index + 1} synced)"
+    progress = (window_index + 1) / total_windows if total_windows else None
+    _upsert_mirror_job(video_id, "pass2", "running", message, progress=progress)
 
 
 def _ensure_local_video(video_id: str) -> None:

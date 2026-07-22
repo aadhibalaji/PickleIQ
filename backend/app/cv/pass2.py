@@ -88,7 +88,8 @@ def _wrist_points(obs) -> list[tuple[float, float]]:
 
 
 def _upload_window_incremental(video_id: str, source: str, window_index: int,
-                                start_frame: int, end_frame: int) -> None:
+                                start_frame: int, end_frame: int,
+                                total_windows: int) -> None:
     """S3 mode only: as soon as one Pass 2 window's overlays are flushed
     (just above), ship a scoped snapshot to S3 as results/{video_id}/
     window_{n}.json — live visibility for the local app (see
@@ -98,7 +99,8 @@ def _upload_window_incremental(video_id: str, source: str, window_index: int,
     pipeline._finish_chain still captures everything at the end regardless."""
     try:
         payload = results_export.export_window_results(video_id, source, window_index,
-                                                          start_frame, end_frame)
+                                                          start_frame, end_frame,
+                                                          total_windows=total_windows)
         storage_s3.upload_window_results(video_id, window_index, payload)
     except Exception:
         log.exception("incremental window %d S3 export failed for %s (non-fatal)",
@@ -584,7 +586,7 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                                     "cx": round(ev.court_x, 2), "cy": round(ev.court_y, 2)}
         overlays.write_entries(video_id, source, list(entries.values()))
         if STORAGE_BACKEND == "s3":
-            _upload_window_incremental(video_id, source, wi, ws, we)
+            _upload_window_incremental(video_id, source, wi, ws, we, len(windows))
         if on_window is not None:
             on_window(we)
 

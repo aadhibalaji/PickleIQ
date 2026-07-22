@@ -229,6 +229,105 @@ def _ballistic_contact(feats: Features, seg_start: float, t1: float,
     return best
 
 
+def _flight_and_landing(feats: Features, anchor: float,
+                        server_y: float | None, cfg: RefineConfig) -> tuple[float, float]:
+    """Phases 3+4 for one candidate contact anchor. A confirmed net crossing
+    shortly after contact, at height, is a hard requirement (see
+    flight_or_landing_ok in score_serve) — contact + rally_evidence alone let
+    non-serve activity (a rolling ball being fetched, a carried ball) through
+    purely on ambient rhythm. Height check: a served ball crossing the net is
+    genuinely airborne; a ball rolling on the ground tracks near h=0, so
+    require the ball above serve_flight_min_height_m at the crossing when
+    height data is available (ballistic 3D reconstruction off/failed => no
+    height signal => don't penalize, can't verify).
+
+    Scans every qualifying crossing in the window rather than stopping at the
+    first: near the net a real serve can register as two crossings a few
+    frames apart (net-tape jitter in the pixel track flips the projected side
+    briefly before settling), and taking the first one indiscriminately can
+    pick the undirected one when a directionally-confirmed crossing for the
+    SAME serve sits a fraction of a second later in the same window.
+    """
+    expected = (1.0 if server_y < NET_Y else -1.0) if server_y is not None else None
+    flight = 0.0
+    for ct, cd in zip(feats.crossings_t, feats.crossings_dir):
+        if cfg.serve_flight_min_s <= ct - anchor <= cfg.serve_flight_max_s:
+            h = _ball_height_at(feats, ct)
+            if h is not None and h < cfg.serve_flight_min_height_m:
+                continue          # ground-level "crossing" — not a real flight, keep scanning
+            flight = max(flight, 0.8)
+            if expected is not None and cd == expected:
+                flight = 1.0
+                break             # strongest possible evidence, nothing left to gain by scanning on
+
+    # landing=1.0 means a bounce CONFIRMED beyond the kitchen on the
+    # receiver's diagonal half (strong evidence); landing=0.3 means some
+    # nearby bounce existed but wasn't clearly beyond the kitchen (weak/
+    # ambiguous — NOT sufficient on its own for the hard gate below, since
+    # this is exactly what a rolling-ball false positive can produce).
+    landing = 0.0
+    if server_y is not None and len(feats.bounces_t):
+        for bt, bxy in zip(feats.bounces_t, feats.bounces_xy):
+            if not (anchor < bt <= anchor + 2.5) or not np.isfinite(bxy[1]):
+                continue
+            beyond = bxy[1] > NET_Y + KITCHEN if server_y < NET_Y \
+                else bxy[1] < NET_Y - KITCHEN
+            in_x = -0.5 <= bxy[0] <= COURT_W + 0.5
+            landing = 1.0 if (beyond and in_x) else 0.3
+            break
+    return flight, landing
+
+
+def _gate_decision(pre: float, contact: float, flight: float, landing: float,
+                   cfg: RefineConfig) -> dict:
+    """Hard gate for one candidate's (pre, contact, flight, landing) reading:
+    1. flight_or_landing_ok is ALWAYS required — EITHER a confirmed
+       beyond-kitchen landing OR a DIRECTIONALLY-CONFIRMED flight crossing
+       (flight == 1.0: the crossing matched the expected direction away
+       from the server's side, not merely "some crossing was found" —
+       flight == 0.8 is undirected and, on its own, is exactly what a
+       stray/ambient net crossing unrelated to this point can produce).
+       Rules out contact + rally_evidence carrying a false positive on
+       ambient rhythm alone (the module docstring's original confirmed
+       false-positive case), and closes a second one where undirected
+       flight (0.8) plus marginal pre_serve/contact still slipped through
+       (confirmed false positive: flight=0.8, landing=0, pre_serve=0.40,
+       contact=0.68).
+    2. PLUS one of: contact_ok, pre_serve_compensate_ok, or (near-floor
+       contact + directionally-confirmed flight + base pre_serve floor).
+       Ball-near-player detection is often weak/occluded right at contact
+       even for real serves, so a strict AND let one noisy metric veto an
+       otherwise well-evidenced serve (two confirmed false negatives:
+       pre_serve 0.62/0.36 with flight/landing confirmed, dropped only
+       because contact read 0.20/0.28, just under the 0.3 floor). Strong
+       formation + confirmed flight/landing can compensate for a weak
+       contact read; separately, a directionally-confirmed flight crossing
+       is itself strong enough evidence that a near-floor (not weak) contact
+       read plus a merely-base pre_serve shouldn't kill the serve (confirmed
+       false negative: flight=1.0, landing=0, pre_serve=0.361, contact=0.2815
+       — missed the 0.3 contact floor by a small margin).
+    """
+    flight_directional = flight >= 1.0
+    flight_or_landing_ok = landing >= 1.0 or flight_directional
+    pre_serve_ok = pre >= cfg.serve_pre_serve_min                    # diagnostic only
+    contact_ok = contact >= cfg.serve_contact_min
+    contact_near_floor_ok = contact >= cfg.serve_contact_near_floor_min
+    pre_serve_compensate_ok = pre >= cfg.serve_pre_serve_compensate_min
+    pass_path = None
+    if flight_or_landing_ok and contact_ok:
+        pass_path = "contact"
+    elif flight_or_landing_ok and pre_serve_compensate_ok:
+        pass_path = "formation_compensation"
+    elif flight_directional and contact_near_floor_ok and pre_serve_ok:
+        pass_path = "directional_flight_compensation"
+    return dict(flight_directional=flight_directional,
+               flight_or_landing_ok=flight_or_landing_ok,
+               pre_serve_ok=pre_serve_ok, contact_ok=contact_ok,
+               contact_near_floor_ok=contact_near_floor_ok,
+               pre_serve_compensate_ok=pre_serve_compensate_ok,
+               pass_path=pass_path)
+
+
 def score_serve(feats: Features, seg_start: float, seg_end: float,
                 cfg: RefineConfig,
                 search_from: float | None = None) -> ServeGateResult:
@@ -237,6 +336,16 @@ def score_serve(feats: Features, seg_start: float, seg_end: float,
     `search_from` extends the lookback to the Pass 1 window start for the
     window's first segment — the serve sits near the window start, and the
     smoothed rising edge can lag it by more than the default lookback.
+
+    A segment can legitimately open with a false-start motion (a practice
+    toss/throw) before the real serve strike. Contact candidates are
+    therefore searched across the WHOLE segment, not just a fixed window
+    after the rising edge, and EACH candidate is tried end-to-end (contact +
+    flight + landing + hard gate) rather than committing to a single
+    highest-scoring contact before flight/landing are ever evaluated — a toss
+    can look like the best "contact" in isolation (stationary, near-baseline
+    player) yet fail flight/landing, silently burying a later, real serve
+    that would have passed on its own.
     """
     t0 = seg_start - cfg.serve_lookback_s
     if search_from is not None:
@@ -253,151 +362,81 @@ def score_serve(feats: Features, seg_start: float, seg_end: float,
     pre_pose_coverage = (float(feats.formation_pose_native[m].mean())
                          if m.any() and len(feats.formation_pose_native) else 0.0)
 
-    # -- phase 2: contact ---------------------------------------------------
-    # Search only the window correlated with strong formation being held
-    # (falls back to the full [t0,t1] lookback if formation was never
-    # strong there) — otherwise a stray high-speed ball event anywhere in the
+    # -- phase 2: contact candidates ------------------------------------------
+    # Search the window correlated with strong formation being held (falls
+    # back to the full [t0,seg_end] lookback if formation was never strong
+    # there) — otherwise a stray high-speed ball event anywhere in the
     # lookback window (a hard shot from the prior point's tail) can outscore
-    # the real, weaker-looking serve contact.
-    fw = _formation_window(feats, t0, t1, cfg)
-    ct0, ct1 = fw if fw is not None else (t0, t1)
-    best = None                      # (combined, t, server_y, xy)
+    # the real, weaker-looking serve contact. Bounded by seg_end (the actual
+    # Stage-C segment boundary), NOT by serve_search_s -- capping the search
+    # at the rising edge + serve_search_s makes a later, genuine contact
+    # (after a false-start toss) structurally invisible to every downstream
+    # check, not just weakly scored.
+    fw = _formation_window(feats, t0, seg_end, cfg)
+    ct0, ct1 = fw if fw is not None else (t0, seg_end)
+    direct = []                      # [(q, t, server_y, xy)], best first
     for t, xy, spd in _contact_candidates(feats, ct0, ct1, cfg):
         fit, server_y = _server_fit(feats, t, xy, cfg)
         speed_q = np.clip(spd / (2 * cfg.serve_contact_speed_mps), 0, 1)
         q = fit * (0.4 + 0.6 * speed_q)
-        if fit > 0.15 and (best is None or q > best[0]):
-            best = (float(q), t, server_y, xy)
-    contact = best[0] if best else 0.0
-    contact_t = best[1] if best else None
-    server_y = best[2] if best else None
+        if fit > 0.15:
+            direct.append((float(q), t, server_y, xy))
+    direct.sort(key=lambda c: -c[0])
 
     # Fallback: the strike is untrackable (ball fused with the body), so no
     # detected candidate sits at the server. Recover it from the serve arc,
     # extrapolated back to where the ball originated. Slightly discounted vs a
-    # directly-observed contact since it is inferred, not seen.
-    if best is None:
-        bc = _ballistic_contact(feats, seg_start, t1, cfg)
-        if bc is not None:
-            contact = 0.85 * bc[0]
-            contact_t, server_y = bc[1], bc[2]
+    # directly-observed contact since it is inferred, not seen. Tried as one
+    # more candidate (after direct ones) rather than only when NO direct
+    # candidate exists, so it can also rescue a segment where the only direct
+    # candidate found is the false-start toss, not the real serve.
+    bc = _ballistic_contact(feats, seg_start, ct1, cfg)
+    candidates = list(direct)
+    if bc is not None:
+        candidates.append((0.85 * bc[0], bc[1], bc[2], bc[3]))
+    candidates.append((0.0, None, None, None))    # last resort: no contact evidence at all
 
-    # -- phase 3: flight ------------------------------------------------------
-    # A confirmed net crossing shortly after contact, at height, is a hard
-    # requirement (see flight_or_landing_ok below) — contact + rally_evidence
-    # alone let non-serve activity (a rolling ball being fetched, a carried
-    # ball) through purely on ambient rhythm. Height check: a served ball
-    # crossing the net is genuinely airborne; a ball rolling on the ground
-    # tracks near h=0, so require the ball above serve_flight_min_height_m at
-    # the crossing when height data is available (ballistic 3D reconstruction
-    # off/failed => no height signal => don't penalize, can't verify).
-    # Scan every qualifying crossing in the window rather than stopping at the
-    # first: near the net a real serve can register as two crossings a few
-    # frames apart (net-tape jitter in the pixel track flips the projected
-    # side briefly before settling), and taking the first one indiscriminately
-    # can pick the undirected one when a directionally-confirmed crossing for
-    # the SAME serve sits a fraction of a second later in the same window.
-    anchor = contact_t if contact_t is not None else seg_start
-    expected = (1.0 if server_y < NET_Y else -1.0) if server_y is not None else None
-    flight = 0.0
-    for ct, cd in zip(feats.crossings_t, feats.crossings_dir):
-        if cfg.serve_flight_min_s <= ct - anchor <= cfg.serve_flight_max_s:
-            h = _ball_height_at(feats, ct)
-            if h is not None and h < cfg.serve_flight_min_height_m:
-                continue          # ground-level "crossing" — not a real flight, keep scanning
-            flight = max(flight, 0.8)
-            if expected is not None and cd == expected:
-                flight = 1.0
-                break             # strongest possible evidence, nothing left to gain by scanning on
+    best_fallback = None   # (comps, gate, contact_t) for the best NON-passing candidate
+    for contact, contact_t, server_y, _xy in candidates:
+        anchor = contact_t if contact_t is not None else seg_start
+        flight, landing = _flight_and_landing(feats, anchor, server_y, cfg)
 
-    # -- phase 4: landing -------------------------------------------------------
-    # landing=1.0 means a bounce CONFIRMED beyond the kitchen on the
-    # receiver's diagonal half (strong evidence); landing=0.3 means some
-    # nearby bounce existed but wasn't clearly beyond the kitchen (weak/
-    # ambiguous — NOT sufficient on its own for the hard gate below, since
-    # this is exactly what a rolling-ball false positive can produce).
-    landing = 0.0
-    if server_y is not None and len(feats.bounces_t):
-        for bt, bxy in zip(feats.bounces_t, feats.bounces_xy):
-            if not (anchor < bt <= anchor + 2.5) or not np.isfinite(bxy[1]):
-                continue
-            beyond = bxy[1] > NET_Y + KITCHEN if server_y < NET_Y \
-                else bxy[1] < NET_Y - KITCHEN
-            in_x = -0.5 <= bxy[0] <= COURT_W + 0.5
-            landing = 1.0 if (beyond and in_x) else 0.3
-            break
+        # -- rally evidence: sustained crossing rate inside the segment ------
+        # Discounted by play DEPTH: a kitchen dinking drill also crosses the
+        # net rhythmically, but its ball never leaves the kitchen corridor,
+        # while a real (served) rally spends plenty of time beyond it.
+        # Anchor-independent -- computed once per candidate is wasteful but
+        # harmless; kept inline here so comps/score stay a single readback.
+        n_cross = int(np.sum((feats.crossings_t >= seg_start)
+                             & (feats.crossings_t <= seg_end)))
+        rate10 = n_cross / max(seg_end - seg_start, 1e-6) * 10.0
+        rally_ev = float(np.clip(rate10 / cfg.rally_evidence_x10s, 0, 1))
+        seg_m = ((feats.native_t >= seg_start) & (feats.native_t <= seg_end)
+                 & feats.ball_visible_native)
+        if seg_m.any():
+            y = feats.td.ball_xy[seg_m, 1]
+            deep_frac = float(np.mean(np.abs(y - NET_Y) > KITCHEN))
+            rally_ev *= float(np.clip(deep_frac / 0.3, 0, 1))
 
-    # -- rally evidence: sustained crossing rate inside the segment ----------
-    # Discounted by play DEPTH: a kitchen dinking drill also crosses the net
-    # rhythmically, but its ball never leaves the kitchen corridor, while a
-    # real (served) rally spends plenty of time beyond it.
-    n_cross = int(np.sum((feats.crossings_t >= seg_start)
-                         & (feats.crossings_t <= seg_end)))
-    rate10 = n_cross / max(seg_end - seg_start, 1e-6) * 10.0
-    rally_ev = float(np.clip(rate10 / cfg.rally_evidence_x10s, 0, 1))
-    seg_m = ((feats.native_t >= seg_start) & (feats.native_t <= seg_end)
-             & feats.ball_visible_native)
-    if seg_m.any():
-        y = feats.td.ball_xy[seg_m, 1]
-        deep_frac = float(np.mean(np.abs(y - NET_Y) > KITCHEN))
-        rally_ev *= float(np.clip(deep_frac / 0.3, 0, 1))
+        comps = {"pre_serve": pre, "contact": contact, "flight": flight,
+                 "landing": landing, "rally_evidence": rally_ev}
+        w = cfg.serve_weights
+        score = sum(w[k] * comps[k] for k in w) / sum(w.values())
+        gate = _gate_decision(pre, contact, flight, landing, cfg)
 
-    comps = {"pre_serve": pre, "contact": contact, "flight": flight,
-             "landing": landing, "rally_evidence": rally_ev}
-    w = cfg.serve_weights
-    score = sum(w[k] * comps[k] for k in w) / sum(w.values())
-    # Hard gate:
-    #  1. flight_or_landing_ok is ALWAYS required — EITHER a confirmed
-    #     beyond-kitchen landing OR a DIRECTIONALLY-CONFIRMED flight crossing
-    #     (flight == 1.0: the crossing matched the expected direction away
-    #     from the server's side, not merely "some crossing was found" —
-    #     flight == 0.8 is undirected and, on its own, is exactly what a
-    #     stray/ambient net crossing unrelated to this point can produce).
-    #     Rules out contact + rally_evidence carrying a false positive on
-    #     ambient rhythm alone (the module docstring's original confirmed
-    #     false-positive case), and closes a second one where undirected
-    #     flight (0.8) plus marginal pre_serve/contact still slipped through
-    #     (confirmed false positive: flight=0.8, landing=0, pre_serve=0.40,
-    #     contact=0.68).
-    #  2. PLUS one of: contact_ok, pre_serve_compensate_ok, or (near-floor
-    #     contact + directionally-confirmed flight + base pre_serve floor).
-    #     Ball-near-player detection is often weak/occluded right at contact
-    #     even for real serves, so a strict AND let one noisy metric veto an
-    #     otherwise well-evidenced serve (two confirmed false negatives:
-    #     pre_serve 0.62/0.36 with flight/landing confirmed, dropped only
-    #     because contact read 0.20/0.28, just under the 0.3 floor). Strong
-    #     formation + confirmed flight/landing can compensate for a weak
-    #     contact read; separately, a directionally-confirmed flight crossing
-    #     is itself strong enough evidence that a near-floor (not weak) contact
-    #     read plus a merely-base pre_serve shouldn't kill the serve (confirmed
-    #     false negative: flight=1.0, landing=0, pre_serve=0.361, contact=0.2815
-    #     — missed the 0.3 contact floor by a small margin).
-    flight_directional = flight >= 1.0
-    flight_or_landing_ok = landing >= 1.0 or flight_directional
-    pre_serve_ok = pre >= cfg.serve_pre_serve_min                    # diagnostic only
-    contact_ok = contact >= cfg.serve_contact_min
-    contact_near_floor_ok = contact >= cfg.serve_contact_near_floor_min
-    pre_serve_compensate_ok = pre >= cfg.serve_pre_serve_compensate_min
-    pass_path = None
-    if flight_or_landing_ok and contact_ok:
-        pass_path = "contact"
-    elif flight_or_landing_ok and pre_serve_compensate_ok:
-        pass_path = "formation_compensation"
-    elif flight_directional and contact_near_floor_ok and pre_serve_ok:
-        pass_path = "directional_flight_compensation"
-    gate_ok = pass_path is not None
-    if not gate_ok:
-        score = 0.0
-    return ServeGateResult(score=float(score), contact_t=contact_t,
-                           components=comps,
-                           flight_or_landing_ok=flight_or_landing_ok,
-                           flight_directional=flight_directional,
-                           contact_ok=contact_ok,
-                           contact_near_floor_ok=contact_near_floor_ok,
-                           pre_serve_ok=pre_serve_ok,
-                           pre_serve_compensate_ok=pre_serve_compensate_ok,
-                           pass_path=pass_path,
-                           pre_serve_pose_coverage=pre_pose_coverage)
+        if gate["pass_path"] is not None:
+            return ServeGateResult(score=float(score), contact_t=contact_t,
+                                   components=comps,
+                                   pre_serve_pose_coverage=pre_pose_coverage,
+                                   **gate)
+        if best_fallback is None:
+            best_fallback = (comps, gate, contact_t)
+
+    # No candidate's gate passed -- report the first (highest-quality direct,
+    # else ballistic, else no-contact) candidate for diagnostics, score 0.
+    comps, gate, contact_t = best_fallback
+    return ServeGateResult(score=0.0, contact_t=contact_t, components=comps,
+                           pre_serve_pose_coverage=pre_pose_coverage, **gate)
 
 
 def snap_end(feats: Features, seg_start: float, seg_end: float,
