@@ -34,6 +34,7 @@ docker run -d --rm --platform linux/amd64 -p "$PORT:8420" \
   -e S3_VIDEO_BUCKET="$BUCKET" \
   -e AWS_REGION="$REGION" \
   -e RUN_PROCESSING=0 \
+  -e AWS_PROFILE_OVERRIDE="${AWS_PROFILE_OVERRIDE:-picklecv-claude-code}" \
   -v "$HOME/.aws:/root/.aws:ro" \
   -v "$DATA_DIR:/app/data" \
   --name "$CONTAINER_NAME" \
