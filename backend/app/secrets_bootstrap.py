@@ -24,13 +24,13 @@ def load_anthropic_key() -> None:
     if os.environ.get("ANTHROPIC_API_KEY"):
         return
     try:
+        import os as _os
         import boto3
-        client = boto3.client("secretsmanager", region_name=SECRET_REGION)
+        profile = _os.environ.get("AWS_PROFILE_OVERRIDE")
+        session = boto3.Session(profile_name=profile) if profile else boto3.Session()
+        client = session.client("secretsmanager", region_name=SECRET_REGION)
         secret = client.get_secret_value(SecretId=SECRET_ID)["SecretString"]
     except Exception as exc:
-        # No boto3 (local dev), no instance role (RunPod/local), no network,
-        # secret missing/renamed — any of these just leaves the key unset,
-        # same as today: everything except the feedback report still works.
         log.info("ANTHROPIC_API_KEY unset and Secrets Manager fetch unavailable (%s); "
                   "feedback-report feature will be disabled until a key is set.", exc)
         return

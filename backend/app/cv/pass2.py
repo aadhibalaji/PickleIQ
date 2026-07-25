@@ -438,7 +438,13 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                      "cxy": [round(o.court_xy[0], 2), round(o.court_xy[1], 2)] if o.court_xy else None,
                      "team": o.team,
                      "kp": [[round(x, 1), round(y, 1)] for x, y in o.keypoints]
-                           if o.keypoints else None}
+                           if o.keypoints else None,
+                     # Parallel to "kp" (same COCO-17 indices) — YOLO's raw
+                     # per-keypoint confidence, previously discarded. Additive:
+                     # "kp" itself is unchanged, so every existing reader of it
+                     # keeps working untouched.
+                     "kp_conf": [round(c, 3) for c in o.kp_conf]
+                                if o.kp_conf else None}
                     for o in obs
                     # identity.py caps real identity slots at MAX_PER_TEAM (2) per
                     # team for the whole match, and force-binds every detection to

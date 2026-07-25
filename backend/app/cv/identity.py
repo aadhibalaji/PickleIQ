@@ -87,10 +87,24 @@ class PlayerIdentityTracker:
     at each detected serve. Slots are never dropped, so ids stay in 1..4."""
 
     # cost = court_dist_m / POS_SCALE + APP_W * bhattacharyya(hist, hist) in [0,1]
+    #        - hysteresis bonus for the identity tracked in nearby recent frames
     POS_SCALE = 2.0
     APP_W = 1.5
     MATCH_MAX = 2.2       # above this a detection prefers a NEW slot (if room)
     HIST_ALPHA = 0.12     # EMA rate for the appearance descriptor
+    # Hysteresis: a single noisy torso-histogram reading (small crop, coarse
+    # 16x16 HSV bins) can swing APP_W=1.5 cost units on ONE frame — enough to
+    # outweigh a decisive multi-metre position gap and steal a continuously-
+    # tracked player away to a stale identity for a frame or two (confirmed on
+    # real data: singles clip 9ac7be49..., frame 10453 — the identity matched
+    # one frame earlier at 0.4m away lost to one dormant for 1467 frames at
+    # 3.1m away, on appearance alone). STICKY_BONUS rewards whichever identity
+    # was matched in the last STICKY_WINDOW frames, decaying linearly to 0 —
+    # short enough that a genuine return after a real occlusion (which takes
+    # longer than a few frames to resolve) still gets matched on position/
+    # appearance alone, unaffected by this bonus.
+    STICKY_BONUS = 0.6
+    STICKY_WINDOW = 10    # frames
     # Hard cap on real identity slots per team, for the WHOLE run (this tracker
     # lives once per run_pass2() call — see PoseTracker.__init__ / run_pass2,
     # it is never re-created per window). Once both slots for a team exist,
@@ -130,10 +144,10 @@ class PlayerIdentityTracker:
         idents = self._team_ids(team)
         hists = [_torso_hist(frame, o.box, o.keypoints) for o in dets]
         matched: set[int] = set()
-        for di, ii in self._match(dets, hists, idents):
+        for di, ii in self._match(dets, hists, idents, frame_idx):
             # Reject a poor match only when we can still afford a new slot; once
             # both slots exist, always bind to the best (a 3rd det is noise).
-            if (self._cost(dets[di], hists[di], idents[ii]) > self.MATCH_MAX
+            if (self._cost(dets[di], hists[di], idents[ii], frame_idx) > self.MATCH_MAX
                     and len(idents) < self.MAX_PER_TEAM):
                 continue
             self._update(idents[ii], dets[di], hists[di], frame_idx)
@@ -152,7 +166,7 @@ class PlayerIdentityTracker:
                 o.number = idn.number
             # else over capacity -> slot/number stay None (dropped as before)
 
-    def _cost(self, o, hist, idn: _Identity) -> float:
+    def _cost(self, o, hist, idn: _Identity, frame_idx: int) -> float:
         pos = 0.0
         if idn.court_xy is not None:
             pos = math.hypot(o.court_xy[0] - idn.court_xy[0],
@@ -160,16 +174,21 @@ class PlayerIdentityTracker:
         app = 1.0
         if hist is not None and idn.hist is not None:
             app = float(cv2.compareHist(idn.hist, hist, cv2.HISTCMP_BHATTACHARYYA))
-        return pos + self.APP_W * app
+        cost = pos + self.APP_W * app
+        if idn.last_frame >= 0:
+            age = frame_idx - idn.last_frame
+            if age < self.STICKY_WINDOW:
+                cost -= self.STICKY_BONUS * (1.0 - age / self.STICKY_WINDOW)
+        return cost
 
-    def _match(self, dets, hists, idents) -> list[tuple[int, int]]:
+    def _match(self, dets, hists, idents, frame_idx: int) -> list[tuple[int, int]]:
         """Minimum-cost injective matching of dets <-> idents. N is tiny (<=2 per
         team), so brute-force over permutations of the smaller side is optimal
         and dependency-free."""
         n_d, n_i = len(dets), len(idents)
         if not n_d or not n_i:
             return []
-        cost = [[self._cost(dets[d], hists[d], idents[i]) for i in range(n_i)]
+        cost = [[self._cost(dets[d], hists[d], idents[i], frame_idx) for i in range(n_i)]
                 for d in range(n_d)]
         best: list[tuple[int, int]] | None = None
         best_c: float | None = None

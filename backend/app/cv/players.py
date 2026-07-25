@@ -101,6 +101,13 @@ class PlayerObs:
     foot_xy: tuple[float, float]            # pixel point on the ground
     court_xy: tuple[float, float] | None    # metres via homography
     keypoints: list[list[float]] = field(default_factory=list)
+    # Per-keypoint confidence (COCO-17 order, same indices as `keypoints`),
+    # straight from YOLO's r.keypoints.conf — previously discarded entirely,
+    # which meant nothing downstream could tell a confident detection from a
+    # low-confidence guess at an occluded joint (see rallyanalysis/coaching.py
+    # and contact_detect.py, both of which only checked x,y > 0). Purely
+    # additive: existing `keypoints` xy behaviour is unchanged.
+    kp_conf: list[float] = field(default_factory=list)
     team: str | None = None                 # 'near' | 'far'
     number: int | None = None
     slot: int | None = None                 # persistent match-stable identity id
@@ -185,6 +192,8 @@ class PoseTracker:
             ids = np.array([self._syn - i for i in range(len(boxes))], dtype=int)
             self._syn -= len(boxes)
         kpts = r.keypoints.xy.cpu().numpy() if r.keypoints is not None else None
+        kconf = (r.keypoints.conf.cpu().numpy()
+                 if r.keypoints is not None and r.keypoints.conf is not None else None)
         h_px, w_px = frame.shape[:2]
         for i, tid in enumerate(ids):
             x1, y1, x2, y2 = boxes[i].tolist()
@@ -213,6 +222,7 @@ class PoseTracker:
                 track_id=int(tid), box=(x1, y1, x2, y2), foot_xy=foot,
                 court_xy=court_xy, team=team,
                 keypoints=kpts[i].tolist() if kpts is not None else [],
+                kp_conf=kconf[i].tolist() if kconf is not None else [],
             ))
         # Match-stable identity: assign each detection to a persistent per-team
         # slot (appearance + court position) and stamp its slot + official number.
