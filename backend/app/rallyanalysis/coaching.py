@@ -66,17 +66,39 @@ MIN_BEST_CONFIDENCE = 0.3
 MAX_TIPS = 8       # keeps the UI list short and readable regardless of rally count
 MAX_PRAISE_TIPS = 3  # reserves most of the cap for actionable ("improve") tips
 
+# Minimum YOLO per-keypoint confidence (cv/players.py's r.keypoints.conf,
+# stored as overlay "kp_conf") for a keypoint to support a biomechanics
+# metric below. A SINGLE global cutoff, not per-joint: the only two
+# already-processed clips checked so far disagree on which joints are
+# weakest (one clip: wrists/ankles worst; the other: ankles/knees worst and
+# flatter across the board) — a per-joint threshold today would encode that
+# small, inconsistent sample as a stable joint hierarchy it doesn't actually
+# support yet. 0.5 is a conservative, easy-to-reason-about floor (YOLO itself
+# is less than a coin flip confident below it) applied uniformly until more
+# labeled clips justify per-joint tuning.
+# THIS IS A STARTING POINT, NOT A CALIBRATED VALUE — revisit once more clips
+# have been processed with kp_conf capture (see cv/players.py PlayerObs.kp_conf).
+KP_CONF_MIN = 0.5
+
 
 # ---------------------------------------------------------------------------
 # Pure pose-window helpers (no DB) — unit-tested directly on synthetic overlays.
 # ---------------------------------------------------------------------------
 
 def _kp_xy(pdict: dict, idx: int) -> tuple[float, float] | None:
+    """A keypoint counts as usable only if it's present AND (when confidence
+    was captured — see cv/players.py's kp_conf) at least KP_CONF_MIN. Older
+    overlay rows written before kp_conf capture existed have no "kp_conf" key
+    at all; those fall back to the old presence-only check rather than being
+    treated as automatically failing a threshold they never recorded."""
     kp = pdict.get("kp")
     if not kp or len(kp) <= idx:
         return None
     pt = kp[idx]
     if not pt or pt[0] <= 0 or pt[1] <= 0:
+        return None
+    conf = pdict.get("kp_conf")
+    if conf and len(conf) > idx and conf[idx] < KP_CONF_MIN:
         return None
     return (float(pt[0]), float(pt[1]))
 
@@ -174,9 +196,11 @@ def compute_feature_vector(contact: dict, entries: list[dict], fps: float) -> Sh
     (any order, any players). Returns None only when this player has no pose
     data anywhere in the window (contact gets skipped, not fabricated).
 
-    Individual metrics that lack pose support fall back to the midpoint of
-    their own reference range (deviation_score 0 for that metric) rather than
-    crashing or fabricating a flag — see the per-field comments below.
+    Individual metrics that lack CONFIDENT pose support (missing keypoint, or
+    below KP_CONF_MIN) are excluded — left None, never backfilled with the
+    midpoint of their reference range. A metric we didn't confidently see is
+    absent, not silently reported as "in range". Excluded metric names are
+    collected in low_confidence_metrics.
     """
     frames = _player_frames(entries, contact["player_id"])
     if not frames:
@@ -186,18 +210,19 @@ def compute_feature_vector(contact: dict, entries: list[dict], fps: float) -> Sh
     pre_frames = [fp for fp in frames if fp[0] <= contact_frame]
     post_frames = [fp for fp in frames if fp[0] >= contact_frame]
     hitting_side = _hitting_side(frames)
+    low_confidence_metrics: list[str] = []
 
     knee_bend_deg = _nearest_valid(frames, contact_frame, _knee_angle)
     if knee_bend_deg is None:
-        knee_bend_deg = _neutral(KNEE_BEND_GOOD_RANGE_DEG)
+        low_confidence_metrics.append("knee_bend_deg")
 
     shoulder_rotation_deg = _nearest_valid(frames, contact_frame, _shoulder_rotation)
     if shoulder_rotation_deg is None:
-        shoulder_rotation_deg = _neutral(SHOULDER_ROTATION_GOOD_RANGE_DEG)
+        low_confidence_metrics.append("shoulder_rotation_deg")
 
     elbow_extension_deg = _nearest_valid(frames, contact_frame, lambda p: _elbow_angle(p, hitting_side))
     if elbow_extension_deg is None:
-        elbow_extension_deg = _neutral(ELBOW_EXTENSION_GOOD_RANGE_DEG)
+        low_confidence_metrics.append("elbow_extension_deg")
 
     # weight_transfer_score: forward court-plane movement (toward the net) of
     # this player from the start of the pre-window to contact, normalized by
@@ -210,7 +235,8 @@ def compute_feature_vector(contact: dict, entries: list[dict], fps: float) -> Sh
         forward = -dy if contact.get("team") == "near" else dy  # near moves toward decreasing y
         weight_transfer_score = max(0.0, min(1.0, forward / WEIGHT_TRANSFER_NORM_M))
     else:
-        weight_transfer_score = _neutral(WEIGHT_TRANSFER_GOOD_RANGE)
+        weight_transfer_score = None
+        low_confidence_metrics.append("weight_transfer_score")
 
     # contact_height_m: LIMITATION — no calibrated vertical (Z) coordinate is
     # available (pose keypoints + homography only give a ground-plane
@@ -234,10 +260,11 @@ def compute_feature_vector(contact: dict, entries: list[dict], fps: float) -> Sh
             path += math.hypot(pt[0] - prev_pt[0], pt[1] - prev_pt[1])
         if pt:
             prev_pt = pt
-    if box_height and box_height > 1e-6:
+    if box_height and box_height > 1e-6 and prev_pt is not None:
         follow_through_completion_score = max(0.0, min(1.0, path / (box_height * FOLLOW_THROUGH_NORM)))
     else:
-        follow_through_completion_score = _neutral(FOLLOW_THROUGH_GOOD_RANGE)
+        follow_through_completion_score = None
+        low_confidence_metrics.append("follow_through_completion_score")
 
     # split_step_delay_s: time from the most "planted" (lowest ankle speed)
     # pre-contact frame to contact — a proxy for split-step landing timing.
@@ -258,12 +285,19 @@ def compute_feature_vector(contact: dict, entries: list[dict], fps: float) -> Sh
         plant_frame = min(ankle_speeds, key=lambda fs: fs[1])[0]
         split_step_delay_s = max(0.0, (contact_frame - plant_frame) / fps)
     else:
-        split_step_delay_s = _neutral(SPLIT_STEP_GOOD_RANGE_S)
+        split_step_delay_s = None
+        low_confidence_metrics.append("split_step_delay_s")
 
     category, deviation_score = _classify(
         knee_bend_deg, shoulder_rotation_deg, elbow_extension_deg,
         weight_transfer_score, contact_height_m, follow_through_completion_score,
         split_step_delay_s)
+    if category is None:
+        # Every category's metrics were excluded — nothing real to score.
+        # (In practice unreachable today since contact_height_m always has a
+        # real reading, but this is what "no scoreable data" degrades to if
+        # that ever changes, rather than fabricating a category/score.)
+        return None
 
     return ShotFeatureVector(
         contact_id=contact["contact_id"], category=category,
@@ -271,13 +305,17 @@ def compute_feature_vector(contact: dict, entries: list[dict], fps: float) -> Sh
         elbow_extension_deg=elbow_extension_deg, weight_transfer_score=weight_transfer_score,
         contact_height_m=contact_height_m,
         follow_through_completion_score=follow_through_completion_score,
-        split_step_delay_s=split_step_delay_s, deviation_score=deviation_score)
+        split_step_delay_s=split_step_delay_s, deviation_score=deviation_score,
+        low_confidence_metrics=low_confidence_metrics)
 
 
-def _norm_dev(value: float, rng: tuple[float, float]) -> float:
+def _norm_dev(value: float | None, rng: tuple[float, float]) -> float | None:
     """Signed deviation from [lo, hi], expressed in units of range-width so
     metrics with different units (degrees, seconds, 0-1 scores) are
-    comparable. 0 = within range."""
+    comparable. 0 = within range. None (metric excluded — no confident pose
+    support) passes through as None rather than being treated as 0/in-range."""
+    if value is None:
+        return None
     lo, hi = rng
     width = hi - lo
     if value < lo:
@@ -289,13 +327,19 @@ def _norm_dev(value: float, rng: tuple[float, float]) -> float:
 
 def _classify(knee_bend_deg, shoulder_rotation_deg, elbow_extension_deg,
               weight_transfer_score, contact_height_m, follow_through_completion_score,
-              split_step_delay_s) -> tuple[str, float]:
+              split_step_delay_s) -> tuple[str | None, float | None]:
     """category = whichever of the four categories has the single worst
-    (largest-magnitude) normalized deviation among its component metrics;
-    deviation_score is that category's signed deviation. A shot with every
-    metric in range gets an arbitrary-but-stable category (max of all-zero
-    deviations) and deviation_score 0.0 (i.e. not flagged — see
-    compute_category_ratios)."""
+    (largest-magnitude) normalized deviation among its REAL (non-excluded)
+    component metrics; deviation_score is that category's signed deviation.
+    A category every one of whose metrics was excluded for missing/low-
+    confidence pose data is never eligible to win — that would be the same
+    fabricated-neutral bug at the category level even if individual metrics
+    are properly excluded. A shot with every metric in range gets an
+    arbitrary-but-stable category (max of all-zero deviations) and
+    deviation_score 0.0 (i.e. not flagged — see compute_category_ratios).
+    Returns (None, None) only if literally no category has any real metric
+    (compute_feature_vector treats that as unscoreable, same as no pose data
+    at all)."""
     per_category = {
         "footwork": [_norm_dev(split_step_delay_s, SPLIT_STEP_GOOD_RANGE_S),
                      _norm_dev(knee_bend_deg, KNEE_BEND_GOOD_RANGE_DEG)],
@@ -305,7 +349,13 @@ def _classify(knee_bend_deg, shoulder_rotation_deg, elbow_extension_deg,
                            _norm_dev(contact_height_m, CONTACT_HEIGHT_GOOD_RANGE_M)],
         "follow_through": [_norm_dev(follow_through_completion_score, FOLLOW_THROUGH_GOOD_RANGE)],
     }
-    category_dev = {cat: max(devs, key=abs) for cat, devs in per_category.items()}
+    category_dev = {}
+    for cat, devs in per_category.items():
+        real = [d for d in devs if d is not None]
+        if real:
+            category_dev[cat] = max(real, key=abs)
+    if not category_dev:
+        return None, None
     category = max(category_dev, key=lambda c: abs(category_dev[c]))
     return category, category_dev[category]
 
@@ -332,6 +382,11 @@ def _shot_summary(vec: ShotFeatureVector, contact: dict) -> dict:
         "shot_side": contact.get("shot_side"),
         "is_serve": bool(contact.get("is_serve")),
         "confidence": contact.get("confidence"),
+        # Surfaced at top level (not just nested in feature_vector) so the LLM
+        # prompt, the UI, and any aggregate stats can all see at a glance
+        # which metrics this shot has NO confident reading for, without
+        # having to inspect every field of feature_vector for a null.
+        "low_confidence_metrics": list(vec.low_confidence_metrics),
         "feature_vector": asdict(vec),
     }
 
@@ -452,15 +507,31 @@ detected contact/swing.
 
 You receive a list of shots, each with a category (footwork, paddle_prep,
 contact_point, or follow_through), a deviation_score (negative/positive =
-outside the good-form range and needs work; 0 = solid, in-range shot), and a
+outside the good-form range and needs work; 0 = solid, in-range shot), a
 feature_vector of raw pose measurements (joint angles in degrees, 0-1 scores,
-seconds). These raw numbers are internal signal only — NEVER mention degrees,
-angles, or anatomical terms (no "elbow extension", "shoulder rotation", "knee
-bend angle", etc.) in your output. Translate them into plain language a
-rec/intermediate pickleball player would actually understand and act on
-(e.g. "you're rushing your paddle back" instead of "delayed unit turn", or
-"plant your feet before you swing" instead of "insufficient weight
-transfer").
+seconds), and a low_confidence_metrics list. These raw numbers are internal
+signal only — NEVER mention degrees, angles, or anatomical terms (no "elbow
+extension", "shoulder rotation", "knee bend angle", etc.) in your output.
+Translate them into plain language a rec/intermediate pickleball player would
+actually understand and act on (e.g. "you're rushing your paddle back"
+instead of "delayed unit turn", or "plant your feet before you swing" instead
+of "insufficient weight transfer").
+
+IMPORTANT — data gaps are real and marked, not hidden: some feature_vector
+fields are null. A null field means the computer-vision system did NOT get a
+confident reading for that specific measurement on that specific shot (pose
+tracking lost the joint, or its confidence was too low to trust) — it is not
+zero, not average, not "fine", it is simply not known. low_confidence_metrics
+names exactly which fields on this shot are null. You must NEVER state or
+imply a specific claim about a joint/measurement listed in
+low_confidence_metrics for that shot (e.g. do not say their elbow was
+extended, their knees were bent well, etc. if elbow_extension_deg or
+knee_bend_deg is null for that shot). The category and deviation_score you're
+given are always computed from whatever real (non-null) data the shot has, so
+still write a tip grounded in that category — just don't invent specifics
+about the fields that are null. If nearly everything relevant to a shot's
+category is null, it's fine for the tip to stay general/encouraging rather
+than specific.
 
 For each shot given a deviation_score != 0, write one "improve" tip: what to
 change and a bit of why it matters, in 2-3 short sentences, concrete and
@@ -614,9 +685,13 @@ def generate_coaching_report(video_id: str, rally_source: str | None = None,
 
 
 def save_report(report: CoachingReport) -> None:
+    # stale_reason explicitly NULL: this report was just built by the
+    # currently-running (confidence-aware) pipeline, so it's current by
+    # definition — never inherit staleness from whatever row it replaces.
     with db.connect() as con:
         con.execute(
-            "INSERT OR REPLACE INTO coaching_reports (video_id, tips_json, created_at) VALUES (?,?,?)",
+            "INSERT OR REPLACE INTO coaching_reports (video_id, tips_json, created_at, stale_reason)"
+            " VALUES (?,?,?,NULL)",
             (report.video_id, db.dumps([asdict(t) for t in report.tips]), db.now()))
 
 
@@ -627,7 +702,8 @@ def get_report(video_id: str) -> CoachingReport | None:
         return None
     return CoachingReport(
         video_id=row["video_id"],
-        tips=[CoachingTip(**t) for t in db.loads(row["tips_json"], [])])
+        tips=[CoachingTip(**t) for t in db.loads(row["tips_json"], [])],
+        stale_reason=row["stale_reason"])
 
 
 if __name__ == "__main__":

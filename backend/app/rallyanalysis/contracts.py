@@ -32,17 +32,30 @@ class ContactEvent:
 
 @dataclass
 class ShotFeatureVector:
-    """One per ContactEvent, feeding the coaching pipeline."""
+    """One per ContactEvent, feeding the coaching pipeline.
+
+    knee_bend_deg/shoulder_rotation_deg/elbow_extension_deg/weight_transfer_score/
+    follow_through_completion_score/split_step_delay_s are None when this shot
+    had no confident pose support for that specific metric (missing keypoint,
+    or below coaching.KP_CONF_MIN) — see low_confidence_metrics. They are NEVER
+    backfilled with a fabricated "neutral/in-range" placeholder; a metric with
+    no real reading is simply absent, not silently reported as fine.
+    contact_height_m is a court-position proxy from the contact event itself
+    (not keypoint-derived), so it's always present."""
     contact_id: str
     category: str  # 'footwork' | 'paddle_prep' | 'contact_point' | 'follow_through'
-    knee_bend_deg: float
-    shoulder_rotation_deg: float
-    elbow_extension_deg: float
-    weight_transfer_score: float
+    knee_bend_deg: float | None
+    shoulder_rotation_deg: float | None
+    elbow_extension_deg: float | None
+    weight_transfer_score: float | None
     contact_height_m: float
-    follow_through_completion_score: float
-    split_step_delay_s: float
+    follow_through_completion_score: float | None
+    split_step_delay_s: float | None
     deviation_score: float  # signed distance from good-form reference range
+    # Names (dataclass field names above) of metrics excluded from this shot
+    # for missing/low-confidence pose data — the explicit "we didn't actually
+    # see this" flag consumed by aggregate stats and the coaching narrative.
+    low_confidence_metrics: list = field(default_factory=list)
 
 
 @dataclass
@@ -65,3 +78,7 @@ class CoachingReport:
     """One per video, generated once (explicit user action — LLM call)."""
     video_id: str
     tips: list = field(default_factory=list)  # list[CoachingTip]
+    # None = current (built on the confidence-aware pipeline). Otherwise a
+    # short machine-readable reason this report predates a data-accuracy fix
+    # and may contain fabricated feature values — see db.STALE_BEFORE_CONFIDENCE_FIX.
+    stale_reason: str | None = None

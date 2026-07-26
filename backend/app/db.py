@@ -213,7 +213,15 @@ _ADDED_COLUMNS = [
     ("ball_corrections", "in_out", "TEXT"),
     ("ball_corrections", "in_out_suggested", "TEXT"),
     ("ball_corrections", "disagree", "INTEGER DEFAULT 0"),
+    # NULL = current/trustworthy; otherwise a short machine-readable reason a
+    # report predates a data-accuracy fix and shouldn't be acted on as-is
+    # without regenerating (e.g. "generated_before_confidence_fix" — see the
+    # backfill in init_db below). TEXT rather than a single-purpose boolean so
+    # a future different staleness reason doesn't need its own new column.
+    ("coaching_reports", "stale_reason", "TEXT"),
 ]
+
+STALE_BEFORE_CONFIDENCE_FIX = "generated_before_confidence_fix"
 
 
 def connect() -> sqlite3.Connection:
@@ -231,6 +239,18 @@ def init_db() -> None:
             have = {r["name"] for r in con.execute(f"PRAGMA table_info({table})")}
             if col not in have:
                 con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {coltype}")
+                if (table, col) == ("coaching_reports", "stale_reason"):
+                    # One-time backfill, the moment this column is created:
+                    # every row that already exists was necessarily built by
+                    # the pre-fix coaching.py (the fix can't have produced a
+                    # row before its own migration ran), so it may contain
+                    # fabricated-neutral feature values silently reported as
+                    # "in range". Only runs inside this one-shot ADD COLUMN
+                    # branch, so reports saved after this point (stale_reason
+                    # set explicitly by save_report) are never touched again.
+                    con.execute(
+                        "UPDATE coaching_reports SET stale_reason=? WHERE stale_reason IS NULL",
+                        (STALE_BEFORE_CONFIDENCE_FIX,))
         # coaching_reports moved from one aggregate narrative to per-shot tips
         # (tips_json) — it's a regeneratable cache, not source data, so drop
         # and recreate on the old schema rather than migrate columns.
