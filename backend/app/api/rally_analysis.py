@@ -10,6 +10,7 @@ Endpoints:
   POST /rally-analysis/{video_id}/coaching-report    generate report (1 Anthropic call) -> coaching_reports
   GET  /rally-analysis/{video_id}/coaching-report    cached report, or {"report": null}
   GET  /rally-analysis/{video_id}/report-stats       forward-momentum / kitchen-arrival / shot-zone aggregate stats
+  GET  /rally-analysis/{video_id}/trajectories       per-rally 3D ball trajectory samples (ballistic reconstruction)
 """
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ from dataclasses import asdict
 from fastapi import APIRouter
 
 from .. import db
-from ..rallyanalysis import coaching, contact_detect, report_stats
+from ..rallyanalysis import coaching, contact_detect, report_stats, trajectory
 from ..rallyanalysis.contracts import CoachingReport
 from ..rallyanalysis.readiness import readiness_report
 
@@ -90,3 +91,14 @@ def get_report_stats(video_id: str, source: str | None = None):
     get_analyzable_rallies() currently clears. Computed fresh each call
     (cheap aggregation, no LLM call) — nothing is persisted."""
     return report_stats.get_report_stats(video_id, rally_source=source)
+
+
+@router.get("/rally-analysis/{video_id}/trajectories")
+def get_trajectories(video_id: str, source: str | None = None):
+    """Per-rally ball trajectory samples for the 3D trajectory view:
+    {video_id, rallies: [{rally_id, points: [{frame, x, y, height_m,
+    confidence, player_id}]}]}. height_m comes from the ballistic
+    reconstruction (refine/ballistic.py); confidence and player_id are
+    documented in rallyanalysis/trajectory.py. Computed fresh each call
+    (nothing persisted), restricted to rallies readiness clears."""
+    return trajectory.get_video_trajectories(video_id, rally_source=source)

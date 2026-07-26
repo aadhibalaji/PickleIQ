@@ -5,7 +5,7 @@ build_report with an injected fake llm_fn), same pattern as contact_detect
 tests."""
 from __future__ import annotations
 
-from ..coaching import (MAX_PRAISE_TIPS, MAX_TIPS, _classify, _neutral, _norm_dev,
+from ..coaching import (MAX_PRAISE_TIPS, MAX_TIPS, SYSTEM, _classify, _neutral, _norm_dev,
                          _summarize_stats, build_report, compute_feature_vector,
                          exclude_serves, generate_llm_tips, select_tip_candidates,
                          select_worst_best,
@@ -63,23 +63,29 @@ def test_classify_flags_the_worst_offending_category():
 def test_worst_shots_adaptive_not_fixed_topn_clean_session():
     # One mild outlier among many perfect shots — adaptive threshold should
     # surface it without us hardcoding "top 3" or similar.
-    vectors_meta = [(_vec(f"c{i}", "footwork", 0.0), _contact(f"c{i}")) for i in range(8)]
-    vectors_meta.append((_vec("bad", "footwork", 5.0), _contact("bad")))
+    # Timestamps spread well beyond MIN_TIP_GAP_S apart -- this test is about
+    # the adaptive severity threshold, not the time-gap filter.
+    vectors_meta = [(_vec(f"c{i}", "footwork", 0.0), _contact(f"c{i}", timestamp_s=i * 10.0))
+                     for i in range(8)]
+    vectors_meta.append((_vec("bad", "footwork", 5.0), _contact("bad", timestamp_s=999.0)))
     worst, _best = select_worst_best(vectors_meta)
     assert any(w["contact_id"] == "bad" for w in worst)
     assert len(worst) < len(vectors_meta)  # didn't just flag everything
 
 
 def test_worst_shots_empty_when_every_shot_in_range():
-    vectors_meta = [(_vec(f"c{i}", "footwork", 0.0), _contact(f"c{i}")) for i in range(5)]
+    vectors_meta = [(_vec(f"c{i}", "footwork", 0.0), _contact(f"c{i}", timestamp_s=i * 10.0))
+                     for i in range(5)]
     worst, _best = select_worst_best(vectors_meta)
     assert worst == []
 
 
 def test_worst_shots_scales_up_for_a_rough_session():
     # Many comparably-bad shots -> adaptive threshold should let most of them
-    # through (a rough session surfaces many, not a fixed count).
-    vectors_meta = [(_vec(f"c{i}", "contact_point", 2.0 + 0.01 * i), _contact(f"c{i}"))
+    # through (a rough session surfaces many, not a fixed count). Timestamps
+    # spread well beyond MIN_TIP_GAP_S apart so the time-gap filter (tested
+    # separately below) doesn't collapse them.
+    vectors_meta = [(_vec(f"c{i}", "contact_point", 2.0 + 0.01 * i), _contact(f"c{i}", timestamp_s=i * 10.0))
                      for i in range(10)]
     worst, _best = select_worst_best(vectors_meta)
     assert len(worst) >= 4
@@ -97,15 +103,56 @@ def test_best_shots_requires_in_range_and_high_confidence():
     assert "low_conf" not in best_ids          # confidence floor excludes it
 
 
+# --------------------------------------------------- min time-gap suppression
+
+def test_same_player_close_worst_tips_keep_only_more_severe_one():
+    # Two worst candidates for the same player 1s apart (well under
+    # MIN_TIP_GAP_S) -- only the larger |deviation_score| one should survive.
+    vectors_meta = [
+        (_vec("mild", "footwork", -1.5), _contact("mild", timestamp_s=10.0)),
+        (_vec("severe", "footwork", -4.0), _contact("severe", timestamp_s=11.0)),
+    ]
+    worst, _best = select_worst_best(vectors_meta)
+    assert {w["contact_id"] for w in worst} == {"severe"}
+
+
+def test_different_players_close_in_time_both_survive():
+    # Same timestamps, but different players -- the gap filter must never
+    # suppress across players.
+    vectors_meta = [
+        (_vec("p1", "footwork", -3.0), _contact("p1", timestamp_s=10.0)),
+        (_vec("p2", "footwork", -3.0),
+         {**_contact("p2", timestamp_s=10.4), "player_id": 2}),
+    ]
+    worst, _best = select_worst_best(vectors_meta)
+    assert {w["contact_id"] for w in worst} == {"p1", "p2"}
+
+
+def test_same_player_close_tips_suppressed_across_categories_worst_beats_best():
+    # A worst tip (footwork) and a best tip (contact_point), same player,
+    # 1s apart -- cross-category suppression still applies, and the worst
+    # (actionable) tip always outranks the best (praise) tip for the same
+    # moment.
+    vectors_meta = [
+        (_vec("worst_one", "footwork", -2.0), _contact("worst_one", timestamp_s=5.0, confidence=0.9)),
+        (_vec("best_one", "contact_point", 0.0), _contact("best_one", timestamp_s=5.5, confidence=0.99)),
+    ]
+    worst, best = select_worst_best(vectors_meta)
+    assert {w["contact_id"] for w in worst} == {"worst_one"}
+    assert best == []
+
+
 # ------------------------------------------------------- tip-candidate cap
 
 def test_select_tip_candidates_caps_total_and_reserves_praise_slots():
     # Many worse-than-threshold shots plus many clean high-confidence
     # shots -- total surfaced must never exceed MAX_TIPS, and praise never
     # crowds out more than MAX_PRAISE_TIPS worth of improve tips.
-    worst_meta = [(_vec(f"bad{i}", "footwork", -5.0), _contact(f"bad{i}", confidence=0.9))
+    # Timestamps spread well beyond MIN_TIP_GAP_S apart -- this test is about
+    # the MAX_TIPS/MAX_PRAISE_TIPS cap, not the time-gap filter.
+    worst_meta = [(_vec(f"bad{i}", "footwork", -5.0), _contact(f"bad{i}", confidence=0.9, timestamp_s=i * 10.0))
                   for i in range(20)]
-    best_meta = [(_vec(f"good{i}", "footwork", 0.0), _contact(f"good{i}", confidence=0.95))
+    best_meta = [(_vec(f"good{i}", "footwork", 0.0), _contact(f"good{i}", confidence=0.95, timestamp_s=1000.0 + i * 10.0))
                  for i in range(20)]
     candidates = select_tip_candidates(worst_meta + best_meta)
     assert len(candidates) == MAX_TIPS
@@ -123,8 +170,10 @@ def test_build_report_passes_candidates_to_llm_fn_and_calls_it_once():
         return {s["contact_id"]: {"tip": "mock tip", "tone": "improve" if s["deviation_score"] else "praise"}
                 for s in shots}
 
+    # timestamps well beyond MIN_TIP_GAP_S apart -- this test is about the
+    # llm_fn wiring/call-count, not the time-gap filter.
     vectors_meta = [(_vec("good", "footwork", 0.0), _contact("good", confidence=0.9, frame_idx=10, timestamp_s=1.5)),
-                     (_vec("bad", "contact_point", -3.0), _contact("bad", confidence=0.9, frame_idx=20, timestamp_s=3.0))]
+                     (_vec("bad", "contact_point", -3.0), _contact("bad", confidence=0.9, frame_idx=20, timestamp_s=30.0))]
     report = build_report("vid1", vectors_meta, llm_fn=fake_llm)
 
     assert len(calls) == 1  # exactly one Anthropic call per video
@@ -134,7 +183,7 @@ def test_build_report_passes_candidates_to_llm_fn_and_calls_it_once():
     tips_by_id = {t.contact_id: t for t in report.tips}
     assert tips_by_id["bad"].tone == "improve"
     assert tips_by_id["bad"].frame == 20
-    assert tips_by_id["bad"].timestamp_s == 3.0
+    assert tips_by_id["bad"].timestamp_s == 30.0
     assert tips_by_id["good"].tone == "praise"
 
 
@@ -344,6 +393,23 @@ def test_compute_feature_vector_missing_kp_conf_key_is_presence_only_no_regressi
     assert vec is not None
     assert vec.low_confidence_metrics == []
     assert vec.knee_bend_deg is not None
+
+
+def test_system_prompt_keeps_null_safety_and_no_raw_numbers_rules():
+    # Rework of the tone framing (see coaching.py's TIPS_SCHEMA/SYSTEM) must
+    # never loosen these safety rules — only the delivery style around them
+    # changes.
+    assert "NEVER mention degrees, angles, confidence/certainty scores" in SYSTEM
+    assert "Never state a raw seconds value, a velocity, or any" in SYSTEM
+    assert "must NEVER state or\nimply a specific claim about a joint/measurement" in SYSTEM
+    assert "no known reading for it — never fabricate a claim about it" in SYSTEM
+
+
+def test_system_prompt_encodes_three_beat_supportive_framing():
+    # The reworked tone must require: acknowledge -> undiluted critique -> encouraging close.
+    assert "three-beat" in SYSTEM
+    assert "Do NOT soften, hedge, vague-up, or water down the" in SYSTEM
+    assert "NOT a compliment sandwich that pads or dilutes" in SYSTEM
 
 
 if __name__ == "__main__":

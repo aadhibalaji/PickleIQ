@@ -102,15 +102,19 @@ kbd { background: var(--panel2); border: 1px solid var(--border); border-radius:
 .rally-video { margin-top: 4px; }
 .rally-video video { display: block; width: 100%; max-height: 46vh; background: #000; border-radius: 8px; }
 .pin-track {
-  position: relative; height: 20px; margin-top: 8px; background: var(--panel2);
+  position: relative; margin-top: 8px; background: var(--panel2);
   border: 1px solid var(--border); border-radius: 4px; cursor: pointer;
+  transition: height 0.15s ease;
 }
 /* Coaching-moment block: spans the shot's swing-analysis time range,
    colored by player (inline style), with a tone-distinguishing border —
    solid for praise, dashed for improve. min-width keeps very short spans
-   clickable; opacity < 1 keeps overlapping blocks visible. */
+   clickable; opacity < 1 keeps overlapping blocks visible. top/height are
+   set inline per-block (RallyAnalysisPanel.jsx's assignLanes) so blocks
+   that would touch/overlap in time stack into rows instead of drawing on
+   top of each other. */
 .pin {
-  position: absolute; top: 2px; bottom: 2px; min-width: 4px;
+  position: absolute; min-width: 4px;
   border-radius: 3px; padding: 0; cursor: pointer; opacity: 0.75;
 }
 .pin.tip-improve { border: 2px dashed var(--panel); }
@@ -135,7 +139,20 @@ kbd { background: var(--panel2); border: 1px solid var(--border); border-radius:
 }
 .shot-heatmap-toggle { margin-left: auto; }
 
+.rally-stats-table th {
+  text-transform: uppercase; font-size: 10px; font-weight: 500; letter-spacing: 0.05em;
+  color: var(--muted); background: transparent; border: none; border-bottom: 1px solid var(--border);
+}
+.rally-stats-table td { text-align: center; }
+.rally-stats-table td:first-child { text-align: left; }
+.rally-stats-empty { color: var(--muted); opacity: 0.5; }
+
+.rally-stats-summary { margin-top: 10px; display: flex; flex-direction: column; gap: 4px; }
+.rally-stats-summary-row { display: flex; gap: 8px; align-items: baseline; font-size: 12px; }
+
+.rally-stats-raw { margin-top: 10px; }
+.rally-stats-raw > summary { cursor: pointer; font-size: 13px; color: var(--muted); }
+.rally-stats-raw[open] > summary { margin-bottom: 8px; }
 .rally-stats-block { margin-top: 10px; }
-.rally-stats-block summary { cursor: pointer; font-size: 13px; color: var(--muted); }
-.rally-stats-block[open] summary { margin-bottom: 8px; }
+.rally-stats-block-title { font-size: 13px; color: var(--muted); margin-bottom: 4px; }
 .sparkline { background: var(--panel2); border: 1px solid var(--border); border-radius: 4px; margin-top: 4px; display: block; }

@@ -66,6 +66,15 @@ MIN_BEST_CONFIDENCE = 0.3
 MAX_TIPS = 8       # keeps the UI list short and readable regardless of rally count
 MAX_PRAISE_TIPS = 3  # reserves most of the cap for actionable ("improve") tips
 
+MIN_TIP_GAP_S = 4.0  # minimum spacing, in seconds, between two selected tip
+                      # moments for the SAME player (worst+best combined, any
+                      # category) — keeps rendered coaching moments from
+                      # clustering a couple seconds apart. The more instructive
+                      # of a too-close pair wins (larger |deviation_score| for
+                      # worst tips, higher confidence for best tips; worst
+                      # always outranks best, matching select_tip_candidates'
+                      # own worst-first budgeting).
+
 # Minimum YOLO per-keypoint confidence (cv/players.py's r.keypoints.conf,
 # stored as overlay "kp_conf") for a keypoint to support a biomechanics
 # metric below. A SINGLE global cutoff, not per-joint: the only two
@@ -391,6 +400,39 @@ def _shot_summary(vec: ShotFeatureVector, contact: dict) -> dict:
     }
 
 
+def _suppress_close_duplicates(worst: list[dict], best: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Drops the less-instructive of any two same-player candidates (worst or
+    best, any category — cross-category too, since two tips about the same
+    player a second apart are near-duplicates regardless of category) whose
+    timestamp_s fall within MIN_TIP_GAP_S of each other. Different players are
+    never suppressed against each other. Greedy by rank: process candidates
+    most-instructive-first (worst before best; within a type, larger
+    |deviation_score| or higher confidence first) and keep a candidate only if
+    no already-kept candidate for the same player is within the gap. A
+    candidate with no timestamp_s is never suppressed and never suppresses
+    another (missing metric, not "close")."""
+    ranked = (
+        [(0, -abs(s["deviation_score"]), s) for s in worst]
+        + [(1, -(s.get("confidence") or 0.0), s) for s in best]
+    )
+    ranked.sort(key=lambda r: (r[0], r[1]))
+
+    kept_ids: set[str] = set()
+    kept_times: dict = {}
+    for _rank, _score, s in ranked:
+        ts = s.get("timestamp_s")
+        pid = s["player_id"]
+        times = kept_times.setdefault(pid, [])
+        if ts is not None and any(abs(ts - t) < MIN_TIP_GAP_S for t in times):
+            continue
+        kept_ids.add(s["contact_id"])
+        if ts is not None:
+            times.append(ts)
+
+    return ([s for s in worst if s["contact_id"] in kept_ids],
+            [s for s in best if s["contact_id"] in kept_ids])
+
+
 def select_worst_best(vectors_meta: list[tuple[ShotFeatureVector, dict]]) -> tuple[list[dict], list[dict]]:
     """Adaptive severity selection — NOT a fixed top-N. worst_shots: shots
     whose |deviation_score| clears WORST_DEVIATION_THRESHOLD reference-range-
@@ -418,7 +460,7 @@ def select_worst_best(vectors_meta: list[tuple[ShotFeatureVector, dict]]) -> tup
             if conf >= threshold and conf >= MIN_BEST_CONFIDENCE:
                 best.append(_shot_summary(vec, contact))
 
-    return worst, best
+    return _suppress_close_duplicates(worst, best)
 
 
 def select_tip_candidates(vectors_meta: list[tuple[ShotFeatureVector, dict]]) -> list[dict]:
@@ -485,13 +527,16 @@ TIPS_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "contact_id": {"type": "string"},
-                    "tip": {"type": "string", "description": "2-3 short sentences in the "
-                            "voice of a real coach talking to the player, not a lab report: "
-                            "direct, specific, warm but willing to be critical when a shot "
-                            "calls for it. No joint angles, degrees, anatomical terms, "
-                            "confidence scores, or raw timings/velocities of any kind. Give "
-                            "a little of the why, not just the instruction, while staying "
-                            "scannable."},
+                    "tip": {"type": "string", "description": "2-3 short sentences from a "
+                            "coach who is invested in this player, not a lab report. Shape: "
+                            "(1) name what's happening for the player first, so the critique "
+                            "lands as being on their side, not (2) the critique itself, kept "
+                            "just as pointed and specific as the data supports — do not soften "
+                            "or vague it up, then (3) a clear, actionable and encouraging close. "
+                            "The critique's directness never gets diluted, only reframed. No "
+                            "joint angles, degrees, anatomical terms, confidence scores, or raw "
+                            "timings/velocities of any kind. Give a little of the why, not just "
+                            "the instruction, while staying scannable."},
                     "tone": {"type": "string", "enum": ["improve", "praise"]},
                 },
                 "required": ["contact_id", "tip", "tone"],
@@ -554,12 +599,36 @@ player missing from player_tendencies (or missing a particular tendency) has
 no known reading for it — never fabricate a claim about it, and never treat
 their absence as "average" or "fine".
 
-Write like a real coach talking to the player, not a lab report or a
-performance review. Be supportive, but be clear and honest — if a shot is
-genuinely off, say so plainly and tell them what to actually do about it
-("bend your knees more before you swing," "get your paddle back earlier"),
-rather than softening it into vague, hedged, corporate-sounding feedback.
-Concrete and direct beats polite and generic.
+Write like a coach who is invested in this specific player, not a lab report
+or a performance review — and NOT a compliment sandwich that pads or dilutes
+the critique. Every "improve" tip follows the same three-beat shape:
+  1. Acknowledge what's happening for the player right now, so the critique
+     that follows reads as a coach who's paying attention to them, not a
+     verdict handed down from nowhere.
+  2. Deliver the actual critique — just as pointed, specific, and concrete as
+     the data supports. Do NOT soften, hedge, vague-up, or water down the
+     substance to make it feel gentler. If a shot is genuinely off, say
+     exactly what's wrong and exactly what to do about it.
+  3. Close on something actionable and encouraging — the fix, and why it'll
+     help — so the player leaves knowing what to do next, not just what they
+     did wrong.
+The reframing is entirely in the packaging (who this is being said to, and
+in what order) — never in the substance of the critique itself.
+
+For example, given the same underlying shot data, do NOT write the flat,
+clinical version:
+  "You're barely putting any energy into this shot—almost no weight transfer
+  and the contact point is too low. Step in, load your weight, and finish
+  your swing so the ball has somewhere to go."
+Instead, write the same critique in the three-beat coach voice, e.g.:
+  "I can see you're not fully committing to this shot yet — there's almost
+  no weight transfer and you're meeting the ball too low to drive it. Step
+  in and load your weight before you swing, then finish all the way
+  through — that's what gives the ball somewhere to go. Get that timing
+  down and this shot picks up a lot of pop."
+Notice the critique itself (low weight transfer, low contact point, the
+fix) is exactly as specific and direct in both versions — only the framing
+around it changed.
 
 For each shot given a deviation_score != 0, write one "improve" tip: what to
 change and a bit of why it matters, in 2-3 short sentences, concrete,
