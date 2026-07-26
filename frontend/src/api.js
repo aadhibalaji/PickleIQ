@@ -106,6 +106,9 @@ export const api = {
   getLearningCurve: (kind) => fetch(`/api/models/learning_curve${kind ? `?kind=${kind}` : ''}`).then(j),
 
   getCoachingReport: (id) => fetch(`/api/rally-analysis/${id}/coaching-report`).then(j),
+  getContactEvents: (id) => fetch(`/api/rally-analysis/${id}/contact-events`).then(j),
+  getReportStats: (id) => fetch(`/api/rally-analysis/${id}/report-stats`).then(j),
+  getTrajectories: (id) => fetch(`/api/rally-analysis/${id}/trajectories`).then(j),
   generateCoachingReport: (id) =>
     fetch(`/api/rally-analysis/${id}/coaching-report`, { method: 'POST' }).then(j),
 

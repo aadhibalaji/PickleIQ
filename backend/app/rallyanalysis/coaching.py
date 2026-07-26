@@ -66,6 +66,15 @@ MIN_BEST_CONFIDENCE = 0.3
 MAX_TIPS = 8       # keeps the UI list short and readable regardless of rally count
 MAX_PRAISE_TIPS = 3  # reserves most of the cap for actionable ("improve") tips
 
+MIN_TIP_GAP_S = 4.0  # minimum spacing, in seconds, between two selected tip
+                      # moments for the SAME player (worst+best combined, any
+                      # category) — keeps rendered coaching moments from
+                      # clustering a couple seconds apart. The more instructive
+                      # of a too-close pair wins (larger |deviation_score| for
+                      # worst tips, higher confidence for best tips; worst
+                      # always outranks best, matching select_tip_candidates'
+                      # own worst-first budgeting).
+
 # Minimum YOLO per-keypoint confidence (cv/players.py's r.keypoints.conf,
 # stored as overlay "kp_conf") for a keypoint to support a biomechanics
 # metric below. A SINGLE global cutoff, not per-joint: the only two
@@ -391,6 +400,39 @@ def _shot_summary(vec: ShotFeatureVector, contact: dict) -> dict:
     }
 
 
+def _suppress_close_duplicates(worst: list[dict], best: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Drops the less-instructive of any two same-player candidates (worst or
+    best, any category — cross-category too, since two tips about the same
+    player a second apart are near-duplicates regardless of category) whose
+    timestamp_s fall within MIN_TIP_GAP_S of each other. Different players are
+    never suppressed against each other. Greedy by rank: process candidates
+    most-instructive-first (worst before best; within a type, larger
+    |deviation_score| or higher confidence first) and keep a candidate only if
+    no already-kept candidate for the same player is within the gap. A
+    candidate with no timestamp_s is never suppressed and never suppresses
+    another (missing metric, not "close")."""
+    ranked = (
+        [(0, -abs(s["deviation_score"]), s) for s in worst]
+        + [(1, -(s.get("confidence") or 0.0), s) for s in best]
+    )
+    ranked.sort(key=lambda r: (r[0], r[1]))
+
+    kept_ids: set[str] = set()
+    kept_times: dict = {}
+    for _rank, _score, s in ranked:
+        ts = s.get("timestamp_s")
+        pid = s["player_id"]
+        times = kept_times.setdefault(pid, [])
+        if ts is not None and any(abs(ts - t) < MIN_TIP_GAP_S for t in times):
+            continue
+        kept_ids.add(s["contact_id"])
+        if ts is not None:
+            times.append(ts)
+
+    return ([s for s in worst if s["contact_id"] in kept_ids],
+            [s for s in best if s["contact_id"] in kept_ids])
+
+
 def select_worst_best(vectors_meta: list[tuple[ShotFeatureVector, dict]]) -> tuple[list[dict], list[dict]]:
     """Adaptive severity selection — NOT a fixed top-N. worst_shots: shots
     whose |deviation_score| clears WORST_DEVIATION_THRESHOLD reference-range-
@@ -418,7 +460,7 @@ def select_worst_best(vectors_meta: list[tuple[ShotFeatureVector, dict]]) -> tup
             if conf >= threshold and conf >= MIN_BEST_CONFIDENCE:
                 best.append(_shot_summary(vec, contact))
 
-    return worst, best
+    return _suppress_close_duplicates(worst, best)
 
 
 def select_tip_candidates(vectors_meta: list[tuple[ShotFeatureVector, dict]]) -> list[dict]:
@@ -485,10 +527,16 @@ TIPS_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "contact_id": {"type": "string"},
-                    "tip": {"type": "string", "description": "2-3 short sentences, plain "
-                            "rec-player coaching language — no joint angles, degrees, or "
-                            "anatomical terms. Give a little of the why, not just the "
-                            "instruction, while staying scannable."},
+                    "tip": {"type": "string", "description": "2-3 short sentences from a "
+                            "coach who is invested in this player, not a lab report. Shape: "
+                            "(1) name what's happening for the player first, so the critique "
+                            "lands as being on their side, not (2) the critique itself, kept "
+                            "just as pointed and specific as the data supports — do not soften "
+                            "or vague it up, then (3) a clear, actionable and encouraging close. "
+                            "The critique's directness never gets diluted, only reframed. No "
+                            "joint angles, degrees, anatomical terms, confidence scores, or raw "
+                            "timings/velocities of any kind. Give a little of the why, not just "
+                            "the instruction, while staying scannable."},
                     "tone": {"type": "string", "enum": ["improve", "praise"]},
                 },
                 "required": ["contact_id", "tip", "tone"],
@@ -510,12 +558,27 @@ contact_point, or follow_through), a deviation_score (negative/positive =
 outside the good-form range and needs work; 0 = solid, in-range shot), a
 feature_vector of raw pose measurements (joint angles in degrees, 0-1 scores,
 seconds), and a low_confidence_metrics list. These raw numbers are internal
-signal only — NEVER mention degrees, angles, or anatomical terms (no "elbow
-extension", "shoulder rotation", "knee bend angle", etc.) in your output.
-Translate them into plain language a rec/intermediate pickleball player would
-actually understand and act on (e.g. "you're rushing your paddle back"
-instead of "delayed unit turn", or "plant your feet before you swing" instead
-of "insufficient weight transfer").
+signal only — NEVER mention degrees, angles, confidence/certainty scores, or
+anatomical terms (no "elbow extension", "shoulder rotation", "knee bend
+angle", etc.) in your output. Translate them into plain language a
+rec/intermediate pickleball player would actually understand and act on
+(e.g. "you're rushing your paddle back" instead of "delayed unit turn", or
+"plant your feet before you swing" instead of "insufficient weight
+transfer").
+
+You may also receive a player_tendencies object — small, rounded, per-player
+summaries (session-level tendencies, not per-shot data) such as how quickly a
+player tends to get back to the kitchen after a point, or how their shots
+tend to distribute across court zones. Treat these exactly like the pose
+metrics above: they are internal signal to inform what you say, never
+numbers to say out loud. Never state a raw seconds value, a velocity, or any
+sub-second timing — translate a slow kitchen-arrival tendency into something
+like "you're slow getting back to the net after your shot," never "kitchen
+arrival averages 2 seconds." Small rounded shot counts (e.g. "you rarely hit
+deep to the backcourt") may inform your framing but should stay in service of
+a coaching point, not be recited as a stat line. If player_tendencies is
+absent or empty, ignore it — say nothing about session-level tendencies for
+that player.
 
 IMPORTANT — data gaps are real and marked, not hidden: some feature_vector
 fields are null. A null field means the computer-vision system did NOT get a
@@ -531,28 +594,72 @@ given are always computed from whatever real (non-null) data the shot has, so
 still write a tip grounded in that category — just don't invent specifics
 about the fields that are null. If nearly everything relevant to a shot's
 category is null, it's fine for the tip to stay general/encouraging rather
-than specific.
+than specific. This null-handling rule applies to player_tendencies too: a
+player missing from player_tendencies (or missing a particular tendency) has
+no known reading for it — never fabricate a claim about it, and never treat
+their absence as "average" or "fine".
+
+Write like a coach who is invested in this specific player, not a lab report
+or a performance review — and NOT a compliment sandwich that pads or dilutes
+the critique. Every "improve" tip follows the same three-beat shape:
+  1. Acknowledge what's happening for the player right now, so the critique
+     that follows reads as a coach who's paying attention to them, not a
+     verdict handed down from nowhere.
+  2. Deliver the actual critique — just as pointed, specific, and concrete as
+     the data supports. Do NOT soften, hedge, vague-up, or water down the
+     substance to make it feel gentler. If a shot is genuinely off, say
+     exactly what's wrong and exactly what to do about it.
+  3. Close on something actionable and encouraging — the fix, and why it'll
+     help — so the player leaves knowing what to do next, not just what they
+     did wrong.
+The reframing is entirely in the packaging (who this is being said to, and
+in what order) — never in the substance of the critique itself.
+
+For example, given the same underlying shot data, do NOT write the flat,
+clinical version:
+  "You're barely putting any energy into this shot—almost no weight transfer
+  and the contact point is too low. Step in, load your weight, and finish
+  your swing so the ball has somewhere to go."
+Instead, write the same critique in the three-beat coach voice, e.g.:
+  "I can see you're not fully committing to this shot yet — there's almost
+  no weight transfer and you're meeting the ball too low to drive it. Step
+  in and load your weight before you swing, then finish all the way
+  through — that's what gives the ball somewhere to go. Get that timing
+  down and this shot picks up a lot of pop."
+Notice the critique itself (low weight transfer, low contact point, the
+fix) is exactly as specific and direct in both versions — only the framing
+around it changed.
 
 For each shot given a deviation_score != 0, write one "improve" tip: what to
-change and a bit of why it matters, in 2-3 short sentences, concrete and
-encouraging. For each shot with deviation_score == 0, write one "praise" tip:
-what they're doing well and why it works, so they know what to keep doing.
-Return exactly one tip per shot you were given, each referencing that shot's
-contact_id so it can be matched back up. Do not overstate certainty — this is
+change and a bit of why it matters, in 2-3 short sentences, concrete,
+critical where warranted, and encouraging in tone rather than content. For
+each shot with deviation_score == 0, write one "praise" tip: what they're
+doing well and why it works, so they know what to keep doing. Return exactly
+one tip per shot you were given, each referencing that shot's contact_id so
+it can be matched back up. Do not overstate certainty — this is
 computer-vision-derived pose data, not a substitute for in-person coaching."""
 
 
-def generate_llm_tips(shots: list[dict]) -> dict[str, dict]:
+def generate_llm_tips(shots: list[dict], stats_summary: dict | None = None) -> dict[str, dict]:
     """Returns {contact_id: {tip, tone}}, or {} (with a logged reason) when
     the API key is missing, the call fails, or the response can't be parsed —
     degrades gracefully, same as analysis/reporter.py. Never trusted for
-    frame/timestamp — those are attached from our own contact_events data."""
+    frame/timestamp — those are attached from our own contact_events data.
+
+    stats_summary (see _summarize_stats) is optional extra context folded
+    into this same single API call — never a second Anthropic call — and is
+    simply omitted from the prompt input when None/empty rather than
+    zero-filled or fabricated."""
     if not shots:
         return {}
     if not ANTHROPIC_API_KEY:
         log.warning("ANTHROPIC_API_KEY not set — skipping coaching tips")
         return {}
     import anthropic
+
+    payload: dict = {"shots": shots}
+    if stats_summary:
+        payload["player_tendencies"] = stats_summary
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     try:
@@ -562,7 +669,7 @@ def generate_llm_tips(shots: list[dict]) -> dict[str, dict]:
             thinking={"type": "enabled", "budget_tokens": 1500},
             system=SYSTEM,
             output_config={"format": {"type": "json_schema", "schema": TIPS_SCHEMA}},
-            messages=[{"role": "user", "content": db.dumps({"shots": shots})}],
+            messages=[{"role": "user", "content": db.dumps(payload)}],
         )
     except anthropic.RateLimitError:
         log.error("Anthropic rate limit — try generating the coaching report again shortly")
@@ -592,6 +699,46 @@ def generate_llm_tips(shots: list[dict]) -> dict[str, dict]:
     return out
 
 
+def _summarize_stats(stats: dict | None) -> dict | None:
+    """Compacts report_stats.get_report_stats()'s per-rally time-series output
+    into the small, LLM-safe summary generate_llm_tips folds into its one
+    prompt: per-player rounded (whole-second) average kitchen-arrival
+    tendency plus how many rallies that's based on, and the already-small
+    per-zone shot counts. Never dumps the raw forward_momentum series or
+    per-rally sub-second kitchen_arrival_s values — those are aggregated away
+    here, not passed through. A player/rally with no real reading for a given
+    stat is simply absent from the summary, never zero-filled or averaged in
+    as 0. Returns None when there's nothing worth passing to the prompt."""
+    if not stats:
+        return None
+
+    arrivals: dict[str, list[float]] = {}
+    for rally in (stats.get("rallies") or {}).values():
+        for pid, secs in (rally.get("kitchen_arrival_s") or {}).items():
+            if secs is not None:
+                arrivals.setdefault(pid, []).append(secs)
+
+    kitchen_tendencies = {
+        player_label(pid): {
+            "avg_kitchen_arrival_s_rounded": round(sum(vals) / len(vals)),
+            "rallies_with_data": len(vals),
+        }
+        for pid, vals in arrivals.items()
+    }
+
+    shot_distribution = {
+        player_label(pid): sides
+        for pid, sides in (stats.get("shot_counts") or {}).items()
+    }
+
+    summary: dict = {}
+    if kitchen_tendencies:
+        summary["kitchen_arrival_tendencies"] = kitchen_tendencies
+    if shot_distribution:
+        summary["shot_distribution_by_zone"] = shot_distribution
+    return summary or None
+
+
 # ---------------------------------------------------------------------------
 # Orchestration — the only DB-touching layer. build_report is the pure core
 # (video_id/vectors_meta -> CoachingReport, LLM call injectable) so tests can
@@ -599,10 +746,16 @@ def generate_llm_tips(shots: list[dict]) -> dict[str, dict]:
 # ---------------------------------------------------------------------------
 
 def build_report(video_id: str, vectors_meta: list[tuple[ShotFeatureVector, dict]],
-                  llm_fn=None) -> CoachingReport:
+                  llm_fn=None, stats_summary: dict | None = None) -> CoachingReport:
     llm_fn = llm_fn or generate_llm_tips
     candidates = select_tip_candidates(vectors_meta)
-    tip_text = llm_fn(candidates)  # the one Anthropic call for this video
+    # llm_fn is the one Anthropic call for this video. Injected/mocked llm_fns
+    # in tests may only accept the original (shots) signature -- fall back to
+    # that rather than requiring every test double to accept stats_summary.
+    try:
+        tip_text = llm_fn(candidates, stats_summary)
+    except TypeError:
+        tip_text = llm_fn(candidates)
     # Player attribution is our own data (contact_events.player_id), not
     # trusted from the model's echoed output — attach it here regardless of
     # what the LLM response contains.
@@ -614,6 +767,17 @@ def build_report(video_id: str, vectors_meta: list[tuple[ShotFeatureVector, dict
         for c in candidates if c["contact_id"] in tip_text
     ]
     return CoachingReport(video_id=video_id, tips=tips)
+
+
+def exclude_serves(contacts: list[dict]) -> list[dict]:
+    """Serves are excluded from the coaching narrative/worst-best selection
+    entirely — filtered once here, at the earliest point the contact list is
+    assembled, rather than downstream in feature-vector computation or
+    worst/best selection. A rally that's all serves (or a video with zero
+    non-serve contacts overall) just yields fewer/no contacts here; the rest
+    of the pipeline already degrades an empty contact/vector list to an empty
+    tip list (see select_tip_candidates), never an error or serve fallback."""
+    return [c for c in contacts if not c.get("is_serve")]
 
 
 def merge_singles_players(contacts: list[dict], match_type: str | None) -> list[dict]:
@@ -666,6 +830,7 @@ def generate_coaching_report(video_id: str, rally_source: str | None = None,
             "SELECT * FROM contact_events WHERE video_id=? ORDER BY frame_idx",
             (video_id,)).fetchall())
     contacts = [c for c in contacts if c["rally_id"] in ready_rally_ids]
+    contacts = exclude_serves(contacts)
     contacts = merge_singles_players(contacts, vrow["match_type"] if vrow else None)
     fps = float(vrow["fps"]) if vrow and vrow["fps"] else 30.0
 
@@ -679,7 +844,15 @@ def generate_coaching_report(video_id: str, rally_source: str | None = None,
         if vec is not None:
             vectors_meta.append((vec, c))
 
-    report = build_report(video_id, vectors_meta)
+    stats_summary = None
+    try:
+        from . import report_stats  # lazy: report_stats imports from this module
+        stats_summary = _summarize_stats(
+            report_stats.get_report_stats(video_id, rally_source=rally_source, overlay_source=overlay_source))
+    except Exception:  # noqa: BLE001 — stats are an add-on; never block the report
+        log.warning("report_stats unavailable for %s — generating coaching report without it", video_id, exc_info=True)
+
+    report = build_report(video_id, vectors_meta, stats_summary=stats_summary)
     save_report(report)
     return report
 
