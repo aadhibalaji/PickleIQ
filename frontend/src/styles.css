@@ -90,6 +90,12 @@ kbd { background: var(--panel2); border: 1px solid var(--border); border-radius:
 
 /* Rally Analysis: pin-on-video coaching view */
 .clip-list-empty { color: var(--muted); font-size: 12px; }
+.stale-report-banner {
+  display: flex; align-items: center; gap: 8px;
+  background: rgba(229, 165, 58, 0.12); border: 1px solid var(--warn);
+  color: var(--warn); border-radius: 8px; padding: 8px 12px;
+  font-size: 13px; margin-bottom: 10px;
+}
 
 .rally-video { margin-top: 4px; }
 .rally-video video { display: block; width: 100%; max-height: 46vh; background: #000; border-radius: 8px; }

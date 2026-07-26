@@ -58,6 +58,12 @@ export default function RallyAnalysisPanel({ videoId, video, onUpdateVideo }) {
           <div className="clip-list-empty">No coaching report yet.</div>
         ) : (
           <>
+            {report.stale_reason && (
+              <div className="stale-report-banner">
+                ⚠️ This report was generated before a data-accuracy fix and may contain
+                unreliable feedback — regenerate for accurate results.
+              </div>
+            )}
             {players.length > 1 && (
               <div className="tabs" style={{ margin: '4px 0 8px' }}>
                 <button className={selectedPlayer === ALL_PLAYERS ? 'active' : ''}

@@ -5,7 +5,8 @@ build_report with an injected fake llm_fn), same pattern as contact_detect
 tests."""
 from __future__ import annotations
 
-from ..coaching import (MAX_PRAISE_TIPS, MAX_TIPS, _classify, _neutral, build_report,
+from ..coaching import (MAX_PRAISE_TIPS, MAX_TIPS, _classify, _neutral, _norm_dev,
+                         build_report, compute_feature_vector,
                          select_tip_candidates, select_worst_best,
                          ELBOW_EXTENSION_GOOD_RANGE_DEG, FOLLOW_THROUGH_GOOD_RANGE,
                          KNEE_BEND_GOOD_RANGE_DEG, SHOULDER_ROTATION_GOOD_RANGE_DEG,
@@ -140,6 +141,96 @@ def test_build_report_degrades_gracefully_when_llm_fn_returns_empty():
     vectors_meta = [(_vec("c1", "footwork", 0.0), _contact("c1"))]
     report = build_report("vid1", vectors_meta, llm_fn=lambda shots: {})
     assert report.tips == []  # never crashes, never fabricates a tip
+
+
+# ------------------------------------------------ silent-neutral fallback fix
+
+def test_norm_dev_none_passes_through_instead_of_zero():
+    assert _norm_dev(None, (0.0, 1.0)) is None
+    assert _norm_dev(0.5, (0.0, 1.0)) == 0.0
+
+
+def test_classify_never_picks_a_category_whose_metrics_are_all_excluded():
+    # footwork's only two metrics (split_step, knee_bend) are both None (no
+    # confident pose support). The old fallback would have defaulted both to
+    # their neutral midpoint -> deviation_score 0.0, a fabricated "footwork is
+    # fine" reading. footwork must not even be an eligible category here.
+    cat, _dev = _classify(None, _neutral(SHOULDER_ROTATION_GOOD_RANGE_DEG),
+                           _neutral(ELBOW_EXTENSION_GOOD_RANGE_DEG), _neutral(WEIGHT_TRANSFER_GOOD_RANGE),
+                           0.0, _neutral(FOLLOW_THROUGH_GOOD_RANGE), None)
+    assert cat != "footwork"
+
+
+def test_classify_returns_none_when_nothing_real_anywhere():
+    cat, dev = _classify(None, None, None, None, None, None, None)
+    assert cat is None
+    assert dev is None
+
+
+def _kp17():
+    """17 COCO keypoints with hip/knee/ankle/shoulder/elbow/wrist placed to
+    give _angle_deg a well-defined (non-degenerate) angle; exact values don't
+    matter for these tests, only that a real number comes out."""
+    pts = [[100.0 + i, 200.0 + i] for i in range(17)]
+    pts[5], pts[6] = [100.0, 50.0], [150.0, 50.0]     # shoulders
+    pts[7], pts[8] = [100.0, 100.0], [150.0, 100.0]   # elbows
+    pts[9], pts[10] = [150.0, 100.0], [200.0, 100.0]  # wrists
+    pts[11], pts[12] = [100.0, 100.0], [150.0, 100.0]  # hips
+    pts[13], pts[14] = [100.0, 150.0], [150.0, 150.0]  # knees
+    pts[15], pts[16] = [150.0, 120.0], [200.0, 120.0]  # ankles
+    return pts
+
+
+def _pose_frame(f, kp, kp_conf, cxy=(1.0, 5.0)):
+    return {"f": f, "players": [{"id": 1, "kp": kp, "kp_conf": kp_conf,
+                                  "cxy": list(cxy), "box": [0.0, 0.0, 50.0, 100.0], "team": "near"}]}
+
+
+def _pose_contact(frame_idx=100, court_x=1.0, court_y=5.0):
+    return {"contact_id": "c1", "frame_idx": frame_idx, "player_id": 1,
+            "court_x": court_x, "court_y": court_y, "team": "near"}
+
+
+def test_compute_feature_vector_high_confidence_excludes_nothing():
+    # Two frames so split_step_delay_s (needs an ankle-speed diff between
+    # consecutive pre-contact frames) has something real to compute too.
+    entries = [_pose_frame(90, _kp17(), [0.95] * 17),
+               _pose_frame(100, _kp17(), [0.95] * 17)]
+    vec = compute_feature_vector(_pose_contact(), entries, fps=30.0)
+    assert vec is not None
+    assert vec.low_confidence_metrics == []
+    assert vec.knee_bend_deg is not None
+    assert vec.shoulder_rotation_deg is not None
+    assert vec.elbow_extension_deg is not None
+    assert vec.split_step_delay_s is not None
+
+
+def test_compute_feature_vector_low_confidence_excludes_not_neutral():
+    conf = [0.95] * 17
+    for idx in (11, 12, 13, 14, 15, 16):  # hips/knees/ankles
+        conf[idx] = 0.1
+    entries = [_pose_frame(100, _kp17(), conf)]
+    vec = compute_feature_vector(_pose_contact(), entries, fps=30.0)
+    assert vec is not None
+    assert vec.knee_bend_deg is None
+    assert "knee_bend_deg" in vec.low_confidence_metrics
+    assert vec.split_step_delay_s is None
+    assert "split_step_delay_s" in vec.low_confidence_metrics
+    # the category actually chosen must never be one whose metrics were all excluded
+    if vec.category == "footwork":
+        assert False, "footwork has no real support here and must not be picked"
+
+
+def test_compute_feature_vector_missing_kp_conf_key_is_presence_only_no_regression():
+    # Overlay rows written before Step 1's kp_conf capture have no "kp_conf"
+    # key at all -- must behave exactly as before (presence-only), not be
+    # treated as automatically failing a threshold they never recorded.
+    entries = [_pose_frame(90, _kp17(), kp_conf=None),
+               _pose_frame(100, _kp17(), kp_conf=None)]
+    vec = compute_feature_vector(_pose_contact(), entries, fps=30.0)
+    assert vec is not None
+    assert vec.low_confidence_metrics == []
+    assert vec.knee_bend_deg is not None
 
 
 if __name__ == "__main__":

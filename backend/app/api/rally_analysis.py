@@ -27,7 +27,8 @@ router = APIRouter()
 def _report_payload(report: CoachingReport) -> dict:
     tips = [asdict(t) for t in report.tips]
     players = sorted({t["player_label"] for t in tips})
-    return {"video_id": report.video_id, "tips": tips, "players": players}
+    return {"video_id": report.video_id, "tips": tips, "players": players,
+            "stale_reason": report.stale_reason}
 
 
 @router.get("/rally-analysis/health")
