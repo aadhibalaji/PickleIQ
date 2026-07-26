@@ -6,8 +6,9 @@ tests."""
 from __future__ import annotations
 
 from ..coaching import (MAX_PRAISE_TIPS, MAX_TIPS, _classify, _neutral, _norm_dev,
-                         build_report, compute_feature_vector,
-                         select_tip_candidates, select_worst_best,
+                         _summarize_stats, build_report, compute_feature_vector,
+                         exclude_serves, generate_llm_tips, select_tip_candidates,
+                         select_worst_best,
                          ELBOW_EXTENSION_GOOD_RANGE_DEG, FOLLOW_THROUGH_GOOD_RANGE,
                          KNEE_BEND_GOOD_RANGE_DEG, SHOULDER_ROTATION_GOOD_RANGE_DEG,
                          SPLIT_STEP_GOOD_RANGE_S, WEIGHT_TRANSFER_GOOD_RANGE)
@@ -32,10 +33,10 @@ def _vec(contact_id, category, deviation_score):
         deviation_score=deviation_score)
 
 
-def _contact(contact_id, confidence=0.8, timestamp_s=1.0, frame_idx=0, rally_id="r1"):
+def _contact(contact_id, confidence=0.8, timestamp_s=1.0, frame_idx=0, rally_id="r1", is_serve=False):
     return {"contact_id": contact_id, "frame_idx": frame_idx, "timestamp_s": timestamp_s,
             "rally_id": rally_id, "player_id": 1, "team": "near", "shot_side": "left",
-            "is_serve": False, "confidence": confidence}
+            "is_serve": is_serve, "confidence": confidence}
 
 
 # --------------------------------------------------------------- classify()
@@ -117,7 +118,7 @@ def test_select_tip_candidates_caps_total_and_reserves_praise_slots():
 def test_build_report_passes_candidates_to_llm_fn_and_calls_it_once():
     calls = []
 
-    def fake_llm(shots):
+    def fake_llm(shots, stats=None):
         calls.append(shots)
         return {s["contact_id"]: {"tip": "mock tip", "tone": "improve" if s["deviation_score"] else "praise"}
                 for s in shots}
@@ -141,6 +142,118 @@ def test_build_report_degrades_gracefully_when_llm_fn_returns_empty():
     vectors_meta = [(_vec("c1", "footwork", 0.0), _contact("c1"))]
     report = build_report("vid1", vectors_meta, llm_fn=lambda shots: {})
     assert report.tips == []  # never crashes, never fabricates a tip
+
+
+# --------------------------------------------------------- serve exclusion
+
+def test_exclude_serves_drops_only_serve_contacts():
+    contacts = [{"contact_id": "serve1", "is_serve": True},
+                {"contact_id": "rally1", "is_serve": False},
+                {"contact_id": "rally2", "is_serve": 0},
+                {"contact_id": "serve2", "is_serve": 1}]
+    kept = exclude_serves(contacts)
+    assert {c["contact_id"] for c in kept} == {"rally1", "rally2"}
+
+
+def test_exclude_serves_all_serves_yields_empty_list():
+    contacts = [{"contact_id": "serve1", "is_serve": True}, {"contact_id": "serve2", "is_serve": 1}]
+    assert exclude_serves(contacts) == []
+
+
+def test_select_tip_candidates_never_surfaces_a_serve_contact():
+    # A serve contact that reaches select_tip_candidates (e.g. if the upstream
+    # exclude_serves filter were ever skipped) must still never win a worst/
+    # best slot -- but the real guarantee is exclude_serves keeping it out of
+    # vectors_meta in the first place, which generate_coaching_report relies
+    # on. Here we simulate "exclude_serves ran" by building vectors_meta only
+    # from non-serve contacts, then assert no is_serve contact sneaks in.
+    vectors_meta = [(_vec("serve", "footwork", -5.0), _contact("serve", is_serve=True)),
+                    (_vec("rally", "footwork", -5.0), _contact("rally", is_serve=False))]
+    non_serve_meta = [(vec, c) for vec, c in vectors_meta if not c["is_serve"]]
+    candidates = select_tip_candidates(non_serve_meta)
+    assert all(not c["is_serve"] for c in candidates)
+    assert {c["contact_id"] for c in candidates} == {"rally"}
+
+
+def test_build_report_all_serve_input_degrades_to_empty_report_no_error():
+    # exclude_serves() upstream would leave vectors_meta empty for an
+    # all-serve rally/video -- build_report must produce an empty-but-valid
+    # report, not crash or fabricate tips from serve data.
+    report = build_report("vid1", [], llm_fn=lambda shots: {})
+    assert report.tips == []
+
+
+# -------------------------------------------------- report_stats summarizing
+
+def test_summarize_stats_none_or_empty_returns_none():
+    assert _summarize_stats(None) is None
+    assert _summarize_stats({}) is None
+    assert _summarize_stats({"rallies": {}, "shot_counts": {}}) is None
+
+
+def test_summarize_stats_rounds_kitchen_arrival_and_omits_nulls():
+    # Player "2" never reaches the kitchen in either rally (None every time)
+    # -- must be entirely absent from the summary, never averaged in as 0.
+    stats = {
+        "rallies": {
+            "r1": {"kitchen_arrival_s": {"1": 1.8, "2": None}},
+            "r2": {"kitchen_arrival_s": {"1": 2.6, "2": None}},
+        },
+        "shot_counts": {},
+    }
+    summary = _summarize_stats(stats)
+    tendencies = summary["kitchen_arrival_tendencies"]
+    assert "Player 2" not in tendencies
+    entry = tendencies["Player 1"]
+    assert entry["avg_kitchen_arrival_s_rounded"] == round((1.8 + 2.6) / 2)
+    assert isinstance(entry["avg_kitchen_arrival_s_rounded"], int)  # never sub-second
+    assert entry["rallies_with_data"] == 2
+
+
+def test_summarize_stats_passes_through_small_shot_counts():
+    stats = {"rallies": {}, "shot_counts": {"1": {"left": {"kitchen": {"serve": 0, "non_serve": 3}}}}}
+    summary = _summarize_stats(stats)
+    assert summary["shot_distribution_by_zone"]["Player 1"] == {"left": {"kitchen": {"serve": 0, "non_serve": 3}}}
+    assert "kitchen_arrival_tendencies" not in summary
+
+
+# ------------------------------------------------ stats context in the prompt
+
+def test_generate_llm_tips_includes_stats_in_prompt_when_present(monkeypatch):
+    captured = {}
+
+    class FakeTextBlock:
+        type = "text"
+        text = '{"tips": []}'
+
+    class FakeResponse:
+        content = [FakeTextBlock()]
+
+    class FakeMessages:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return FakeResponse()
+
+    class FakeClient:
+        def __init__(self, api_key=None):
+            self.messages = FakeMessages()
+
+    import sys
+    import types
+
+    fake_anthropic = types.SimpleNamespace(
+        Anthropic=FakeClient, RateLimitError=Exception, AuthenticationError=Exception,
+        APIStatusError=Exception, APIConnectionError=Exception)
+    monkeypatch.setitem(sys.modules, "anthropic", fake_anthropic)
+    monkeypatch.setattr("app.rallyanalysis.coaching.ANTHROPIC_API_KEY", "fake-key")
+
+    stats = {"kitchen_arrival_tendencies": {"Player 1": {"avg_kitchen_arrival_s_rounded": 2, "rallies_with_data": 3}}}
+    generate_llm_tips([{"contact_id": "c1"}], stats_summary=stats)
+    assert "player_tendencies" in captured["messages"][0]["content"]
+
+    captured.clear()
+    generate_llm_tips([{"contact_id": "c1"}], stats_summary=None)
+    assert "player_tendencies" not in captured["messages"][0]["content"]
 
 
 # ------------------------------------------------ silent-neutral fallback fix

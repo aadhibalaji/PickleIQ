@@ -9,6 +9,7 @@ Endpoints:
   GET  /rally-analysis/{video_id}/readiness          per-rally Pass 2 readiness (waiting/stale/ready)
   POST /rally-analysis/{video_id}/coaching-report    generate report (1 Anthropic call) -> coaching_reports
   GET  /rally-analysis/{video_id}/coaching-report    cached report, or {"report": null}
+  GET  /rally-analysis/{video_id}/report-stats       forward-momentum / kitchen-arrival / shot-zone aggregate stats
 """
 from __future__ import annotations
 
@@ -17,7 +18,7 @@ from dataclasses import asdict
 from fastapi import APIRouter
 
 from .. import db
-from ..rallyanalysis import coaching, contact_detect
+from ..rallyanalysis import coaching, contact_detect, report_stats
 from ..rallyanalysis.contracts import CoachingReport
 from ..rallyanalysis.readiness import readiness_report
 
@@ -80,3 +81,12 @@ def get_coaching_report(video_id: str):
     regeneration only happens via the POST endpoint."""
     report = coaching.get_report(video_id)
     return {"video_id": video_id, "report": _report_payload(report) if report else None}
+
+
+@router.get("/rally-analysis/{video_id}/report-stats")
+def get_report_stats(video_id: str, source: str | None = None):
+    """Aggregate coaching-report stats (forward momentum, kitchen arrival,
+    shot counts by side/zone), restricted to rallies readiness.
+    get_analyzable_rallies() currently clears. Computed fresh each call
+    (cheap aggregation, no LLM call) — nothing is persisted."""
+    return report_stats.get_report_stats(video_id, rally_source=source)
