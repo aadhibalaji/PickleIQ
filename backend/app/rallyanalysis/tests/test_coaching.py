@@ -5,13 +5,11 @@ build_report with an injected fake llm_fn), same pattern as contact_detect
 tests."""
 from __future__ import annotations
 
-from ..coaching import (MAX_PRAISE_TIPS, MAX_TIPS, SYSTEM, _classify, _neutral, _norm_dev,
-                         _summarize_stats, build_report, compute_feature_vector,
-                         exclude_serves, generate_llm_tips, select_tip_candidates,
-                         select_worst_best,
-                         ELBOW_EXTENSION_GOOD_RANGE_DEG, FOLLOW_THROUGH_GOOD_RANGE,
-                         KNEE_BEND_GOOD_RANGE_DEG, SHOULDER_ROTATION_GOOD_RANGE_DEG,
-                         SPLIT_STEP_GOOD_RANGE_S, WEIGHT_TRANSFER_GOOD_RANGE)
+from ..coaching import (MAX_PRAISE_TIPS, MAX_TIPS, MIN_SAMPLES_FOR_DISTRIBUTION, SYSTEM,
+                         _classify, _extract_raw_metrics, _finalize_vector, _player_fences_by_metric,
+                         _rel_dev, _robust_fence, _summarize_stats, build_report,
+                         compute_feature_vector, exclude_serves, generate_llm_tips,
+                         select_tip_candidates, select_worst_best)
 from ..contracts import ShotFeatureVector
 
 CATEGORIES = ["footwork", "paddle_prep", "contact_point", "follow_through"]
@@ -20,16 +18,12 @@ CATEGORIES = ["footwork", "paddle_prep", "contact_point", "follow_through"]
 def _vec(contact_id, category, deviation_score):
     """Build a ShotFeatureVector whose fields don't matter for the tests
     below — only category/deviation_score are asserted on — so every other
-    field is a neutral mid-range placeholder."""
+    field is an arbitrary placeholder."""
     return ShotFeatureVector(
         contact_id=contact_id, category=category,
-        knee_bend_deg=_neutral(KNEE_BEND_GOOD_RANGE_DEG),
-        shoulder_rotation_deg=_neutral(SHOULDER_ROTATION_GOOD_RANGE_DEG),
-        elbow_extension_deg=_neutral(ELBOW_EXTENSION_GOOD_RANGE_DEG),
-        weight_transfer_score=_neutral(WEIGHT_TRANSFER_GOOD_RANGE),
-        contact_height_m=0.0,
-        follow_through_completion_score=_neutral(FOLLOW_THROUGH_GOOD_RANGE),
-        split_step_delay_s=_neutral(SPLIT_STEP_GOOD_RANGE_S),
+        knee_bend_deg=130.0, shoulder_rotation_deg=40.0, elbow_extension_deg=140.0,
+        weight_transfer_score=0.6, contact_height_m=0.0,
+        follow_through_completion_score=0.7, split_step_delay_s=0.2,
         deviation_score=deviation_score)
 
 
@@ -39,23 +33,65 @@ def _contact(contact_id, confidence=0.8, timestamp_s=1.0, frame_idx=0, rally_id=
             "is_serve": is_serve, "confidence": confidence}
 
 
-# --------------------------------------------------------------- classify()
+# ------------------------------------------------------ relative scoring
 
-def test_classify_all_in_range_scores_zero():
-    cat, dev = _classify(_neutral(KNEE_BEND_GOOD_RANGE_DEG), _neutral(SHOULDER_ROTATION_GOOD_RANGE_DEG),
-                          _neutral(ELBOW_EXTENSION_GOOD_RANGE_DEG), _neutral(WEIGHT_TRANSFER_GOOD_RANGE),
-                          0.0, _neutral(FOLLOW_THROUGH_GOOD_RANGE), _neutral(SPLIT_STEP_GOOD_RANGE_S))
+METRIC_FIELDS = ("knee_bend_deg", "shoulder_rotation_deg", "elbow_extension_deg",
+                  "weight_transfer_score", "contact_height_m",
+                  "follow_through_completion_score", "split_step_delay_s")
+
+
+def _all_zero_devs():
+    return {f: 0.0 for f in METRIC_FIELDS}
+
+
+def test_robust_fence_needs_min_samples():
+    assert _robust_fence([1.0, 2.0]) is None  # below MIN_SAMPLES_FOR_DISTRIBUTION
+    assert _robust_fence([1.0] * MIN_SAMPLES_FOR_DISTRIBUTION) is not None
+
+
+def test_rel_dev_none_when_value_or_fence_missing():
+    fence = _robust_fence([100.0, 120.0, 140.0])
+    assert _rel_dev(None, fence) is None   # no confident reading on this shot
+    assert _rel_dev(120.0, None) is None   # not enough of the player's own shots to compare
+
+
+def test_rel_dev_zero_within_players_own_fence_nonzero_outside():
+    fence = _robust_fence([120.0, 125.0, 130.0, 135.0, 140.0])
+    assert _rel_dev(130.0, fence) == 0.0        # at this player's own median
+    dev = _rel_dev(500.0, fence)
+    assert dev is not None and dev > 0          # far outside this player's own spread
+
+
+def test_classify_all_typical_scores_zero():
+    cat, dev = _classify(_all_zero_devs())
     assert dev == 0.0
     assert cat in CATEGORIES
 
 
 def test_classify_flags_the_worst_offending_category():
-    # knee way outside range (footwork), everything else dead-center -> footwork wins.
-    cat, dev = _classify(300.0, _neutral(SHOULDER_ROTATION_GOOD_RANGE_DEG),
-                          _neutral(ELBOW_EXTENSION_GOOD_RANGE_DEG), _neutral(WEIGHT_TRANSFER_GOOD_RANGE),
-                          0.0, _neutral(FOLLOW_THROUGH_GOOD_RANGE), _neutral(SPLIT_STEP_GOOD_RANGE_S))
+    # knee way outside this player's own fence (footwork), everything else typical -> footwork wins.
+    devs = _all_zero_devs()
+    devs["knee_bend_deg"] = 6.0
+    cat, dev = _classify(devs)
     assert cat == "footwork"
     assert dev > 0
+
+
+def test_classify_never_picks_a_category_whose_metrics_are_all_none():
+    # footwork's only two metrics (split_step, knee_bend) are both None (no
+    # confident pose support, or not enough of this player's own shots to
+    # compare against) -- footwork must not even be an eligible category.
+    devs = _all_zero_devs()
+    devs["split_step_delay_s"] = None
+    devs["knee_bend_deg"] = None
+    cat, _dev = _classify(devs)
+    assert cat != "footwork"
+
+
+def test_classify_returns_none_when_nothing_real_anywhere():
+    cat, dev = _classify({f: None for f in METRIC_FIELDS})
+    assert cat is None
+    assert dev is None
 
 
 # --------------------------------------------------------- adaptive selection
@@ -305,30 +341,6 @@ def test_generate_llm_tips_includes_stats_in_prompt_when_present(monkeypatch):
     assert "player_tendencies" not in captured["messages"][0]["content"]
 
 
-# ------------------------------------------------ silent-neutral fallback fix
-
-def test_norm_dev_none_passes_through_instead_of_zero():
-    assert _norm_dev(None, (0.0, 1.0)) is None
-    assert _norm_dev(0.5, (0.0, 1.0)) == 0.0
-
-
-def test_classify_never_picks_a_category_whose_metrics_are_all_excluded():
-    # footwork's only two metrics (split_step, knee_bend) are both None (no
-    # confident pose support). The old fallback would have defaulted both to
-    # their neutral midpoint -> deviation_score 0.0, a fabricated "footwork is
-    # fine" reading. footwork must not even be an eligible category here.
-    cat, _dev = _classify(None, _neutral(SHOULDER_ROTATION_GOOD_RANGE_DEG),
-                           _neutral(ELBOW_EXTENSION_GOOD_RANGE_DEG), _neutral(WEIGHT_TRANSFER_GOOD_RANGE),
-                           0.0, _neutral(FOLLOW_THROUGH_GOOD_RANGE), None)
-    assert cat != "footwork"
-
-
-def test_classify_returns_none_when_nothing_real_anywhere():
-    cat, dev = _classify(None, None, None, None, None, None, None)
-    assert cat is None
-    assert dev is None
-
-
 def _kp17():
     """17 COCO keypoints with hip/knee/ankle/shoulder/elbow/wrist placed to
     give _angle_deg a well-defined (non-degenerate) angle; exact values don't
@@ -353,46 +365,90 @@ def _pose_contact(frame_idx=100, court_x=1.0, court_y=5.0):
             "court_x": court_x, "court_y": court_y, "team": "near"}
 
 
-def test_compute_feature_vector_high_confidence_excludes_nothing():
+def test_extract_raw_metrics_high_confidence_excludes_nothing():
     # Two frames so split_step_delay_s (needs an ankle-speed diff between
     # consecutive pre-contact frames) has something real to compute too.
     entries = [_pose_frame(90, _kp17(), [0.95] * 17),
                _pose_frame(100, _kp17(), [0.95] * 17)]
-    vec = compute_feature_vector(_pose_contact(), entries, fps=30.0)
-    assert vec is not None
-    assert vec.low_confidence_metrics == []
-    assert vec.knee_bend_deg is not None
-    assert vec.shoulder_rotation_deg is not None
-    assert vec.elbow_extension_deg is not None
-    assert vec.split_step_delay_s is not None
+    raw = _extract_raw_metrics(_pose_contact(), entries, fps=30.0)
+    assert raw is not None
+    assert raw["low_confidence_metrics"] == []
+    assert raw["knee_bend_deg"] is not None
+    assert raw["shoulder_rotation_deg"] is not None
+    assert raw["elbow_extension_deg"] is not None
+    assert raw["split_step_delay_s"] is not None
 
 
-def test_compute_feature_vector_low_confidence_excludes_not_neutral():
+def test_extract_raw_metrics_low_confidence_excludes_not_neutral():
     conf = [0.95] * 17
     for idx in (11, 12, 13, 14, 15, 16):  # hips/knees/ankles
         conf[idx] = 0.1
     entries = [_pose_frame(100, _kp17(), conf)]
-    vec = compute_feature_vector(_pose_contact(), entries, fps=30.0)
-    assert vec is not None
-    assert vec.knee_bend_deg is None
-    assert "knee_bend_deg" in vec.low_confidence_metrics
-    assert vec.split_step_delay_s is None
-    assert "split_step_delay_s" in vec.low_confidence_metrics
-    # the category actually chosen must never be one whose metrics were all excluded
-    if vec.category == "footwork":
-        assert False, "footwork has no real support here and must not be picked"
+    raw = _extract_raw_metrics(_pose_contact(), entries, fps=30.0)
+    assert raw is not None
+    assert raw["knee_bend_deg"] is None
+    assert "knee_bend_deg" in raw["low_confidence_metrics"]
+    assert raw["split_step_delay_s"] is None
+    assert "split_step_delay_s" in raw["low_confidence_metrics"]
 
 
-def test_compute_feature_vector_missing_kp_conf_key_is_presence_only_no_regression():
+def test_extract_raw_metrics_missing_kp_conf_key_is_presence_only_no_regression():
     # Overlay rows written before Step 1's kp_conf capture have no "kp_conf"
     # key at all -- must behave exactly as before (presence-only), not be
     # treated as automatically failing a threshold they never recorded.
     entries = [_pose_frame(90, _kp17(), kp_conf=None),
                _pose_frame(100, _kp17(), kp_conf=None)]
+    raw = _extract_raw_metrics(_pose_contact(), entries, fps=30.0)
+    assert raw is not None
+    assert raw["low_confidence_metrics"] == []
+    assert raw["knee_bend_deg"] is not None
+
+
+# ------------------------------------------- compute_feature_vector (fences)
+
+def test_compute_feature_vector_without_fences_has_no_comparison_anywhere():
+    # No player_fences supplied (e.g. this shot's player has too few of their
+    # own valid shots this video) -- every metric is "no comparison
+    # available", never a fabricated 0/typical reading, and with nothing
+    # comparable anywhere the shot is unscoreable (matches _classify's
+    # "nothing real anywhere" -> None degrade).
+    entries = [_pose_frame(90, _kp17(), [0.95] * 17),
+               _pose_frame(100, _kp17(), [0.95] * 17)]
     vec = compute_feature_vector(_pose_contact(), entries, fps=30.0)
+    assert vec is None
+
+
+def test_compute_feature_vector_with_fences_flags_no_comparison_metrics():
+    # This player has enough of their own shots (5 >= MIN_SAMPLES_FOR_DISTRIBUTION)
+    # for knee_bend_deg to get a real fence, but none for shoulder_rotation_deg
+    # -- shoulder_rotation_deg must show up in no_comparison_metrics even
+    # though its raw reading on this shot was confident.
+    entries = [_pose_frame(90, _kp17(), [0.95] * 17),
+               _pose_frame(100, _kp17(), [0.95] * 17)]
+    raw = _extract_raw_metrics(_pose_contact(), entries, fps=30.0)
+    knee_fence = _robust_fence([raw["knee_bend_deg"]] * MIN_SAMPLES_FOR_DISTRIBUTION)
+    fences = {"knee_bend_deg": knee_fence}
+    vec = compute_feature_vector(_pose_contact(), entries, fps=30.0, player_fences=fences)
     assert vec is not None
+    assert "shoulder_rotation_deg" in vec.no_comparison_metrics
+    assert "knee_bend_deg" not in vec.no_comparison_metrics
+    # never fabricate a comparison for the low-confidence field itself either
     assert vec.low_confidence_metrics == []
-    assert vec.knee_bend_deg is not None
+
+
+def test_player_fences_by_metric_groups_per_player_and_respects_min_samples():
+    raw_by_contact = [
+        ({"contact_id": "a", "player_id": 1}, {f: 10.0 for f in METRIC_FIELDS} | {"low_confidence_metrics": []}),
+        ({"contact_id": "b", "player_id": 1}, {f: 12.0 for f in METRIC_FIELDS} | {"low_confidence_metrics": []}),
+        ({"contact_id": "c", "player_id": 1}, {f: 14.0 for f in METRIC_FIELDS} | {"low_confidence_metrics": []}),
+        ({"contact_id": "d", "player_id": 2}, {f: 99.0 for f in METRIC_FIELDS} | {"low_confidence_metrics": []}),
+    ]
+    fences = _player_fences_by_metric(raw_by_contact)
+    assert fences[1]["knee_bend_deg"] is not None    # player 1 has 3 shots -> real fence
+    assert fences[2]["knee_bend_deg"] is None        # player 2 has only 1 shot -> no fence
+    # player 1's fence is built only from player 1's own values, not player 2's
+    q1, q3, _iqr = fences[1]["knee_bend_deg"]
+    assert q1 >= 10.0 and q3 <= 14.0
 
 
 def test_system_prompt_keeps_null_safety_and_no_raw_numbers_rules():
@@ -403,6 +459,18 @@ def test_system_prompt_keeps_null_safety_and_no_raw_numbers_rules():
     assert "Never state a raw seconds value, a velocity, or any" in SYSTEM
     assert "must NEVER state or\nimply a specific claim about a joint/measurement" in SYSTEM
     assert "no known reading for it — never fabricate a claim about it" in SYSTEM
+
+
+def test_system_prompt_frames_deviation_as_relative_to_the_player_not_universal():
+    # Must never imply a fixed/universal biomechanical standard -- only
+    # comparison to this player's own session.
+    assert "relative to THIS PLAYER" in SYSTEM
+    assert "no validated \"correct\" biomechanical range" in SYSTEM
+
+
+def test_system_prompt_bans_comparison_claims_without_enough_of_players_own_shots():
+    assert "no_comparison_metrics" in SYSTEM
+    assert "You must NEVER claim or imply a comparison" in SYSTEM
 
 
 def test_system_prompt_encodes_three_beat_supportive_framing():
