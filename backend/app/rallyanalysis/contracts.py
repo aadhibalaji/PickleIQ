@@ -41,7 +41,12 @@ class ShotFeatureVector:
     backfilled with a fabricated "neutral/in-range" placeholder; a metric with
     no real reading is simply absent, not silently reported as fine.
     contact_height_m is a court-position proxy from the contact event itself
-    (not keypoint-derived), so it's always present."""
+    (not keypoint-derived), so it's always present.
+
+    deviation_score is judged against THIS PLAYER's own median/spread for
+    this metric across their other shots in THIS video — never a fixed
+    universal range — see coaching._rel_dev. 0 = within this player's own
+    typical spread for that metric this session."""
     contact_id: str
     category: str  # 'footwork' | 'paddle_prep' | 'contact_point' | 'follow_through'
     knee_bend_deg: float | None
@@ -51,11 +56,19 @@ class ShotFeatureVector:
     contact_height_m: float
     follow_through_completion_score: float | None
     split_step_delay_s: float | None
-    deviation_score: float  # signed distance from good-form reference range
+    deviation_score: float  # signed deviation from this player's own median/spread, this video
     # Names (dataclass field names above) of metrics excluded from this shot
     # for missing/low-confidence pose data — the explicit "we didn't actually
     # see this" flag consumed by aggregate stats and the coaching narrative.
     low_confidence_metrics: list = field(default_factory=list)
+    # Names of metrics that DID get a confident reading on this shot, but
+    # where this player didn't have enough of their OWN valid shots for that
+    # metric in this video (see coaching.MIN_SAMPLES_FOR_DISTRIBUTION) to
+    # know what "typical" looks like for them — so no relative comparison
+    # could be judged. Distinct from low_confidence_metrics: the pose reading
+    # itself is trusted here, there's just no personal baseline to compare it
+    # against yet.
+    no_comparison_metrics: list = field(default_factory=list)
 
 
 @dataclass

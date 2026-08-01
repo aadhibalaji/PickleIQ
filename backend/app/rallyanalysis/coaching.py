@@ -33,18 +33,35 @@ L_KNEE, R_KNEE = 13, 14
 L_ANKLE, R_ANKLE = 15, 16
 
 # ---------------------------------------------------------------------------
-# HEURISTIC REFERENCE RANGES — starting-point biomechanical guardrails only.
-# These are NOT validated against professional or ground-truth pickleball
-# data; a human coach should sanity-check/re-tune them before trusting
-# flagged output. Values are chosen to be plausible defaults, nothing more.
+# PER-PLAYER RELATIVE SCORING — a shot is judged against THIS PLAYER's own
+# median/spread for each metric, computed across their other shots in THIS
+# video, never a fixed universal range. Two labeled clips gave contradictory
+# answers on which joint is weakest across singles vs doubles play, so there
+# is no validated universal cutoff to compare against yet — a player's own
+# session is the only baseline we can trust today. See _rel_dev/_robust_fence.
 # ---------------------------------------------------------------------------
-KNEE_BEND_GOOD_RANGE_DEG = (100.0, 155.0)          # hip-knee-ankle angle at contact
-SHOULDER_ROTATION_GOOD_RANGE_DEG = (15.0, 70.0)    # shoulder-line vs hip-line twist at contact
-ELBOW_EXTENSION_GOOD_RANGE_DEG = (110.0, 175.0)    # shoulder-elbow-wrist angle, hitting arm, at contact
-WEIGHT_TRANSFER_GOOD_RANGE = (0.35, 1.0)           # 0-1 score, see compute_feature_vector
-CONTACT_HEIGHT_GOOD_RANGE_M = (-1.5, 1.5)          # proxy — see contact_height_m note below
-FOLLOW_THROUGH_GOOD_RANGE = (0.4, 1.0)             # 0-1 completion score
-SPLIT_STEP_GOOD_RANGE_S = (0.05, 0.35)             # seconds between plant and contact
+METRIC_FIELDS = (
+    "knee_bend_deg", "shoulder_rotation_deg", "elbow_extension_deg",
+    "weight_transfer_score", "contact_height_m",
+    "follow_through_completion_score", "split_step_delay_s",
+)
+
+# Minimum non-null values a player needs for a given metric, this video,
+# before we trust a median/spread computed from them enough to score shots
+# against it — below this, 1-2 points would make an unstable "distribution"
+# look meaningful. JUDGMENT CALL: 3 is a small, workable floor for a
+# handful-of-shots-per-video session; raise if per-player samples turn out
+# noisier than expected in practice.
+MIN_SAMPLES_FOR_DISTRIBUTION = 3
+
+# Tukey outlier fence multiplier: a shot's metric only counts as deviating
+# once it falls beyond Q1 - 1.5*IQR / Q3 + 1.5*IQR of THIS PLAYER's own
+# values for that metric this video — the standard robust-statistics
+# convention for "notably atypical," reused here instead of inventing a new
+# one. Deviation is then expressed as (excess distance beyond the fence) in
+# IQR units, matching the old fixed-range function's "0 inside, signed
+# excess width outside" shape.
+FENCE_IQR_MULTIPLIER = 1.5
 
 # Normalization constants (turn raw pixel/metre displacements into 0-1 scores).
 WEIGHT_TRANSFER_NORM_M = 1.0   # forward court-plane movement treated as "full" transfer
@@ -54,11 +71,12 @@ FOLLOW_THROUGH_NORM = 1.8      # post-contact wrist path length, as a multiple o
 PRE_WINDOW_S = 0.6   # how far before contact we look for split-step / prep
 POST_WINDOW_S = 0.45  # how far after contact we look for follow-through
 
-WORST_DEVIATION_THRESHOLD = 1.0  # |deviation_score| >= this many reference-range-widths
-                                   # beyond the category's own good-form bound counts as
-                                   # "worst" — adaptive PER CATEGORY (each category has its
-                                   # own reference range baked into _norm_dev's normalization),
-                                   # not a fixed top-N count: a clean session naturally clears
+WORST_DEVIATION_THRESHOLD = 1.0  # |deviation_score| >= this many of the PLAYER's OWN
+                                   # IQR-widths beyond their own Tukey fence for that
+                                   # metric counts as "worst" — adaptive PER CATEGORY and
+                                   # PER PLAYER (each category/player/video combo has its
+                                   # own fence baked into _rel_dev's normalization), not a
+                                   # fixed top-N count: a clean session naturally clears
                                    # 0-1 shots, a rough one can clear many.
 K_STD_BEST = 0.5          # best-shot z-score threshold over confidence (in-range shots only)
 MIN_BEST_CONFIDENCE = 0.3
@@ -194,22 +212,25 @@ def _hitting_side(frames: list[tuple[int, dict]]) -> str:
     return "L" if totals["L"] > totals["R"] else "R"
 
 
-def _neutral(rng: tuple[float, float]) -> float:
-    return (rng[0] + rng[1]) / 2.0
-
-
-def compute_feature_vector(contact: dict, entries: list[dict], fps: float) -> ShotFeatureVector | None:
+def _extract_raw_metrics(contact: dict, entries: list[dict], fps: float) -> dict | None:
     """contact: one contact_events row (dict) — contact_id, frame_idx,
     player_id, court_x, court_y, .... entries: overlay rows covering a
     [contact_frame - PRE_WINDOW_S, contact_frame + POST_WINDOW_S] window
     (any order, any players). Returns None only when this player has no pose
     data anywhere in the window (contact gets skipped, not fabricated).
 
+    Returns the raw (un-classified, un-scored) metric values plus
+    low_confidence_metrics — the metric-extraction half of what
+    compute_feature_vector used to do in one step, split out so the caller
+    can build every shot's raw metrics first, derive each player's own
+    per-metric fence across their whole video, and only then classify/score
+    each shot relative to that fence (see generate_coaching_report).
+
     Individual metrics that lack CONFIDENT pose support (missing keypoint, or
-    below KP_CONF_MIN) are excluded — left None, never backfilled with the
-    midpoint of their reference range. A metric we didn't confidently see is
-    absent, not silently reported as "in range". Excluded metric names are
-    collected in low_confidence_metrics.
+    below KP_CONF_MIN) are excluded — left None, never backfilled with a
+    fabricated neutral value. A metric we didn't confidently see is absent,
+    not silently reported as "in range". Excluded metric names are collected
+    in low_confidence_metrics.
     """
     frames = _player_frames(entries, contact["player_id"])
     if not frames:
@@ -297,76 +318,140 @@ def compute_feature_vector(contact: dict, entries: list[dict], fps: float) -> Sh
         split_step_delay_s = None
         low_confidence_metrics.append("split_step_delay_s")
 
-    category, deviation_score = _classify(
-        knee_bend_deg, shoulder_rotation_deg, elbow_extension_deg,
-        weight_transfer_score, contact_height_m, follow_through_completion_score,
-        split_step_delay_s)
-    if category is None:
-        # Every category's metrics were excluded — nothing real to score.
-        # (In practice unreachable today since contact_height_m always has a
-        # real reading, but this is what "no scoreable data" degrades to if
-        # that ever changes, rather than fabricating a category/score.)
+    return {
+        "knee_bend_deg": knee_bend_deg, "shoulder_rotation_deg": shoulder_rotation_deg,
+        "elbow_extension_deg": elbow_extension_deg, "weight_transfer_score": weight_transfer_score,
+        "contact_height_m": contact_height_m,
+        "follow_through_completion_score": follow_through_completion_score,
+        "split_step_delay_s": split_step_delay_s,
+        "low_confidence_metrics": low_confidence_metrics,
+    }
+
+
+def _robust_fence(values: list[float]) -> tuple[float, float, float] | None:
+    """(q1, q3, iqr) over `values` — this player's own non-null readings for
+    one metric, this video — or None if there are too few
+    (< MIN_SAMPLES_FOR_DISTRIBUTION) to trust a spread computed from them."""
+    if len(values) < MIN_SAMPLES_FOR_DISTRIBUTION:
         return None
-
-    return ShotFeatureVector(
-        contact_id=contact["contact_id"], category=category,
-        knee_bend_deg=knee_bend_deg, shoulder_rotation_deg=shoulder_rotation_deg,
-        elbow_extension_deg=elbow_extension_deg, weight_transfer_score=weight_transfer_score,
-        contact_height_m=contact_height_m,
-        follow_through_completion_score=follow_through_completion_score,
-        split_step_delay_s=split_step_delay_s, deviation_score=deviation_score,
-        low_confidence_metrics=low_confidence_metrics)
+    q1, q3 = np.percentile(np.asarray(values, dtype=float), [25, 75])
+    return float(q1), float(q3), float(q3 - q1)
 
 
-def _norm_dev(value: float | None, rng: tuple[float, float]) -> float | None:
-    """Signed deviation from [lo, hi], expressed in units of range-width so
-    metrics with different units (degrees, seconds, 0-1 scores) are
-    comparable. 0 = within range. None (metric excluded — no confident pose
-    support) passes through as None rather than being treated as 0/in-range."""
-    if value is None:
+def _rel_dev(value: float | None, fence: tuple[float, float, float] | None) -> float | None:
+    """Signed deviation from this player's own typical spread for this
+    metric, this video — expressed in units of THEIR OWN iqr so metrics with
+    different units (degrees, seconds, 0-1 scores) stay comparable. 0 = within
+    [q1 - FENCE_IQR_MULTIPLIER*iqr, q3 + FENCE_IQR_MULTIPLIER*iqr] (this
+    player's own Tukey fence). None (no confident pose reading for this shot,
+    OR this player didn't have enough of their own shots to define a fence
+    for this metric) passes through as None rather than being treated as
+    0/typical — there is nothing real to compare in either case."""
+    if value is None or fence is None:
         return None
-    lo, hi = rng
-    width = hi - lo
+    q1, q3, iqr = fence
+    if iqr < 1e-9:
+        # This player's own readings for this metric are ~identical this
+        # session — any difference is real but there's no spread to divide
+        # by. ponytail: binary flag (0 or +-1 iqr-unit) rather than an
+        # unbounded ratio; revisit if this over/under-flags flatline metrics.
+        return 0.0 if abs(value - q1) < 1e-9 else math.copysign(1.0, value - q1)
+    lo, hi = q1 - FENCE_IQR_MULTIPLIER * iqr, q3 + FENCE_IQR_MULTIPLIER * iqr
     if value < lo:
-        return (value - lo) / width
+        return (value - lo) / iqr
     if value > hi:
-        return (value - hi) / width
+        return (value - hi) / iqr
     return 0.0
 
 
-def _classify(knee_bend_deg, shoulder_rotation_deg, elbow_extension_deg,
-              weight_transfer_score, contact_height_m, follow_through_completion_score,
-              split_step_delay_s) -> tuple[str | None, float | None]:
-    """category = whichever of the four categories has the single worst
-    (largest-magnitude) normalized deviation among its REAL (non-excluded)
-    component metrics; deviation_score is that category's signed deviation.
-    A category every one of whose metrics was excluded for missing/low-
-    confidence pose data is never eligible to win — that would be the same
-    fabricated-neutral bug at the category level even if individual metrics
-    are properly excluded. A shot with every metric in range gets an
-    arbitrary-but-stable category (max of all-zero deviations) and
-    deviation_score 0.0 (i.e. not flagged — see compute_category_ratios).
-    Returns (None, None) only if literally no category has any real metric
-    (compute_feature_vector treats that as unscoreable, same as no pose data
-    at all)."""
+def _classify(devs: dict[str, float | None]) -> tuple[str | None, float | None]:
+    """devs: {metric_field_name: relative_deviation_or_None} for one shot
+    (see _rel_dev — already computed against the player's own fence).
+    category = whichever of the four categories has the single worst
+    (largest-magnitude) deviation among its REAL (non-None) component
+    metrics; deviation_score is that category's signed deviation. A category
+    every one of whose metrics is None (excluded for low pose confidence, or
+    no player fence to compare against) is never eligible to win — that would
+    be the same fabricated-neutral bug at the category level even if
+    individual metrics are properly excluded. A shot with every metric
+    typical for this player gets an arbitrary-but-stable category (max of
+    all-zero deviations) and deviation_score 0.0 (i.e. not flagged — see
+    compute_category_ratios). Returns (None, None) only if literally no
+    category has any real metric (compute_feature_vector treats that as
+    unscoreable, same as no pose data at all)."""
     per_category = {
-        "footwork": [_norm_dev(split_step_delay_s, SPLIT_STEP_GOOD_RANGE_S),
-                     _norm_dev(knee_bend_deg, KNEE_BEND_GOOD_RANGE_DEG)],
-        "paddle_prep": [_norm_dev(shoulder_rotation_deg, SHOULDER_ROTATION_GOOD_RANGE_DEG)],
-        "contact_point": [_norm_dev(elbow_extension_deg, ELBOW_EXTENSION_GOOD_RANGE_DEG),
-                           _norm_dev(weight_transfer_score, WEIGHT_TRANSFER_GOOD_RANGE),
-                           _norm_dev(contact_height_m, CONTACT_HEIGHT_GOOD_RANGE_M)],
-        "follow_through": [_norm_dev(follow_through_completion_score, FOLLOW_THROUGH_GOOD_RANGE)],
+        "footwork": [devs["split_step_delay_s"], devs["knee_bend_deg"]],
+        "paddle_prep": [devs["shoulder_rotation_deg"]],
+        "contact_point": [devs["elbow_extension_deg"], devs["weight_transfer_score"],
+                           devs["contact_height_m"]],
+        "follow_through": [devs["follow_through_completion_score"]],
     }
     category_dev = {}
-    for cat, devs in per_category.items():
-        real = [d for d in devs if d is not None]
+    for cat, ds in per_category.items():
+        real = [d for d in ds if d is not None]
         if real:
             category_dev[cat] = max(real, key=abs)
     if not category_dev:
         return None, None
     category = max(category_dev, key=lambda c: abs(category_dev[c]))
     return category, category_dev[category]
+
+
+def _player_fences_by_metric(raw_by_contact: list[tuple[dict, dict]]) -> dict:
+    """{player_id: {metric_field_name: fence_or_None}} — one fence per
+    player per metric, built from THAT PLAYER's own non-null values for that
+    metric across every contact in raw_by_contact (i.e. their whole video).
+    A metric absent from a player's dict, or mapped to None, means they
+    didn't have MIN_SAMPLES_FOR_DISTRIBUTION valid shots for it — _rel_dev
+    treats that exactly like a missing fence (no comparison possible)."""
+    values: dict = {}
+    for contact, raw in raw_by_contact:
+        pid = contact["player_id"]
+        for field_name in METRIC_FIELDS:
+            v = raw[field_name]
+            if v is not None:
+                values.setdefault(pid, {}).setdefault(field_name, []).append(v)
+    return {pid: {field_name: _robust_fence(vals) for field_name, vals in metrics.items()}
+            for pid, metrics in values.items()}
+
+
+def _finalize_vector(contact: dict, raw: dict, fences: dict) -> ShotFeatureVector | None:
+    """raw: one _extract_raw_metrics() result. fences: this shot's player's
+    {metric_field_name: fence_or_None}, this video (see
+    _player_fences_by_metric). Returns None when no category has any real
+    (comparable) metric — same "nothing to score" degrade as before, just
+    driven by relative comparability now instead of confident pose alone."""
+    devs = {f: _rel_dev(raw[f], fences.get(f)) for f in METRIC_FIELDS}
+    category, deviation_score = _classify(devs)
+    if category is None:
+        return None
+    no_comparison_metrics = [f for f in METRIC_FIELDS if raw[f] is not None and fences.get(f) is None]
+    return ShotFeatureVector(
+        contact_id=contact["contact_id"], category=category,
+        knee_bend_deg=raw["knee_bend_deg"], shoulder_rotation_deg=raw["shoulder_rotation_deg"],
+        elbow_extension_deg=raw["elbow_extension_deg"], weight_transfer_score=raw["weight_transfer_score"],
+        contact_height_m=raw["contact_height_m"],
+        follow_through_completion_score=raw["follow_through_completion_score"],
+        split_step_delay_s=raw["split_step_delay_s"], deviation_score=deviation_score,
+        low_confidence_metrics=raw["low_confidence_metrics"],
+        no_comparison_metrics=no_comparison_metrics)
+
+
+def compute_feature_vector(contact: dict, entries: list[dict], fps: float,
+                            player_fences: dict | None = None) -> ShotFeatureVector | None:
+    """Single-shot convenience wrapper around _extract_raw_metrics +
+    _finalize_vector. player_fences (see _player_fences_by_metric, one
+    player's slice of it): the calling video's per-metric fences for this
+    shot's player, or None/omitted to score every metric as "no comparison
+    available" (e.g. calling this in isolation without a video's worth of
+    other shots to build a fence from). generate_coaching_report calls
+    _extract_raw_metrics/_finalize_vector directly instead, so it can build
+    every shot's raw metrics once before deriving fences across the whole
+    video, rather than paying for entries/pose extraction twice per shot."""
+    raw = _extract_raw_metrics(contact, entries, fps)
+    if raw is None:
+        return None
+    return _finalize_vector(contact, raw, player_fences or {})
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +481,7 @@ def _shot_summary(vec: ShotFeatureVector, contact: dict) -> dict:
         # which metrics this shot has NO confident reading for, without
         # having to inspect every field of feature_vector for a null.
         "low_confidence_metrics": list(vec.low_confidence_metrics),
+        "no_comparison_metrics": list(vec.no_comparison_metrics),
         "feature_vector": asdict(vec),
     }
 
@@ -554,17 +640,28 @@ mechanics (not video) that a computer-vision pipeline extracted at each
 detected contact/swing.
 
 You receive a list of shots, each with a category (footwork, paddle_prep,
-contact_point, or follow_through), a deviation_score (negative/positive =
-outside the good-form range and needs work; 0 = solid, in-range shot), a
-feature_vector of raw pose measurements (joint angles in degrees, 0-1 scores,
-seconds), and a low_confidence_metrics list. These raw numbers are internal
-signal only — NEVER mention degrees, angles, confidence/certainty scores, or
-anatomical terms (no "elbow extension", "shoulder rotation", "knee bend
-angle", etc.) in your output. Translate them into plain language a
-rec/intermediate pickleball player would actually understand and act on
-(e.g. "you're rushing your paddle back" instead of "delayed unit turn", or
-"plant your feet before you swing" instead of "insufficient weight
-transfer").
+contact_point, or follow_through), a deviation_score, a feature_vector of raw
+pose measurements (joint angles in degrees, 0-1 scores, seconds), a
+low_confidence_metrics list, and a no_comparison_metrics list.
+
+IMPORTANT — deviation_score is relative to THIS PLAYER, not a universal
+standard: it measures how far this shot falls from THIS PLAYER's OWN typical
+value for that category's metric(s), computed across their OTHER shots in
+this same session. Negative/positive = notably outside their own usual range
+for this category and needs work; 0 = typical for them, a solid shot. There
+is no validated "correct" biomechanical range this pipeline compares against
+— only how consistent this shot was with the rest of this player's own
+session. Frame feedback that way (e.g. "shallower than your usual knee bend
+on this shot" or "you're not getting as low as you normally do"), never as a
+claim about correct/ideal form in general (never "your knee bend should be
+X degrees" or "that's below the ideal range").
+
+These raw numbers are internal signal only — NEVER mention degrees, angles, confidence/certainty scores, or anatomical terms (no "elbow extension",
+"shoulder rotation", "knee bend angle", etc.) in your output. Translate them
+into plain language a rec/intermediate pickleball player would actually
+understand and act on (e.g. "you're rushing your paddle back" instead of
+"delayed unit turn", or "plant your feet before you swing" instead of
+"insufficient weight transfer").
 
 You may also receive a player_tendencies object — small, rounded, per-player
 summaries (session-level tendencies, not per-shot data) such as how quickly a
@@ -598,6 +695,17 @@ than specific. This null-handling rule applies to player_tendencies too: a
 player missing from player_tendencies (or missing a particular tendency) has
 no known reading for it — never fabricate a claim about it, and never treat
 their absence as "average" or "fine".
+
+That same spirit extends to no_comparison_metrics: a field can be listed
+there even though its raw reading WAS confident — it means this player
+simply hasn't hit enough shots THIS SESSION for that specific metric to know
+what's typical for them yet, so there is nothing real to compare this shot
+against. You must NEVER claim or imply a comparison (e.g. "shallower than
+your usual", "better than your average", "not as extended as normal for you")
+for a field listed in a shot's no_comparison_metrics, even though you may
+still know its raw value. If a shot's category is driven mostly by fields in
+no_comparison_metrics, keep the tip general/encouraging about that category
+rather than inventing a personal baseline that doesn't exist yet.
 
 Write like a coach who is invested in this specific player, not a lab report
 or a performance review — and NOT a compliment sandwich that pads or dilutes
@@ -835,12 +943,23 @@ def generate_coaching_report(video_id: str, rally_source: str | None = None,
     fps = float(vrow["fps"]) if vrow and vrow["fps"] else 30.0
 
     pre_frames, post_frames = int(PRE_WINDOW_S * fps), int(POST_WINDOW_S * fps)
-    vectors_meta: list[tuple[ShotFeatureVector, dict]] = []
+    # Two passes: first pull every shot's raw (un-scored) metrics, then derive
+    # each player's own per-metric fence across their whole video, and only
+    # then classify/score each shot relative to THEIR fence — a shot can't be
+    # scored against a distribution that isn't fully built yet.
+    raw_by_contact: list[tuple[dict, dict]] = []
     for c in contacts:
         entries = overlays.read_range(video_id, overlay_source,
                                        max(0, c["frame_idx"] - pre_frames),
                                        c["frame_idx"] + post_frames)
-        vec = compute_feature_vector(c, entries, fps)
+        raw = _extract_raw_metrics(c, entries, fps)
+        if raw is not None:
+            raw_by_contact.append((c, raw))
+
+    player_fences = _player_fences_by_metric(raw_by_contact)
+    vectors_meta: list[tuple[ShotFeatureVector, dict]] = []
+    for c, raw in raw_by_contact:
+        vec = _finalize_vector(c, raw, player_fences.get(c["player_id"], {}))
         if vec is not None:
             vectors_meta.append((vec, c))
 
@@ -880,23 +999,25 @@ def get_report(video_id: str) -> CoachingReport | None:
 
 
 if __name__ == "__main__":
-    # ponytail self-check: a shot with every metric mid-range must land at
-    # deviation_score 0.0 and not be flagged; select_tip_candidates must cap
-    # total output at MAX_TIPS even when far more shots clear the bar.
-    good = ShotFeatureVector(
-        contact_id="c1", category="footwork",
-        knee_bend_deg=_neutral(KNEE_BEND_GOOD_RANGE_DEG),
-        shoulder_rotation_deg=_neutral(SHOULDER_ROTATION_GOOD_RANGE_DEG),
-        elbow_extension_deg=_neutral(ELBOW_EXTENSION_GOOD_RANGE_DEG),
-        weight_transfer_score=_neutral(WEIGHT_TRANSFER_GOOD_RANGE),
-        contact_height_m=0.0,
-        follow_through_completion_score=_neutral(FOLLOW_THROUGH_GOOD_RANGE),
-        split_step_delay_s=_neutral(SPLIT_STEP_GOOD_RANGE_S),
-        deviation_score=0.0)
-    cat, dev = _classify(good.knee_bend_deg, good.shoulder_rotation_deg, good.elbow_extension_deg,
-                          good.weight_transfer_score, good.contact_height_m,
-                          good.follow_through_completion_score, good.split_step_delay_s)
+    # ponytail self-check: a value at the player's own median must land at
+    # deviation_score 0.0; too few of the player's own shots for a metric
+    # must yield None (no fence, no comparison), never a fabricated 0;
+    # select_tip_candidates must cap total output at MAX_TIPS even when far
+    # more shots clear the bar.
+    fence = _robust_fence([120.0, 125.0, 130.0, 135.0, 140.0])
+    assert fence is not None
+    assert _rel_dev(130.0, fence) == 0.0          # at own median -> typical
+    assert _rel_dev(500.0, fence) is not None and _rel_dev(500.0, fence) > 0  # way outside own fence
+    assert _robust_fence([120.0, 130.0]) is None  # below MIN_SAMPLES_FOR_DISTRIBUTION -> no fence
+    assert _rel_dev(130.0, None) is None          # no fence -> no comparison, not 0
+
+    devs_typical = {f: 0.0 for f in METRIC_FIELDS}
+    cat, dev = _classify(devs_typical)
     assert dev == 0.0, dev
+
+    devs_no_fence = {f: None for f in METRIC_FIELDS}
+    cat, dev = _classify(devs_no_fence)
+    assert cat is None and dev is None, (cat, dev)  # nothing comparable anywhere -> unscoreable
 
     bad_vectors_meta = [
         (ShotFeatureVector(contact_id=f"bad{i}", category="footwork",
@@ -904,7 +1025,9 @@ if __name__ == "__main__":
                             weight_transfer_score=0.0, contact_height_m=0.0,
                             follow_through_completion_score=0.0, split_step_delay_s=0.0,
                             deviation_score=-5.0),
-         {"contact_id": f"bad{i}", "frame_idx": i, "timestamp_s": float(i), "rally_id": "r",
+         # timestamps spread well beyond MIN_TIP_GAP_S apart -- this check is
+         # about the MAX_TIPS cap, not the time-gap suppression filter.
+         {"contact_id": f"bad{i}", "frame_idx": i, "timestamp_s": i * 10.0, "rally_id": "r",
           "player_id": 1, "team": "near", "shot_side": "left", "is_serve": False, "confidence": 0.9})
         for i in range(20)
     ]

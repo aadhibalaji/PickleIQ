@@ -73,7 +73,11 @@ def test_generate_coaching_report_finds_pass1_only_rallies_by_default(monkeypatc
     # test_coaching.py) and the Anthropic call (no ANTHROPIC_API_KEY in the
     # test env) so this test isolates what it actually guards: that the
     # pass1-only rally was found and its contact reached feature-vector
-    # extraction and tip generation at all.
+    # extraction and tip generation at all. This fixture only produces one
+    # contact total, and per-player relative scoring needs >= MIN_SAMPLES_FOR_
+    # DISTRIBUTION of a player's own shots to judge anything against -- lower
+    # it to 1 here since this test isn't about relative-scoring behavior.
+    monkeypatch.setattr(coaching, "MIN_SAMPLES_FOR_DISTRIBUTION", 1)
     monkeypatch.setattr(coaching, "select_tip_candidates",
                          lambda vectors_meta: [coaching._shot_summary(vec, c) for vec, c in vectors_meta])
     monkeypatch.setattr(coaching, "generate_llm_tips",

@@ -57,7 +57,10 @@ knee_bend_deg, shoulder_rotation_deg, elbow_extension_deg,
 weight_transfer_score, contact_height_m,
 follow_through_completion_score,
 split_step_delay_s,
-deviation_score: float          # signed distance from good-form reference range, per category
+deviation_score: float          # signed distance from THIS PLAYER's own median/spread for
+                                 # that metric across their other shots in this same video,
+                                 # per category -- never a fixed universal reference range
+                                 # (see backend/app/rallyanalysis/coaching.py's _rel_dev)
 ```
 
 **`RallyMetrics`** — one per rally:
