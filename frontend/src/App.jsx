@@ -46,7 +46,7 @@ export default function App() {
 
   const nav = (
     <div className="row spread" style={{ padding: '8px 16px', borderBottom: '1px solid #ccc' }}>
-      <b>🏓 Pickleball Rally Detection</b>
+      <b>Pickleball Rally Detection</b>
       <div className="row">
         <button
           onClick={() => setView('app')}
@@ -85,7 +85,7 @@ export default function App() {
   return (
     <div>
       {nav}
-      <h1>🏓 Pickleball Rally Detection</h1>
+      <h1>Pickleball Rally Detection</h1>
       <div className="panel">
         <div className="row spread">
           <div>
