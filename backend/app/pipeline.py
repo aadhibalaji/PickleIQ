@@ -11,6 +11,7 @@ import numpy as np
 
 from . import db, results_export, storage_s3
 from .config import STORAGE_BACKEND
+from .cv import overlays
 from .cv.court import CameraModel
 from .cv.pass1 import run_pass1
 from .cv.pass2 import run_pass2
@@ -366,6 +367,77 @@ def _build_do_pass2(video_id: str, params: dict):
             runner.submit(video_id, "contacts", lambda h: _finish_chain(video_id))
 
     return do_pass2
+
+
+def _set_selection_status(selection_id: str, status: str, error_message: str | None = None) -> None:
+    with db.connect() as con:
+        con.execute(
+            "UPDATE coaching_selections SET status=?, error_message=? WHERE id=?",
+            (status, error_message, selection_id))
+
+
+def _build_do_pass2_range(video_id: str, params: dict, selection_id: str,
+                           start_frame: int, end_frame: int, overlay_source: str):
+    """Runs Pass 2 over a single user-specified (video_id, start_frame,
+    end_frame) range that does NOT come from a rally_labels row — a manual
+    coaching selection. Unlike _build_do_pass2:
+      - writes overlays under `overlay_source` (never "pass2" — that would
+        wipe the real Pass 1-driven run for this video).
+      - does NOT chain _refine_after_pass2 or a "contacts" job: both
+        ultimately depend on rally_labels rows (refine reads Pass 1 windows;
+        contacts is gated by readiness.get_analyzable_rallies, which only
+        enumerates rally_labels rows), so chaining them here would silently
+        do nothing for this range.
+      - verifies overlay data actually landed before marking the selection
+        'ready' (see module-level note in the caller) instead of treating a
+        no-op run as success.
+
+    TODO: once contacts-for-manual-ranges is built, it should call
+    contact_detect.detect_contacts_for_rally(video_id, selection_id, entries,
+    fps) directly for this range, bypassing readiness.get_analyzable_rallies
+    entirely (that gate will never see a rally_labels-less range)."""
+    # Guard, not just a comment: run_pass2 unconditionally does
+    # overlays.clear(video_id, source) at the top of every run. The one
+    # current caller (api/rally_analysis.py's process_selection) always
+    # builds overlay_source as f"pass2_range_{selection_id}", so this never
+    # fires today — but nothing inside this function enforced that on its
+    # own, and a future call site (or a refactor) passing overlay_source=
+    # "pass2"/None/"" here would silently wipe the real Pass 1-driven Pass 2
+    # overlay for this video with no error. Fail loudly at build time
+    # instead, before a job is even queued.
+    if not overlay_source or overlay_source == "pass2":
+        raise ValueError(
+            f"_build_do_pass2_range: overlay_source must be a distinct, "
+            f"non-empty string, got {overlay_source!r} for video {video_id!r} "
+            f"— refusing to risk clearing the real 'pass2' overlay source")
+
+    def do_pass2_range(handle: JobHandle) -> None:
+        _ensure_local_video(video_id)
+        H, cam, _ = effective_calibration(video_id)
+        _set_selection_status(selection_id, "processing")
+        try:
+            run_pass2(video_id, params, H, cam, handle, source=overlay_source,
+                      windows_override=[(start_frame, end_frame)])
+        except JobCancelled:
+            _set_selection_status(selection_id, "failed", "cancelled by user")
+            raise
+        except Exception as exc:
+            _set_selection_status(selection_id, "failed", f"{type(exc).__name__}: {exc}")
+            raise
+
+        # Completeness check: a job that finishes without raising but wrote
+        # no overlay data for this range must not look like a real success
+        # (e.g. a degenerate/zero-length range, or every frame silently
+        # dropped upstream) — mark it failed instead of ready.
+        entries = overlays.read_range(video_id, overlay_source, start_frame, end_frame)
+        if not entries:
+            _set_selection_status(
+                selection_id, "failed",
+                "pass2 completed but produced no overlay data for this range")
+            return
+        _set_selection_status(selection_id, "ready")
+
+    return do_pass2_range
 
 
 def start_processing(video_id: str) -> dict:

@@ -30,7 +30,7 @@ from ..cv.court import COURT_W
 from ..cv.players import PlayerObs, is_serve_formation
 from ..cv import overlays
 from .contracts import ContactEvent
-from .readiness import _default_overlay_source, get_analyzable_rallies
+from .readiness import default_overlay_source, get_analyzable_rallies
 
 L_WRIST, R_WRIST = 9, 10  # COCO-17 keypoint indices
 
@@ -223,7 +223,7 @@ def detect_contacts_for_video(video_id: str, rally_source: str | None = None,
     # the rally_source default fix) — fall through to the same pass2-if-
     # available-else-pass1 default readiness.py uses, rather than leaving
     # overlay_source unresolved for the read_range calls below.
-    overlay_source = overlay_source or rally_source or _default_overlay_source(video_id)
+    overlay_source = overlay_source or rally_source or default_overlay_source(video_id)
     with db.connect() as con:
         vrow = con.execute("SELECT fps FROM videos WHERE id=?", (video_id,)).fetchone()
     fps = float(vrow["fps"]) if vrow and vrow["fps"] else 30.0

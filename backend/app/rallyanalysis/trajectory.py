@@ -44,7 +44,7 @@ from .. import db
 from ..cv.court import CameraModel
 from ..refine import ballistic
 from ..refine.io_loaders import TrackingData, load_homography, load_tracking, load_video
-from .readiness import _default_overlay_source, get_analyzable_rallies
+from .readiness import default_overlay_source, get_analyzable_rallies
 
 DEPTH_FLOOR = 0.3                # confidence floor for the far baseline
 ATTRIBUTION_WINDOW_FRAMES = 45   # ~1.5s at 30fps: how far back a contact can
@@ -160,7 +160,7 @@ def get_video_trajectories(video_id: str, rally_source: str | None = None,
         return {"video_id": video_id, "rallies": []}
     cam = CameraModel.from_homography(H, vrow["width"], vrow["height"])
     fps = float(vrow["fps"])
-    overlay_source = rally_source or _default_overlay_source(video_id)
+    overlay_source = rally_source or default_overlay_source(video_id)
     rallies = get_analyzable_rallies(video_id, rally_source=rally_source,
                                      overlay_source=overlay_source)
 

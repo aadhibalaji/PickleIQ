@@ -26,7 +26,10 @@ CREATE TABLE IF NOT EXISTS videos (
 CREATE TABLE IF NOT EXISTS jobs (
   id TEXT PRIMARY KEY,
   video_id TEXT NOT NULL,
-  kind TEXT NOT NULL,               -- 'pass1' | 'pass2'
+  kind TEXT NOT NULL,               -- fixed: 'pass1' | 'pass2' | 'contacts' | 'learn';
+                                     -- also per-selection dynamic values
+                                     -- 'pass2_range_<selection_id>' (see
+                                     -- pipeline._build_do_pass2_range)
   status TEXT NOT NULL,             -- 'queued' | 'running' | 'done' | 'error'
   progress REAL DEFAULT 0,
   message TEXT DEFAULT '',
@@ -179,6 +182,19 @@ CREATE TABLE IF NOT EXISTS contact_events (
 CREATE TABLE IF NOT EXISTS coaching_reports (
   video_id TEXT PRIMARY KEY,        -- one report per video (latest wins, regenerate on request)
   tips_json TEXT NOT NULL,          -- JSON [{contact_id, frame, timestamp_s, category, tip, tone}]
+  created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS coaching_selections (
+  id TEXT PRIMARY KEY,
+  video_id TEXT NOT NULL,
+  start_frame INTEGER NOT NULL,
+  end_frame INTEGER NOT NULL,
+  source TEXT NOT NULL,             -- 'pass1_accepted' | 'user_drawn'
+  status TEXT NOT NULL,             -- 'pending' | 'processing' | 'ready' | 'failed'
+  rally_label_id TEXT,              -- FK to rally_labels.id, set only when source='pass1_accepted'
+  overlay_source TEXT,              -- overlays.source string holding this range's Pass 2 output
+  error_message TEXT,               -- set when status='failed'
   created_at REAL NOT NULL
 );
 
