@@ -75,5 +75,18 @@
   "73": "test_ball_filter.py",
   "74": "deploy.sh",
   "75": "cv/tests/__init__.py",
-  "76": "app/tests/__init__.py"
+  "76": "app/tests/__init__.py",
+  "77": "ndarray",
+  "78": "media.py",
+  "79": "_finalize_vector",
+  "80": "test_progress_sync.py",
+  "81": "test_train_eval.py",
+  "82": "_robust_fence",
+  "83": "results_exist",
+  "84": "ShotFeatureVector",
+  "85": "_export_video",
+  "86": "poll_cloud_windows",
+  "87": "download_to_scratch",
+  "88": "project_court",
+  "89": "start_processing"
 }

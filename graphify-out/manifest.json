@@ -45,8 +45,8 @@
     "semantic_hash": "3518b7ebca738bf8f06721d0d15ed262"
   },
   "backend/app/api/media.py": {
-    "mtime": 1784754093.4200516,
-    "ast_hash": "bb7e30a86d387d12768ddc7dfb34e1e5",
+    "mtime": 1785797678.3090415,
+    "ast_hash": "e144961a1dd75ef6a1a01696dbdfc3e6",
     "semantic_hash": ""
   },
   "backend/app/api/models.py": {
@@ -55,19 +55,19 @@
     "semantic_hash": "c009401a5216704c704eafb4bf38f0d2"
   },
   "backend/app/api/rally_analysis.py": {
-    "mtime": 1784171554.8164535,
-    "ast_hash": "f6aee03f93d18cf1a7b0460d37a7a88a",
-    "semantic_hash": "f6aee03f93d18cf1a7b0460d37a7a88a"
+    "mtime": 1785883667.3167834,
+    "ast_hash": "01134760b4c58f5248af1919a9678779",
+    "semantic_hash": ""
   },
   "backend/app/cloud_ingest.py": {
-    "mtime": 1784668416.5480258,
-    "ast_hash": "11b306e4b1bb066926ec9bfdc528a63e",
+    "mtime": 1785883716.7681072,
+    "ast_hash": "26c73d714abf7ece8802de75e897093c",
     "semantic_hash": ""
   },
   "backend/app/config.py": {
-    "mtime": 1784509108.7546382,
-    "ast_hash": "4f4a4ac776045a8a0fab1c33fcb16ffc",
-    "semantic_hash": "4f4a4ac776045a8a0fab1c33fcb16ffc"
+    "mtime": 1785883617.2050395,
+    "ast_hash": "e89bc26a6428ea0c46830edcb5cd1f41",
+    "semantic_hash": ""
   },
   "backend/app/cv/__init__.py": {
     "mtime": 1783525630.4733295,
@@ -75,7 +75,7 @@
     "semantic_hash": "d41d8cd98f00b204e9800998ecf8427e"
   },
   "backend/app/cv/ball_coarse.py": {
-    "mtime": 1784171554.8167963,
+    "mtime": 1785796969.6450324,
     "ast_hash": "f70bf87044d23641d3911a8c00bf0d34",
     "semantic_hash": "f70bf87044d23641d3911a8c00bf0d34"
   },
@@ -85,12 +85,12 @@
     "semantic_hash": "cd22b4b1f3074ebec764ce77f1ccd734"
   },
   "backend/app/cv/ball_track.py": {
-    "mtime": 1784171554.8169353,
+    "mtime": 1785796969.645265,
     "ast_hash": "fe95bf38329715f63657e7560a3f95db",
     "semantic_hash": "fe95bf38329715f63657e7560a3f95db"
   },
   "backend/app/cv/ball_tracknet.py": {
-    "mtime": 1784171554.8171287,
+    "mtime": 1785796969.6450355,
     "ast_hash": "be95ccf75dba4ab1b4bc8fc459d67348",
     "semantic_hash": "be95ccf75dba4ab1b4bc8fc459d67348"
   },
@@ -115,9 +115,9 @@
     "semantic_hash": "387d9a21351a3fc973564d02b76fe6dd"
   },
   "backend/app/cv/identity.py": {
-    "mtime": 1784171554.818225,
-    "ast_hash": "86b82e5f1d269ca7ccb3da59db2cf4c7",
-    "semantic_hash": "86b82e5f1d269ca7ccb3da59db2cf4c7"
+    "mtime": 1784925000.8929002,
+    "ast_hash": "55b78454396b5e55365a48b072ecf77c",
+    "semantic_hash": ""
   },
   "backend/app/cv/kalman.py": {
     "mtime": 1783525630.4742396,
@@ -130,19 +130,19 @@
     "semantic_hash": "cdd043defe518634664f7ae2daa02fb5"
   },
   "backend/app/cv/pass1.py": {
-    "mtime": 1784754032.3887331,
-    "ast_hash": "c545d576f27bff0f0b3861e28155b0b1",
+    "mtime": 1785857931.8813677,
+    "ast_hash": "09b049a7ba7f2f213ce67101441740ab",
     "semantic_hash": ""
   },
   "backend/app/cv/pass2.py": {
-    "mtime": 1784754072.130894,
-    "ast_hash": "f163853dede664f8835b3a697fae2000",
+    "mtime": 1785645185.4647858,
+    "ast_hash": "c62893c62d3599fba7961a73a2920b03",
     "semantic_hash": ""
   },
   "backend/app/cv/players.py": {
-    "mtime": 1784171554.8197796,
-    "ast_hash": "a0036196ef54306e16d8642ae7002890",
-    "semantic_hash": "a0036196ef54306e16d8642ae7002890"
+    "mtime": 1785001522.5544546,
+    "ast_hash": "173fd72a003eb23f65df080d53abcf12",
+    "semantic_hash": ""
   },
   "backend/app/cv/rally_logic.py": {
     "mtime": 1783525630.4747963,
@@ -155,9 +155,9 @@
     "semantic_hash": "722a2cacf7765572c00fd6e19f8e277f"
   },
   "backend/app/db.py": {
-    "mtime": 1784397883.4089446,
-    "ast_hash": "3f9c80c409e90f0bebeb7913105ae0a7",
-    "semantic_hash": "3f9c80c409e90f0bebeb7913105ae0a7"
+    "mtime": 1785853169.861706,
+    "ast_hash": "61292af77d1736e393122e03156fa600",
+    "semantic_hash": ""
   },
   "backend/app/hw_profile.py": {
     "mtime": 1784243680.0715773,
@@ -170,9 +170,9 @@
     "semantic_hash": "3cc6ac512067b8da50adf40ae1a3bb6f"
   },
   "backend/app/jobs.py": {
-    "mtime": 1784514922.4190092,
-    "ast_hash": "41164717769050263726e3bebaeb0edb",
-    "semantic_hash": "41164717769050263726e3bebaeb0edb"
+    "mtime": 1785883648.494145,
+    "ast_hash": "c48eaf2a14d2a95de67fa779ef1e41e5",
+    "semantic_hash": ""
   },
   "backend/app/learning/__init__.py": {
     "mtime": 1783525630.4750907,
@@ -220,8 +220,8 @@
     "semantic_hash": "d50ed59237ffa46af5630259afb13e0a"
   },
   "backend/app/pipeline.py": {
-    "mtime": 1784754110.814597,
-    "ast_hash": "ef220a3f3024be5fe816b94b727064b3",
+    "mtime": 1785883725.1558743,
+    "ast_hash": "fb8e5415c39e0da143f6471a8138e850",
     "semantic_hash": ""
   },
   "backend/app/rallyanalysis/__init__.py": {
@@ -230,24 +230,24 @@
     "semantic_hash": "d41d8cd98f00b204e9800998ecf8427e"
   },
   "backend/app/rallyanalysis/coaching.py": {
-    "mtime": 1784171554.8215756,
-    "ast_hash": "f41729a1116a32ca51931880e15322f4",
-    "semantic_hash": "f41729a1116a32ca51931880e15322f4"
+    "mtime": 1785853189.423293,
+    "ast_hash": "88eb29f1c43a1615998b4525f396fa00",
+    "semantic_hash": ""
   },
   "backend/app/rallyanalysis/contact_detect.py": {
-    "mtime": 1784171554.8217387,
-    "ast_hash": "c5fc7861c53eea9e88f604de46dcfddd",
-    "semantic_hash": "c5fc7861c53eea9e88f604de46dcfddd"
+    "mtime": 1785645358.100566,
+    "ast_hash": "72b0b376259db2788150c650493e2db6",
+    "semantic_hash": ""
   },
   "backend/app/rallyanalysis/contracts.py": {
-    "mtime": 1784171554.82184,
-    "ast_hash": "282206c6b12ff5330e499a68d6a63e93",
-    "semantic_hash": "282206c6b12ff5330e499a68d6a63e93"
+    "mtime": 1785853093.7873504,
+    "ast_hash": "00d67f7b5ca3829d12475f60fa2434ed",
+    "semantic_hash": ""
   },
   "backend/app/rallyanalysis/readiness.py": {
-    "mtime": 1784171554.8219616,
-    "ast_hash": "7bfe0643965684cd6afe7d792c8b8831",
-    "semantic_hash": "7bfe0643965684cd6afe7d792c8b8831"
+    "mtime": 1785645365.5620997,
+    "ast_hash": "c48ac76db5e3479018f68b568319ba86",
+    "semantic_hash": ""
   },
   "backend/app/rallyanalysis/tests/__init__.py": {
     "mtime": 1784171554.8220224,
@@ -255,9 +255,9 @@
     "semantic_hash": "d41d8cd98f00b204e9800998ecf8427e"
   },
   "backend/app/rallyanalysis/tests/test_coaching.py": {
-    "mtime": 1784171554.8224995,
-    "ast_hash": "948054117a241dae6e0430bc931b58ff",
-    "semantic_hash": "948054117a241dae6e0430bc931b58ff"
+    "mtime": 1785853093.7886016,
+    "ast_hash": "6cf97ff5c35f6956c90322088a88286b",
+    "semantic_hash": ""
   },
   "backend/app/rallyanalysis/tests/test_contact_detect.py": {
     "mtime": 1784171554.8228097,
@@ -265,9 +265,9 @@
     "semantic_hash": "0fd551cd5a50f6240344347c9bb12496"
   },
   "backend/app/rallyanalysis/tests/test_rally_source_default.py": {
-    "mtime": 1784171554.8228858,
-    "ast_hash": "e5439b92b93c4810bada25f772c31fe9",
-    "semantic_hash": "e5439b92b93c4810bada25f772c31fe9"
+    "mtime": 1785853093.7894235,
+    "ast_hash": "95b5fe3ee1a125aee041b3d86cf38f50",
+    "semantic_hash": ""
   },
   "backend/app/rallyanalysis/tests/test_readiness.py": {
     "mtime": 1784171554.8231328,
@@ -310,9 +310,9 @@
     "semantic_hash": "18291cfc73e28fa9a53b4d0349be2e79"
   },
   "backend/app/refine/io_loaders.py": {
-    "mtime": 1784171554.8244479,
-    "ast_hash": "17c7207e66ba91842a072031f2c20b35",
-    "semantic_hash": "17c7207e66ba91842a072031f2c20b35"
+    "mtime": 1785857942.9319816,
+    "ast_hash": "c56b080235bd0806924c704293bd5403",
+    "semantic_hash": ""
   },
   "backend/app/refine/labels.py": {
     "mtime": 1784171554.8245094,
@@ -395,18 +395,18 @@
     "semantic_hash": ""
   },
   "backend/app/secrets_bootstrap.py": {
-    "mtime": 1784327009.6600857,
-    "ast_hash": "1d3e8937bd7a053506f5cc1aa1c4197a",
-    "semantic_hash": "1d3e8937bd7a053506f5cc1aa1c4197a"
+    "mtime": 1784762574.3080509,
+    "ast_hash": "7ce1450baf8e832eef19e058734913eb",
+    "semantic_hash": ""
   },
   "backend/app/self_stop.py": {
-    "mtime": 1784392088.1182625,
-    "ast_hash": "df0f842eea9331888828c409f5eed198",
-    "semantic_hash": "df0f842eea9331888828c409f5eed198"
+    "mtime": 1785883633.5965703,
+    "ast_hash": "e967d67dacaa743aa2544749d1a1287b",
+    "semantic_hash": ""
   },
   "backend/app/storage_s3.py": {
-    "mtime": 1784750552.5583723,
-    "ast_hash": "f6396a27ca810f2282915a752f9427af",
+    "mtime": 1785883722.999293,
+    "ast_hash": "ef11beec667b006f0eecd83e0c9d749d",
     "semantic_hash": ""
   },
   "backend/scripts/ball_gt_io.py": {
@@ -475,8 +475,8 @@
     "semantic_hash": "a68603daee52a167e3fa99ea83f37344"
   },
   "frontend/src/App.jsx": {
-    "mtime": 1784750575.476684,
-    "ast_hash": "8430055ca020d9a18f410c6a13c88ee0",
+    "mtime": 1785810367.3542576,
+    "ast_hash": "3cff82a121c0e33b02e149a25f758576",
     "semantic_hash": ""
   },
   "frontend/src/CalibrationPanel.jsx": {
@@ -490,9 +490,9 @@
     "semantic_hash": "d3fcd36f64756bf8a871be4eda93cea5"
   },
   "frontend/src/RallyAnalysis/RallyAnalysisPanel.jsx": {
-    "mtime": 1784171554.8307185,
-    "ast_hash": "eabce0c57568069287501ce99319cf61",
-    "semantic_hash": "eabce0c57568069287501ce99319cf61"
+    "mtime": 1785858101.621502,
+    "ast_hash": "61592593986d75a173a769a1b6036ec4",
+    "semantic_hash": ""
   },
   "frontend/src/Timeline.jsx": {
     "mtime": 1784171554.8309138,
@@ -505,13 +505,13 @@
     "semantic_hash": "9f4ce196d0bac1cfa8e9e4478c4e5178"
   },
   "frontend/src/Workspace.jsx": {
-    "mtime": 1784514694.111637,
-    "ast_hash": "b3e54b7d89831813b9ab4cee29d8c86a",
-    "semantic_hash": "b3e54b7d89831813b9ab4cee29d8c86a"
+    "mtime": 1785883728.7844687,
+    "ast_hash": "9d88a84113027536c94ca9e4e4effe51",
+    "semantic_hash": ""
   },
   "frontend/src/api.js": {
-    "mtime": 1784750563.5949097,
-    "ast_hash": "f694c9acab6b1b911e8b8ee9c50b7bf6",
+    "mtime": 1785858081.8717945,
+    "ast_hash": "160a064ad085ab4d1336238227981301",
     "semantic_hash": ""
   },
   "frontend/src/main.jsx": {
@@ -540,9 +540,9 @@
     "semantic_hash": ""
   },
   "scripts/restart-local.sh": {
-    "mtime": 1784514889.8620474,
-    "ast_hash": "7ce209018a92ca62ff08f105bcdcc81d",
-    "semantic_hash": "7ce209018a92ca62ff08f105bcdcc81d"
+    "mtime": 1784851040.3050084,
+    "ast_hash": "61a0dcc003f5a6c4088dd1ca5e62e6e8",
+    "semantic_hash": ""
   },
   "CLAUDE.md": {
     "mtime": 1784573600.5993876,
@@ -575,8 +575,8 @@
     "semantic_hash": ""
   },
   "docs/CONTEXT.md": {
-    "mtime": 1784171554.8284082,
-    "ast_hash": "ec1fa2ebd05b4069c22901dc58f7f1b7",
+    "mtime": 1785853093.7903118,
+    "ast_hash": "ebaa777ea9d856afaeb44f7945e040d7",
     "semantic_hash": ""
   },
   "docs/HW_PROFILES.md": {
@@ -605,8 +605,8 @@
     "semantic_hash": ""
   },
   "docs/RALLY_SYSTEM.md": {
-    "mtime": 1784171554.8292081,
-    "ast_hash": "e956895413b3ad1812b5fd86e63e5f32",
+    "mtime": 1785607094.2521439,
+    "ast_hash": "0c8792757ea1e785dcf3a34e347093ec",
     "semantic_hash": ""
   },
   "docs/SESSION_HANDOFF_2026-07-10.md": {
@@ -652,6 +652,91 @@
   "scripts/deploy.sh": {
     "mtime": 1784606944.759736,
     "ast_hash": "8b7ec8006810e9e49532c229e61af4b5",
+    "semantic_hash": ""
+  },
+  "backend/app/cv/tests/test_identity.py": {
+    "mtime": 1784925032.328401,
+    "ast_hash": "e8f643f61424e16ad9e1dccffbfd04a8",
+    "semantic_hash": ""
+  },
+  "backend/app/rallyanalysis/keyframes.py": {
+    "mtime": 1785853093.787572,
+    "ast_hash": "4e0af1eb5c52968025c25440cf124564",
+    "semantic_hash": ""
+  },
+  "backend/app/rallyanalysis/report_stats.py": {
+    "mtime": 1785853093.7878618,
+    "ast_hash": "a0695e096c8ac11eeeff405cca24f110",
+    "semantic_hash": ""
+  },
+  "backend/app/rallyanalysis/shot_context.py": {
+    "mtime": 1785853093.788077,
+    "ast_hash": "1a028156a601e0379756b000f8b418ba",
+    "semantic_hash": ""
+  },
+  "backend/app/rallyanalysis/tests/test_keyframes.py": {
+    "mtime": 1785853093.7887514,
+    "ast_hash": "714a86a75c5f1384876c241ba736e859",
+    "semantic_hash": ""
+  },
+  "backend/app/rallyanalysis/tests/test_report_stats.py": {
+    "mtime": 1785102799.4745243,
+    "ast_hash": "d404ec21b17ab0173550c4db4c33a11c",
+    "semantic_hash": ""
+  },
+  "backend/app/rallyanalysis/tests/test_shot_context.py": {
+    "mtime": 1785853093.789717,
+    "ast_hash": "a3d0c080cf947f4b649a90ad6f083cd9",
+    "semantic_hash": ""
+  },
+  "backend/app/rallyanalysis/tests/test_trajectory.py": {
+    "mtime": 1785104870.0177536,
+    "ast_hash": "84020c5323e263ecc2ab5394ed2acc11",
+    "semantic_hash": ""
+  },
+  "backend/app/rallyanalysis/trajectory.py": {
+    "mtime": 1785645358.1036522,
+    "ast_hash": "4b6868cb5e28ea672c7b47cc6a41a657",
+    "semantic_hash": ""
+  },
+  "backend/app/tests/test_job_timeout.py": {
+    "mtime": 1785797598.5171275,
+    "ast_hash": "82f5b14f6c5dde370eb774f3612f8809",
+    "semantic_hash": ""
+  },
+  "backend/app/tests/test_self_stop_toggle.py": {
+    "mtime": 1785883735.2616322,
+    "ast_hash": "b90edc8fc3eafdf1e4f76b97c8a1be3b",
+    "semantic_hash": ""
+  },
+  "backend/scripts/export_tracknet_dataset.py": {
+    "mtime": 1784843717.450299,
+    "ast_hash": "e6b451ccf0a511c690e7420d84372cf4",
+    "semantic_hash": ""
+  },
+  "backend/scripts/finetune_tracknet.py": {
+    "mtime": 1784844592.3177814,
+    "ast_hash": "51ffcdb57371036d6e5ccfc14937f805",
+    "semantic_hash": ""
+  },
+  "frontend/src/Home.jsx": {
+    "mtime": 1785628871.2457469,
+    "ast_hash": "1ebb67eac09c8d04c2852e48b2372dc7",
+    "semantic_hash": ""
+  },
+  "frontend/src/RallyAnalysis/CoachingSelections.jsx": {
+    "mtime": 1785858135.7559683,
+    "ast_hash": "3b5edbb33803f42d368bec9550841e51",
+    "semantic_hash": ""
+  },
+  "frontend/src/RallyAnalysis/ShotHeatmap.jsx": {
+    "mtime": 1785104981.563922,
+    "ast_hash": "a0041694df60faf348fb5b0d818e2632",
+    "semantic_hash": ""
+  },
+  "frontend/src/RallyAnalysis/playerColors.js": {
+    "mtime": 1785103282.2621508,
+    "ast_hash": "4c8b567c37ca718bd6c94c3cf39336ca",
     "semantic_hash": ""
   }
 }
