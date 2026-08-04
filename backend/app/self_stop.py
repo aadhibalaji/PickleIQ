@@ -1,18 +1,30 @@
-"""Stop this EC2 instance once the job queue runs dry, so GPU time isn't
-billed while idle between batches.
+"""Stop this EC2 instance once work is done, so GPU time isn't billed while
+idle between batches — with a Pass-1→Pass-2 grace so the human-in-the-loop
+selection step doesn't force a cold start.
 
-Mirrors secrets_bootstrap.py's pattern: everything here — the IMDSv2 token
-fetch, the instance-id lookup, and the stop_instances() call itself — sits
-inside one try/except. A transient metadata-service or EC2 API hiccup must
-never propagate into the caller (the job runner's main loop); it just logs
-and no-ops, same as running locally or on RunPod where the metadata service
-at 169.254.169.254 doesn't exist at all.
+Mirrors secrets_bootstrap.py's pattern: everything in stop_this_instance —
+the IMDSv2 token fetch, the instance-id lookup, and the stop_instances()
+call itself — sits inside one try/except. A transient metadata-service or
+EC2 API hiccup must never propagate into the caller (the job runner's main
+loop); it just logs and no-ops, same as running locally or on RunPod where
+the metadata service at 169.254.169.254 doesn't exist at all.
+
+Toggle semantics (see should_auto_stop):
+  ON  — smart stop: stay up after Pass 1 for SELF_STOP_PASS1_GRACE_S so the
+        user can trigger Pass 2; stop when the queue is empty and nothing is
+        in that grace window (including after the Pass 2 full chain finishes,
+        or when the grace expires with no Pass 2 started).
+  OFF — stay up through the Pass 1→Pass 2 gap the same way, but only arm a
+        stop after a Pass 2 full chain reaches a terminal state (done/error/
+        cancelled) or the grace expires. Idle boots with no recent chain do
+        not self-stop (testing escape hatch).
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
+import time
 
 import requests
 

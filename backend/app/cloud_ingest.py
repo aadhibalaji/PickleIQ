@@ -228,6 +228,11 @@ def _tick() -> None:
             log.exception("cloud ingest: failed to start %s (non-fatal, retrying next tick)",
                           video_id)
 
+    # After video discovery so a request that arrived with a brand-new
+    # upload can resolve once the video row exists (same tick if ingest
+    # succeeded above; otherwise next tick).
+    _tick_pass2_requests()
+
 
 def _loop() -> None:
     while True:

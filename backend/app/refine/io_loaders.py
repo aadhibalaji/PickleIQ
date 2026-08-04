@@ -109,13 +109,21 @@ def load_video(video_id: str) -> dict:
 
 
 def load_pass1_windows(video_id: str, source: str = "pass1") -> list[Pass1Window]:
+    """Rally windows this video's refine/keep-drop pass should score.
+
+    Excludes rows meta-tagged user_drawn=True (see
+    pipeline._build_do_pass2_selections): those are manual coaching-selection
+    ranges, not Pass 1's own candidates, so there is no Pass 1 confidence
+    signal to grade — keep/drop is a Pass-1-candidate concept and doesn't
+    apply to a range the user already hand-picked."""
     with db.connect() as con:
         rows = con.execute(
             "SELECT id, start_frame, end_frame, meta FROM rally_labels"
             " WHERE video_id=? AND source=? ORDER BY start_frame",
             (video_id, source)).fetchall()
-    return [Pass1Window(r["id"], r["start_frame"], r["end_frame"],
-                        db.loads(r["meta"], {})) for r in rows]
+    windows = [Pass1Window(r["id"], r["start_frame"], r["end_frame"],
+                           db.loads(r["meta"], {})) for r in rows]
+    return [w for w in windows if not w.meta.get("user_drawn")]
 
 
 def load_homography(video_id: str) -> np.ndarray | None:

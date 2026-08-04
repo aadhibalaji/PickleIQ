@@ -22,6 +22,24 @@ from .hw_profile import active_profile
 log = logging.getLogger("pipeline")
 
 
+def queue_pass2_on_cloud(video_id: str, request: dict) -> dict:
+    """RUN_PROCESSING=0 only — writes a Pass 2 work request to S3 for the
+    EC2 worker's cloud_ingest poller (see storage_s3.upload_pass2_request /
+    cloud_ingest._ingest_pass2_request). Mirrors a local pass2 jobs row so
+    the UI shows cloud progress the same way it does after a video upload.
+    Never calls runner.submit on this container."""
+    if RUN_PROCESSING:
+        raise RuntimeError("queue_pass2_on_cloud is only for RUN_PROCESSING=0 containers")
+    if STORAGE_BACKEND != "s3":
+        raise RuntimeError("queue_pass2_on_cloud requires STORAGE_BACKEND=s3")
+    payload = {**request, "video_id": video_id, "requested_at": db.now()}
+    storage_s3.upload_pass2_request(video_id, payload)
+    _upsert_mirror_job(video_id, "pass1", "done", "")
+    _upsert_mirror_job(video_id, "pass2", "queued",
+                       "waiting for cloud worker to run Pass 2")
+    return {"queued_for_cloud": True, "job_id": None}
+
+
 def seed_cloud_placeholder(video_id: str) -> None:
     """RUN_PROCESSING=0 only — called from api/media.py's upload_video in
     place of start_processing(). Inserts one informational jobs row so the
@@ -84,6 +102,17 @@ def mirror_cloud_chain_status(video_id: str, chain_status: dict[str, dict]) -> N
         if not info or info["status"] == "not_run":
             continue
         _upsert_mirror_job(video_id, kind, info["status"], info.get("message") or "")
+    # Local coaching_selections were flipped to 'processing' when the UI
+    # wrote the S3 pass2 request — once the cloud reports pass2 terminal,
+    # mirror that so the Rally Analysis panel doesn't stay stuck.
+    p2 = chain_status.get("pass2") or {}
+    if p2.get("status") in ("done", "error", "cancelled"):
+        new_status = "ready" if p2["status"] == "done" else "failed"
+        with db.connect() as con:
+            con.execute(
+                "UPDATE coaching_selections SET status=?, error_message=? WHERE video_id=?"
+                " AND status='processing'",
+                (new_status, p2.get("message") or None, video_id))
 
 
 def mirror_cloud_progress(video_id: str, progress_payload: dict) -> None:
@@ -316,10 +345,19 @@ def _detect_contacts_after_pass2(video_id: str) -> None:
         log.exception("contact detection failed (non-fatal)")
 
 
-def _build_do_pass2(video_id: str, params: dict):
-    """Shared by start_processing (chained after Pass 1) and reprocess
-    (standalone 'pass2' re-run) so the cancel/error handling below only has
-    to be written — and reviewed — once.
+def _build_do_pass2(video_id: str, params: dict,
+                     windows_override: list[tuple[int, int]] | None = None):
+    """Shared by reprocess (standalone 'pass2' re-run, all Pass 1 windows) and
+    _build_do_pass2_selections (below — user-curated windows only) so the
+    cancel/error handling below only has to be written — and reviewed —
+    once.
+
+    windows_override, when given, is threaded straight through to
+    run_pass2's own windows_override: Pass 2 processes exactly these ranges
+    instead of querying every rally_labels(pass1) row. refine/keep-drop and
+    contacts still key off rally_labels the normal way (see
+    _build_do_pass2_selections's docstring for how user-drawn ranges reach
+    rally_labels without being graded by keep/drop).
 
     run_pass2 raises JobCancelled (via handle.update()'s cooperative check,
     called roughly every 100 frames — see jobs.py) when the user hits
@@ -348,7 +386,8 @@ def _build_do_pass2(video_id: str, params: dict):
         on_window = _window_refiner(video_id)
         on_window(-1)   # drop stale refine JSON before the pass starts
         try:
-            run_pass2(video_id, params, H, cam, handle, on_window=on_window)
+            run_pass2(video_id, params, H, cam, handle, on_window=on_window,
+                      windows_override=windows_override)
         except JobCancelled:
             _finish_chain(video_id, run_contacts=False,
                           status_override={"pass2": {"status": "cancelled",
@@ -441,7 +480,13 @@ def _build_do_pass2_range(video_id: str, params: dict, selection_id: str,
 
 
 def start_processing(video_id: str) -> dict:
-    """Kick off Pass 1 immediately (background); Pass 2 chains after it."""
+    """Kick off Pass 1 immediately (background). Pass 2 no longer auto-runs
+    after it: it's now user-triggered from the Rally Analysis tab once the
+    user has reviewed Pass 1's candidates and picked what to include/draw
+    (see api/rally_analysis.py's process_selections /
+    _build_do_pass2_selections) — Pass 2 used to blindly process 100% of
+    Pass 1's candidate windows, most of which a user typically doesn't want
+    analyzed."""
     version, params = learned_params.get_latest()
     params = _with_hw_overrides(params)
     with db.connect() as con:
@@ -463,10 +508,6 @@ def start_processing(video_id: str) -> dict:
             # status back to 'running' — see storage_s3.delete_progress.
             if STORAGE_BACKEND == "s3":
                 storage_s3.delete_progress(video_id)
-        # Chain Pass 2 automatically (unless Pass 1 was cancelled). It will
-        # fail with a clear message if the court is not calibrated yet.
-        if not handle.cancelled():
-            runner.submit(video_id, "pass2", _build_do_pass2(video_id, params))
 
     job_id = runner.submit(video_id, "pass1", do_pass1)
     return {"job_id": job_id, "learned_params_version": version}

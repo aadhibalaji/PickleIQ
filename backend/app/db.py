@@ -235,6 +235,11 @@ _ADDED_COLUMNS = [
     # backfill in init_db below). TEXT rather than a single-purpose boolean so
     # a future different staleness reason doesn't need its own new column.
     ("coaching_reports", "stale_reason", "TEXT"),
+    # JSON [{player_id, player_label, theme}] — one per-player session theme
+    # from the same single coaching LLM call as tips_json. NULL/absent on
+    # reports generated before themes existed (rendered as "no theme", never
+    # backfilled — regenerating the report is the upgrade path).
+    ("coaching_reports", "themes_json", "TEXT"),
 ]
 
 STALE_BEFORE_CONFIDENCE_FIX = "generated_before_confidence_fix"

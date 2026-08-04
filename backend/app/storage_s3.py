@@ -389,6 +389,57 @@ def download_tracknet_weights(dest: Path) -> bool:
     return True
 
 
+def pass2_request_key(video_id: str) -> str:
+    """Work-request object a RUN_PROCESSING=0 UI container writes so the EC2
+    worker's cloud_ingest poller can enqueue Pass 2 — Rally Analysis
+    process-selections has no other way to reach the worker (unlike video
+    upload, which wakes the instance via the S3→Lambda trigger). Lives under
+    jobs/ so a video-only Lambda prefix filter never treats it as an upload."""
+    return f"jobs/{video_id}/pass2_request.json"
+
+
+def upload_pass2_request(video_id: str, data: dict) -> str:
+    key = pass2_request_key(video_id)
+    _put_json(key, data)
+    return key
+
+
+def download_pass2_request(video_id: str) -> dict | None:
+    return _get_json(pass2_request_key(video_id))
+
+
+def list_pass2_request_video_ids() -> list[str]:
+    """video_ids with an *unclaimed* pass2_request.json in S3. Claimed
+    requests stay as overwrite markers (this role often lacks
+    s3:DeleteObject — see delete_progress) so we must open each object."""
+    _require_bucket()
+    try:
+        resp = _client().list_objects_v2(Bucket=S3_VIDEO_BUCKET, Prefix="jobs/")
+    except Exception as exc:
+        log.error("S3 list_objects_v2 failed: bucket=%s prefix=jobs/ (%s)", S3_VIDEO_BUCKET, exc)
+        raise RuntimeError(f"S3 list failed for prefix 'jobs/' in bucket {S3_VIDEO_BUCKET!r}: {exc}") from exc
+    out: list[str] = []
+    for obj in resp.get("Contents", []):
+        key = obj["Key"]
+        parts = key.split("/")
+        if len(parts) != 3 or parts[0] != "jobs" or parts[2] != "pass2_request.json":
+            continue
+        video_id = parts[1]
+        data = _get_json(key)
+        if data and not data.get("claimed"):
+            out.append(video_id)
+    return out
+
+
+def claim_pass2_request(video_id: str) -> None:
+    """Marks the work request consumed without requiring s3:DeleteObject —
+    overwrites the JSON with a claimed marker the list/poll helpers ignore."""
+    import time
+    _put_json(pass2_request_key(video_id), {
+        "claimed": True, "video_id": video_id, "claimed_at": time.time(),
+    })
+
+
 def refine_config_key() -> str:
     return "refine/config.override.yaml.json"
 

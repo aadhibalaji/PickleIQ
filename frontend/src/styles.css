@@ -121,10 +121,20 @@ kbd { background: var(--panel2); border: 1px solid var(--border); border-radius:
 .pin.tip-praise { border: 2px solid var(--panel); }
 .pin.pin-active { opacity: 1; box-shadow: 0 0 0 2px #fff; z-index: 1; }
 
+.theme-cards { display: flex; flex-direction: column; gap: 6px; margin: 0 0 10px; }
+.theme-card { padding: 8px 12px; background: var(--panel2); border-radius: 6px; border-left: 3px solid var(--border); }
+.theme-card-player { font-size: 12px; color: var(--muted); font-weight: 600; }
+.theme-card-text { font-size: 13px; line-height: 1.4; margin: 4px 0 0; }
+
 .tip-panel { margin-top: 10px; padding: 10px; background: var(--panel2); border-radius: 6px; border-left: 3px solid var(--border); }
 .tip-panel.tip-improve { border-left-color: var(--warn); }
 .tip-panel.tip-praise { border-left-color: var(--accent); }
 .tip-panel-player { font-size: 12px; color: var(--muted); font-weight: 600; }
+.tip-feedback { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
+.tip-feedback-label { font-size: 11px; color: var(--muted); }
+.tip-feedback-btn { padding: 2px 8px; font-size: 13px; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; cursor: pointer; opacity: 0.6; }
+.tip-feedback-btn:hover { opacity: 1; }
+.tip-feedback-btn.active { opacity: 1; border-color: var(--accent); }
 .tip-card-badge { font-size: 11px; text-transform: capitalize; color: var(--muted); }
 .tip-card-text { font-size: 13px; line-height: 1.4; margin: 6px 0 0; }
 

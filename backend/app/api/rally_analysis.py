@@ -39,12 +39,47 @@ def _report_payload(report: CoachingReport) -> dict:
     tips = [asdict(t) for t in report.tips]
     players = sorted({t["player_label"] for t in tips})
     return {"video_id": report.video_id, "tips": tips, "players": players,
+            "player_themes": [asdict(t) for t in report.player_themes],
             "stale_reason": report.stale_reason}
 
 
 @router.get("/rally-analysis/health")
 def health():
     return {"status": "ok"}
+
+
+@router.post("/rally-analysis/{video_id}/process-single-rally")
+def process_single_rally(video_id: str):
+    """Coaching-only fast path for a PRE-TRIMMED clip containing exactly one
+    rally: writes a pass1-source rally label spanning the whole clip
+    (replacing any prior pass1 labels for this video — that's why this must
+    only be used on single-rally clips, never a full match), then submits
+    Pass 2 directly via pipeline.reprocess. Pass 2 reads its processing
+    windows from pass1-source rally_labels (see cv/pass2.py run_pass2), so
+    this skips Pass 1's rally detection entirely while the rest of the chain
+    (pass2 overlays -> contacts job -> readiness gate -> Generate report)
+    runs completely unchanged. Court calibration is still required, exactly
+    as for a normal Pass 2 run."""
+    from .. import pipeline
+    with db.connect() as con:
+        vrow = con.execute("SELECT frame_count FROM videos WHERE id=?", (video_id,)).fetchone()
+        if vrow is None:
+            raise HTTPException(status_code=404, detail="video not found")
+        if not vrow["frame_count"]:
+            raise HTTPException(status_code=409, detail="video has no frame_count recorded")
+        con.execute("DELETE FROM rally_labels WHERE video_id=? AND source='pass1'", (video_id,))
+        con.execute(
+            "INSERT INTO rally_labels (id, video_id, source, start_frame, end_frame, meta)"
+            " VALUES (?,?,?,?,?,?)",
+            (db.new_id(), video_id, "pass1", 0, int(vrow["frame_count"]) - 1,
+             db.dumps({"whole_clip_rally": True})))
+    if not RUN_PROCESSING:
+        # UI-only container: hand Pass 2 to the EC2 worker via S3 (same
+        # path as process-selections) instead of runner.submit here.
+        cloud = pipeline.queue_pass2_on_cloud(video_id, {"mode": "full_pass2"})
+        return {"video_id": video_id, "rally_frames": [0, int(vrow["frame_count"]) - 1], **cloud}
+    result = pipeline.reprocess(video_id, "pass2")
+    return {"video_id": video_id, "rally_frames": [0, int(vrow["frame_count"]) - 1], **result}
 
 
 @router.post("/rally-analysis/{video_id}/detect-contacts")
@@ -91,6 +126,45 @@ def get_coaching_report(video_id: str):
     regeneration only happens via the POST endpoint."""
     report = coaching.get_report(video_id)
     return {"video_id": video_id, "report": _report_payload(report) if report else None}
+
+
+@router.post("/rally-analysis/{video_id}/tip-feedback")
+def submit_tip_feedback(video_id: str, payload: dict):
+    """Stores one thumbs verdict for one tip: {contact_id, rating: 1|-1,
+    category?, tone?, tip?}. Re-rating the same tip replaces the prior row
+    (PRIMARY KEY (video_id, contact_id)); category/tone/tip text are
+    snapshotted so the signal stays analyzable after the report is
+    regenerated. This is the measurement layer for tip-selection quality —
+    see get_tip_feedback's aggregate."""
+    contact_id = payload.get("contact_id")
+    rating = payload.get("rating")
+    if not contact_id or rating not in (1, -1):
+        raise HTTPException(status_code=422,
+                            detail="contact_id and rating (1 or -1) are required")
+    with db.connect() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO tip_feedback"
+            " (video_id, contact_id, rating, category, tone, tip_text, created_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (video_id, contact_id, int(rating), payload.get("category"),
+             payload.get("tone"), payload.get("tip"), db.now()))
+    return {"video_id": video_id, "contact_id": contact_id, "rating": rating}
+
+
+@router.get("/rally-analysis/{video_id}/tip-feedback")
+def get_tip_feedback(video_id: str):
+    """{ratings: {contact_id: 1|-1}, summary: {helpful, not_helpful}} — the
+    ratings map restores button state in the UI; the summary is the report-
+    level hit-rate that turns tip-selection changes into a measurable number
+    instead of vibes."""
+    with db.connect() as con:
+        rows = con.execute(
+            "SELECT contact_id, rating FROM tip_feedback WHERE video_id=?",
+            (video_id,)).fetchall()
+    ratings = {r["contact_id"]: r["rating"] for r in rows}
+    return {"video_id": video_id, "ratings": ratings,
+            "summary": {"helpful": sum(1 for v in ratings.values() if v == 1),
+                         "not_helpful": sum(1 for v in ratings.values() if v == -1)}}
 
 
 @router.get("/rally-analysis/{video_id}/report-stats")
