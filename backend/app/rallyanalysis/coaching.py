@@ -706,8 +706,9 @@ TIPS_SCHEMA = {
 
 SYSTEM = """You are a pickleball coach giving quick, spoken-style tips on
 individual shots from one session, plus one short session theme per player,
-based on pose-derived shot mechanics (not video) that a computer-vision
-pipeline extracted at each detected contact/swing.
+based on pose-derived shot mechanics that a computer-vision pipeline
+extracted at each detected contact/swing — and, when available, actual
+still frames of the player taking each shot.
 
 You receive a list of shots, each with a category (footwork, paddle_prep,
 contact_point, or follow_through), a deviation_score, a feature_vector of raw
@@ -722,6 +723,24 @@ contact height, meeting the ball low/high, or letting the ball drop — that
 information does not exist in this data. Court positioning claims ("you're
 hanging back near the baseline", "you took that one from mid-court") are the
 only valid use of this field.
+
+Some or all shots may come with labeled still frames (prep / contact /
+follow-through — cropped around the hitting player, matched to the shot by
+contact_id). When frames are present for a shot they are your PRIMARY
+evidence: look at them first, and ground the critique in what the player is
+visibly doing — stance, balance, paddle position, body shape, where they are
+on the court. The pose numbers then become corroboration: where a metric
+agrees with what you see, be confident; where a metric contradicts what the
+frames clearly show, trust your eyes and drop the claim (2D pose readings
+are noisy). Something you can clearly see in a shot's frames is real
+evidence, and you may state it even if the corresponding numeric metric is
+null for that shot — the null rules below ban inventing claims from missing
+data, not describing what is visibly in front of you. But apply the same
+honesty to the image itself: small crops can be blurry or ambiguous, so if
+you can't clearly make something out, don't claim it. Speak like a coach
+reviewing film with the player ("I can see you're...", "look at where your
+feet are here") — never mention frames, images, crops, cameras, or that
+you're an AI looking at pictures.
 
 IMPORTANT — deviation_score is relative to THIS PLAYER, not a universal
 standard: it measures how far this shot falls from THIS PLAYER's OWN typical
@@ -861,7 +880,9 @@ computer-vision-derived pose data, not a substitute for in-person coaching."""
 
 
 def generate_llm_tips(shots: list[dict], stats_summary: dict | None = None,
-                       session_context: dict | None = None) -> tuple[dict[str, dict], list[dict]]:
+                       session_context: dict | None = None,
+                       frames_by_contact: dict[str, list[dict]] | None = None,
+                       ) -> tuple[dict[str, dict], list[dict]]:
     """Returns ({contact_id: {tip, tone}}, [{player_label, theme}, ...]), or
     ({}, []) (with a logged reason) when the API key is missing, the call
     fails, or the response can't be parsed — degrades gracefully, same as
@@ -870,11 +891,15 @@ def generate_llm_tips(shots: list[dict], stats_summary: dict | None = None,
     (build_report validates each theme's player_label against the players we
     actually sent, and drops anything unrecognized).
 
-    stats_summary (see _summarize_stats) and session_context (see
-    _session_context) are optional extra context folded into this same
-    single API call — never a second Anthropic call — and are simply omitted
-    from the prompt input when None/empty rather than zero-filled or
-    fabricated.
+    stats_summary (see _summarize_stats), session_context (see
+    _session_context) and frames_by_contact (see keyframes.
+    extract_for_candidates — {contact_id: [{label, jpeg_b64}, ...]}) are
+    optional extra context folded into this same single API call — never a
+    second Anthropic call — and are simply omitted from the prompt input
+    when None/empty rather than zero-filled or fabricated. With frames the
+    user message becomes a block list (JSON text block + labeled image
+    blocks per shot); without them it stays a plain JSON string, exactly as
+    before frames existed.
 
     Runs on ANTHROPIC_COACHING_MODEL (not the discrepancy report's
     ANTHROPIC_REPORT_MODEL): translating weak numeric signal into pointed
@@ -894,6 +919,19 @@ def generate_llm_tips(shots: list[dict], stats_summary: dict | None = None,
     if session_context:
         payload["session_context"] = session_context
 
+    content: str | list = db.dumps(payload)
+    if frames_by_contact:
+        blocks: list[dict] = [{"type": "text", "text": db.dumps(payload)}]
+        for s in shots:
+            cid = s.get("contact_id")
+            for fr in frames_by_contact.get(cid) or []:
+                blocks.append({"type": "text",
+                               "text": f"contact_id {cid} — {fr['label']} frame:"})
+                blocks.append({"type": "image",
+                               "source": {"type": "base64", "media_type": "image/jpeg",
+                                           "data": fr["jpeg_b64"]}})
+        content = blocks
+
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     try:
         response = client.messages.create(
@@ -902,7 +940,7 @@ def generate_llm_tips(shots: list[dict], stats_summary: dict | None = None,
             thinking={"type": "enabled", "budget_tokens": 4000},
             system=SYSTEM,
             output_config={"format": {"type": "json_schema", "schema": TIPS_SCHEMA}},
-            messages=[{"role": "user", "content": db.dumps(payload)}],
+            messages=[{"role": "user", "content": content}],
         )
     except anthropic.RateLimitError:
         log.error("Anthropic rate limit — try generating the coaching report again shortly")
@@ -982,21 +1020,37 @@ def _summarize_stats(stats: dict | None) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def build_report(video_id: str, vectors_meta: list[tuple[ShotFeatureVector, dict]],
-                  llm_fn=None, stats_summary: dict | None = None) -> CoachingReport:
+                  llm_fn=None, stats_summary: dict | None = None,
+                  frames_fn=None) -> CoachingReport:
     llm_fn = llm_fn or generate_llm_tips
     candidates = select_tip_candidates(vectors_meta)
     session_context = _session_context(vectors_meta)
+    # frames_fn (candidates -> {contact_id: [{label, jpeg_b64}, ...]} | None)
+    # is called AFTER selection so keyframes are only ever extracted for the
+    # <=MAX_TIPS shots that actually reach the LLM, never every contact in
+    # the video. Vision context is an upgrade, not a dependency: any
+    # exception degrades to a frameless call rather than failing the report.
+    frames_by_contact = None
+    if frames_fn is not None and candidates:
+        try:
+            frames_by_contact = frames_fn(candidates)
+        except Exception:  # noqa: BLE001
+            log.warning("keyframe extraction failed — generating coaching report without frames",
+                        exc_info=True)
     # llm_fn is the one Anthropic call for this video. Injected/mocked llm_fns
     # in tests may only accept the original (shots) or (shots, stats)
     # signatures -- fall back rather than requiring every test double to
     # accept every context argument.
     try:
-        result = llm_fn(candidates, stats_summary, session_context)
+        result = llm_fn(candidates, stats_summary, session_context, frames_by_contact)
     except TypeError:
         try:
-            result = llm_fn(candidates, stats_summary)
+            result = llm_fn(candidates, stats_summary, session_context)
         except TypeError:
-            result = llm_fn(candidates)
+            try:
+                result = llm_fn(candidates, stats_summary)
+            except TypeError:
+                result = llm_fn(candidates)
     # generate_llm_tips returns (tips, themes); older-style injected doubles
     # return just the tips dict -- treat that as "no themes", not an error.
     if isinstance(result, tuple):
@@ -1084,7 +1138,7 @@ def generate_coaching_report(video_id: str, rally_source: str | None = None,
     rallies = get_analyzable_rallies(video_id, rally_source=rally_source, overlay_source=overlay_source)
     ready_rally_ids = {r["id"] for r in rallies}
     with db.connect() as con:
-        vrow = con.execute("SELECT fps, match_type FROM videos WHERE id=?", (video_id,)).fetchone()
+        vrow = con.execute("SELECT fps, match_type, path FROM videos WHERE id=?", (video_id,)).fetchone()
         contacts = db.rows_to_dicts(con.execute(
             "SELECT * FROM contact_events WHERE video_id=? ORDER BY frame_idx",
             (video_id,)).fetchall())
@@ -1122,7 +1176,22 @@ def generate_coaching_report(video_id: str, rally_source: str | None = None,
     except Exception:  # noqa: BLE001 — stats are an add-on; never block the report
         log.warning("report_stats unavailable for %s — generating coaching report without it", video_id, exc_info=True)
 
-    report = build_report(video_id, vectors_meta, stats_summary=stats_summary)
+    # Vision context: crops of the hitting player at prep/contact/follow-
+    # through for each SELECTED tip candidate (build_report calls this only
+    # after selection). Missing/unreadable video path (e.g. an s3-mode row
+    # whose local scratch file is gone) degrades to a frameless call inside
+    # keyframes/build_report — never blocks the report.
+    video_path = vrow["path"] if vrow and vrow["path"] else None
+    frames_fn = None
+    if video_path:
+        from . import keyframes  # lazy: keeps cv2 out of coaching's import graph
+
+        def frames_fn(candidates):  # noqa: F811 — deliberate conditional def
+            return keyframes.extract_for_candidates(
+                video_path, candidates, video_id, overlay_source, fps,
+                PRE_WINDOW_S, POST_WINDOW_S)
+
+    report = build_report(video_id, vectors_meta, stats_summary=stats_summary, frames_fn=frames_fn)
     save_report(report)
     return report
 

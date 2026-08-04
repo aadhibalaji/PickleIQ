@@ -250,6 +250,41 @@ def test_build_report_attaches_validated_player_themes():
     assert theme.theme == "keep working the feet"
 
 
+def test_build_report_frames_fn_runs_on_candidates_only_and_feeds_llm_fn():
+    captured = {}
+
+    def fake_frames(candidates):
+        captured["frame_candidates"] = candidates
+        return {c["contact_id"]: [{"label": "contact", "jpeg_b64": "abc"}] for c in candidates}
+
+    def fake_llm(shots, stats=None, ctx=None, frames=None):
+        captured["frames"] = frames
+        return {}
+
+    vectors_meta = [(_vec(f"c{i}", "footwork", -3.0), _contact(f"c{i}", timestamp_s=i * 10.0))
+                     for i in range(20)]
+    build_report("vid1", vectors_meta, llm_fn=fake_llm, frames_fn=fake_frames)
+    # frames extracted only for the <=MAX_TIPS selected shots, never all 20
+    assert len(captured["frame_candidates"]) <= MAX_TIPS
+    assert set(captured["frames"]) == {c["contact_id"] for c in captured["frame_candidates"]}
+
+
+def test_build_report_frames_fn_failure_degrades_to_frameless_call():
+    captured = {}
+
+    def fake_llm(shots, stats=None, ctx=None, frames=None):
+        captured["frames"] = frames
+        return {s["contact_id"]: {"tip": "t", "tone": "improve"} for s in shots}
+
+    def broken_frames(candidates):
+        raise RuntimeError("video file missing")
+
+    vectors_meta = [(_vec("bad", "footwork", -3.0), _contact("bad"))]
+    report = build_report("vid1", vectors_meta, llm_fn=fake_llm, frames_fn=broken_frames)
+    assert captured["frames"] is None    # degraded, not raised
+    assert len(report.tips) == 1         # report still produced
+
+
 def test_build_report_passes_whole_session_context_to_llm_fn():
     # session_context must cover EVERY scored shot (here: 12), not just the
     # <=MAX_TIPS candidates that get individual tips.
@@ -469,6 +504,53 @@ def test_generate_llm_tips_sends_honest_names_session_context_and_coaching_model
     assert "session_context" not in captured["messages"][0]["content"]
 
 
+def test_generate_llm_tips_folds_frames_into_the_same_single_call(monkeypatch):
+    captured = {}
+
+    class FakeTextBlock:
+        type = "text"
+        text = '{"tips": [], "player_themes": []}'
+
+    class FakeResponse:
+        content = [FakeTextBlock()]
+
+    class FakeMessages:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return FakeResponse()
+
+    class FakeClient:
+        def __init__(self, api_key=None):
+            self.messages = FakeMessages()
+
+    import sys
+    import types
+
+    fake_anthropic = types.SimpleNamespace(
+        Anthropic=FakeClient, RateLimitError=Exception, AuthenticationError=Exception,
+        APIStatusError=Exception, APIConnectionError=Exception)
+    monkeypatch.setitem(sys.modules, "anthropic", fake_anthropic)
+    monkeypatch.setattr("app.rallyanalysis.coaching.ANTHROPIC_API_KEY", "fake-key")
+
+    shots = [{"contact_id": "c1"}]
+    frames = {"c1": [{"label": "prep", "jpeg_b64": "AAAA"},
+                     {"label": "contact", "jpeg_b64": "BBBB"}]}
+    generate_llm_tips(shots, frames_by_contact=frames)
+    content = captured["messages"][0]["content"]
+    assert isinstance(content, list)  # block list: JSON text + labeled images
+    image_blocks = [b for b in content if b.get("type") == "image"]
+    assert len(image_blocks) == 2
+    assert image_blocks[0]["source"] == {"type": "base64", "media_type": "image/jpeg", "data": "AAAA"}
+    labels = [b["text"] for b in content if b.get("type") == "text"]
+    assert any("prep" in t and "c1" in t for t in labels)
+
+    # Without frames the message stays a plain JSON string, exactly as before
+    # vision context existed.
+    captured.clear()
+    generate_llm_tips(shots, frames_by_contact=None)
+    assert isinstance(captured["messages"][0]["content"], str)
+
+
 def _kp17():
     """17 COCO keypoints with hip/knee/ankle/shoulder/elbow/wrist placed to
     give _angle_deg a well-defined (non-degenerate) angle; exact values don't
@@ -623,6 +705,15 @@ def test_system_prompt_covers_session_context_themes_and_severity_bands():
     # Critique intensity must be calibrated to |deviation_score| bands,
     # qualitatively — never recited as a number.
     assert "Calibrate how strongly you word a critique" in SYSTEM
+
+
+def test_system_prompt_makes_frames_primary_evidence_without_breaking_voice():
+    # Frames outrank the noisy 2D pose numbers when both exist...
+    assert "PRIMARY" in SYSTEM
+    # ...visible evidence may override a null metric (but never fabrication)...
+    assert "not describing what is visibly in front of you" in SYSTEM
+    # ...and the coach voice never breaks the fourth wall about images/AI.
+    assert "never mention frames, images, crops, cameras" in SYSTEM
 
 
 if __name__ == "__main__":

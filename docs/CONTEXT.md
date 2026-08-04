@@ -67,6 +67,7 @@ Separate from the discrepancy feedback report (`analysis/reporter.py`).
 2. Contact detection: adaptive wrist-speed peaks from Pass 2 pose overlays (not ball/bounce). Min gap ≥0.35s; serve flag via formation. Also available via `POST .../detect-contacts`.
 3. User clicks **Generate report** → feature vectors → category ratios + worst/best shots → **one** Anthropic call (`ANTHROPIC_COACHING_MODEL`, default Sonnet — deliberately heavier than the discrepancy report's `ANTHROPIC_REPORT_MODEL`) → persist `coaching_reports` (`tips_json` + `themes_json`).
    The single call also receives `session_context` (per-player whole-session flag counts, from every scored shot, not just the ≤`MAX_TIPS` shown) and returns one per-player session **theme** alongside the per-shot tips. At the LLM boundary only, `contact_height_m` is renamed `distance_from_net_m` (see caveat below) — DB/UI keep the internal name.
+   **Vision context** (`rallyanalysis/keyframes.py`): the same call carries JPEG crops of the hitting player (prep/contact/follow-through, cropped via overlay boxes, ≤512px) for each selected tip candidate only — extracted fresh from `videos.path`, never persisted. Frames are the model's primary evidence; the pose metrics corroborate. Missing/unopenable video degrades to the frameless call (frames are an upgrade, never a dependency).
 
 ### Categories / flags
 Per contact: knee bend, shoulder rotation, elbow extension, weight transfer, contact-height proxy, follow-through, split-step delay.  
