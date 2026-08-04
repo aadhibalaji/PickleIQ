@@ -87,10 +87,23 @@ class CoachingTip:
 
 
 @dataclass
+class PlayerTheme:
+    """One per player per report: the session's dominant pattern for that
+    player in coach language, produced by the same single LLM call as the
+    tips. player_id/player_label are attached from our own contact_events
+    data (the model's echoed label is only used to match, never trusted as
+    attribution — see coaching.build_report)."""
+    player_id: int
+    player_label: str
+    theme: str
+
+
+@dataclass
 class CoachingReport:
     """One per video, generated once (explicit user action — LLM call)."""
     video_id: str
     tips: list = field(default_factory=list)  # list[CoachingTip]
+    player_themes: list = field(default_factory=list)  # list[PlayerTheme]
     # None = current (built on the confidence-aware pipeline). Otherwise a
     # short machine-readable reason this report predates a data-accuracy fix
     # and may contain fabricated feature values — see db.STALE_BEFORE_CONFIDENCE_FIX.

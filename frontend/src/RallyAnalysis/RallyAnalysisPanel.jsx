@@ -79,6 +79,10 @@ export default function RallyAnalysisPanel({ videoId, video, onUpdateVideo }) {
 
   const tips = report?.tips || []
   const players = report?.players || []
+  const themes = report?.player_themes || []
+  const visibleThemes = selectedPlayer === ALL_PLAYERS
+    ? themes
+    : themes.filter((t) => t.player_label === selectedPlayer)
 
   // One color map for the whole panel (filter tabs, tip labels, stats,
   // sparklines) — same rule as ShotHeatmap: distinct player_ids ascending,
@@ -148,6 +152,19 @@ export default function RallyAnalysisPanel({ videoId, video, onUpdateVideo }) {
                     </button>
                   )
                 })}
+              </div>
+            )}
+            {visibleThemes.length > 0 && (
+              <div className="theme-cards">
+                {visibleThemes.map((t) => (
+                  <div key={t.player_label} className="theme-card">
+                    <span className="theme-card-player"
+                          style={{ color: playerColor(colorMap, t.player_id) }}>
+                      {t.player_label} — session focus
+                    </span>
+                    <p className="theme-card-text">{t.theme}</p>
+                  </div>
+                ))}
               </div>
             )}
             <CoachingVideo videoId={videoId} tips={tips} selectedPlayer={selectedPlayer}

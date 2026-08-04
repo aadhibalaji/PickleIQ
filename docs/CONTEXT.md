@@ -65,7 +65,8 @@ Separate from the discrepancy feedback report (`analysis/reporter.py`).
 ### Flow
 1. Pass 2 finishes → pipeline chains a `contacts` job (must be its own job so Pass 2 is already `done` for the readiness gate).
 2. Contact detection: adaptive wrist-speed peaks from Pass 2 pose overlays (not ball/bounce). Min gap ≥0.35s; serve flag via formation. Also available via `POST .../detect-contacts`.
-3. User clicks **Generate report** → feature vectors → category ratios + worst/best shots → **one** Anthropic call (`ANTHROPIC_REPORT_MODEL`) → persist `coaching_reports`.
+3. User clicks **Generate report** → feature vectors → category ratios + worst/best shots → **one** Anthropic call (`ANTHROPIC_COACHING_MODEL`, default Sonnet — deliberately heavier than the discrepancy report's `ANTHROPIC_REPORT_MODEL`) → persist `coaching_reports` (`tips_json` + `themes_json`).
+   The single call also receives `session_context` (per-player whole-session flag counts, from every scored shot, not just the ≤`MAX_TIPS` shown) and returns one per-player session **theme** alongside the per-shot tips. At the LLM boundary only, `contact_height_m` is renamed `distance_from_net_m` (see caveat below) — DB/UI keep the internal name.
 
 ### Categories / flags
 Per contact: knee bend, shoulder rotation, elbow extension, weight transfer, contact-height proxy, follow-through, split-step delay.  
@@ -92,7 +93,7 @@ been removed from this feature — coaching tips are now the only Rally Analysis
 | POST | `/rally-analysis/{id}/detect-contacts` | Run + replace `contact_events` |
 | GET | `/rally-analysis/{id}/contact-events` | List contacts |
 | GET | `/rally-analysis/{id}/readiness` | Per-rally Pass 2 readiness |
-| POST | `/rally-analysis/{id}/coaching-report` | Generate + persist (1 Anthropic call); returns `{video_id, tips, players}` |
+| POST | `/rally-analysis/{id}/coaching-report` | Generate + persist (1 Anthropic call); returns `{video_id, tips, players, player_themes}` |
 | GET | `/rally-analysis/{id}/coaching-report` | Cached report or `{report: null}` |
 | PATCH | `/videos/{id}` | Set per-clip metadata (currently `match_type`) |
 

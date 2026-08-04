@@ -5,11 +5,12 @@ build_report with an injected fake llm_fn), same pattern as contact_detect
 tests."""
 from __future__ import annotations
 
+from .. import coaching
 from ..coaching import (MAX_PRAISE_TIPS, MAX_TIPS, MIN_SAMPLES_FOR_DISTRIBUTION, SYSTEM,
-                         _classify, _extract_raw_metrics, _finalize_vector, _player_fences_by_metric,
-                         _rel_dev, _robust_fence, _summarize_stats, build_report,
-                         compute_feature_vector, exclude_serves, generate_llm_tips,
-                         select_tip_candidates, select_worst_best)
+                         _classify, _extract_raw_metrics, _finalize_vector, _llm_shot_payload,
+                         _player_fences_by_metric, _rel_dev, _robust_fence, _session_context,
+                         _summarize_stats, build_report, compute_feature_vector, exclude_serves,
+                         generate_llm_tips, select_tip_candidates, select_worst_best)
 from ..contracts import ShotFeatureVector
 
 CATEGORIES = ["footwork", "paddle_prep", "contact_point", "follow_through"]
@@ -227,6 +228,86 @@ def test_build_report_degrades_gracefully_when_llm_fn_returns_empty():
     vectors_meta = [(_vec("c1", "footwork", 0.0), _contact("c1"))]
     report = build_report("vid1", vectors_meta, llm_fn=lambda shots: {})
     assert report.tips == []  # never crashes, never fabricates a tip
+    assert report.player_themes == []  # dict-only (old-style) double -> no themes, no error
+
+
+def test_build_report_attaches_validated_player_themes():
+    # The model's echoed player_label is only a join key: unknown labels are
+    # dropped (hallucinated player), duplicates collapse to the first, and
+    # player_id always comes from our own contact data.
+    def fake_llm(shots, stats=None, ctx=None):
+        return ({s["contact_id"]: {"tip": "t", "tone": "improve"} for s in shots},
+                [{"player_label": "Player 1", "theme": "keep working the feet"},
+                 {"player_label": "Player 99", "theme": "hallucinated player"},
+                 {"player_label": "Player 1", "theme": "duplicate, dropped"}])
+
+    vectors_meta = [(_vec("bad", "footwork", -3.0), _contact("bad"))]
+    report = build_report("vid1", vectors_meta, llm_fn=fake_llm)
+    assert len(report.player_themes) == 1
+    theme = report.player_themes[0]
+    assert theme.player_label == "Player 1"
+    assert theme.player_id == 1
+    assert theme.theme == "keep working the feet"
+
+
+def test_build_report_passes_whole_session_context_to_llm_fn():
+    # session_context must cover EVERY scored shot (here: 12), not just the
+    # <=MAX_TIPS candidates that get individual tips.
+    captured = {}
+
+    def fake_llm(shots, stats=None, ctx=None):
+        captured["shots"] = shots
+        captured["ctx"] = ctx
+        return {}
+
+    vectors_meta = [(_vec(f"c{i}", "footwork", -3.0), _contact(f"c{i}", timestamp_s=i * 10.0))
+                     for i in range(12)]
+    build_report("vid1", vectors_meta, llm_fn=fake_llm)
+    assert captured["ctx"]["Player 1"]["shots_analyzed"] == 12
+    assert len(captured["shots"]) <= MAX_TIPS
+
+
+# ------------------------------------------------- session context aggregates
+
+def test_session_context_counts_whole_session_per_player():
+    vectors_meta = [
+        (_vec("a", "footwork", -2.0), _contact("a")),
+        (_vec("b", "footwork", 0.0), _contact("b")),
+        (_vec("c", "contact_point", 1.5), {**_contact("c"), "player_id": 2}),
+    ]
+    ctx = _session_context(vectors_meta)
+    assert ctx["Player 1"]["shots_analyzed"] == 2
+    assert ctx["Player 1"]["typical_shots"] == 1
+    assert ctx["Player 1"]["flagged_by_category"] == {"footwork": 1}
+    assert ctx["Player 2"]["flagged_by_category"] == {"contact_point": 1}
+    assert _session_context([]) is None
+
+
+# --------------------------------------------- LLM-boundary metric renaming
+
+def test_llm_shot_payload_renames_misleading_metric_names_everywhere():
+    shot = {
+        "contact_id": "c1",
+        "low_confidence_metrics": ["knee_bend_deg"],
+        "no_comparison_metrics": ["contact_height_m"],
+        "feature_vector": {"contact_height_m": -1.2, "knee_bend_deg": None,
+                            "low_confidence_metrics": ["knee_bend_deg"],
+                            "no_comparison_metrics": ["contact_height_m"]},
+    }
+    out = _llm_shot_payload(shot)
+    assert "contact_height_m" not in out["feature_vector"]
+    assert out["feature_vector"]["distance_from_net_m"] == -1.2
+    assert out["no_comparison_metrics"] == ["distance_from_net_m"]
+    assert out["feature_vector"]["no_comparison_metrics"] == ["distance_from_net_m"]
+    assert out["low_confidence_metrics"] == ["knee_bend_deg"]  # honest names pass through
+    # LLM-boundary only: the original shot dict (what gets persisted/served)
+    # must keep the internal name untouched.
+    assert shot["feature_vector"]["contact_height_m"] == -1.2
+    assert shot["no_comparison_metrics"] == ["contact_height_m"]
+
+
+def test_llm_shot_payload_tolerates_bare_dicts():
+    assert _llm_shot_payload({"contact_id": "c1"}) == {"contact_id": "c1"}
 
 
 # --------------------------------------------------------- serve exclusion
@@ -339,6 +420,53 @@ def test_generate_llm_tips_includes_stats_in_prompt_when_present(monkeypatch):
     captured.clear()
     generate_llm_tips([{"contact_id": "c1"}], stats_summary=None)
     assert "player_tendencies" not in captured["messages"][0]["content"]
+
+
+def test_generate_llm_tips_sends_honest_names_session_context_and_coaching_model(monkeypatch):
+    captured = {}
+
+    class FakeTextBlock:
+        type = "text"
+        text = '{"tips": [], "player_themes": []}'
+
+    class FakeResponse:
+        content = [FakeTextBlock()]
+
+    class FakeMessages:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return FakeResponse()
+
+    class FakeClient:
+        def __init__(self, api_key=None):
+            self.messages = FakeMessages()
+
+    import sys
+    import types
+
+    fake_anthropic = types.SimpleNamespace(
+        Anthropic=FakeClient, RateLimitError=Exception, AuthenticationError=Exception,
+        APIStatusError=Exception, APIConnectionError=Exception)
+    monkeypatch.setitem(sys.modules, "anthropic", fake_anthropic)
+    monkeypatch.setattr("app.rallyanalysis.coaching.ANTHROPIC_API_KEY", "fake-key")
+
+    shots = [{"contact_id": "c1", "feature_vector": {"contact_height_m": 0.5}}]
+    ctx = {"Player 1": {"shots_analyzed": 10, "typical_shots": 7,
+                        "flagged_by_category": {"footwork": 3}}}
+    tips, themes = generate_llm_tips(shots, stats_summary=None, session_context=ctx)
+    assert tips == {} and themes == []
+    content = captured["messages"][0]["content"]
+    # The misleading internal name must never reach the model...
+    assert "contact_height_m" not in content
+    assert "distance_from_net_m" in content
+    # ...the whole-session aggregates ride along in the SAME single call...
+    assert "session_context" in content
+    # ...on the dedicated coaching model, not the discrepancy-report model.
+    assert captured["model"] == coaching.ANTHROPIC_COACHING_MODEL
+
+    captured.clear()
+    generate_llm_tips(shots, stats_summary=None, session_context=None)
+    assert "session_context" not in captured["messages"][0]["content"]
 
 
 def _kp17():
@@ -478,6 +606,23 @@ def test_system_prompt_encodes_three_beat_supportive_framing():
     assert "three-beat" in SYSTEM
     assert "Do NOT soften, hedge, vague-up, or water down the" in SYSTEM
     assert "NOT a compliment sandwich that pads or dilutes" in SYSTEM
+
+
+def test_system_prompt_describes_distance_from_net_never_height():
+    # The LLM-facing name is the honest one, and the prompt must forbid
+    # reading any vertical/contact-height meaning into it (the pipeline has
+    # no vertical measurement at all).
+    assert "distance_from_net_m" in SYSTEM
+    assert "NOTHING about how high or low" in SYSTEM
+    assert "contact_height_m" not in SYSTEM
+
+
+def test_system_prompt_covers_session_context_themes_and_severity_bands():
+    assert "session_context" in SYSTEM
+    assert "player_themes" in SYSTEM
+    # Critique intensity must be calibrated to |deviation_score| bands,
+    # qualitatively — never recited as a number.
+    assert "Calibrate how strongly you word a critique" in SYSTEM
 
 
 if __name__ == "__main__":

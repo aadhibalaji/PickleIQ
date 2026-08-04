@@ -16,10 +16,10 @@ from dataclasses import asdict
 import numpy as np
 
 from .. import db
-from ..config import ANTHROPIC_API_KEY, ANTHROPIC_REPORT_MODEL
+from ..config import ANTHROPIC_API_KEY, ANTHROPIC_COACHING_MODEL
 from ..cv import overlays
 from ..cv.court import NET_Y
-from .contracts import CoachingReport, CoachingTip, ShotFeatureVector
+from .contracts import CoachingReport, CoachingTip, PlayerTheme, ShotFeatureVector
 from .readiness import _default_overlay_source, get_analyzable_rallies
 
 log = logging.getLogger("rallyanalysis.coaching")
@@ -604,6 +604,60 @@ def select_tip_candidates(vectors_meta: list[tuple[ShotFeatureVector, dict]]) ->
 # analysis/reporter.py's generate_llm_report. Called at most once per video.
 # ---------------------------------------------------------------------------
 
+# Internal metric names that would mislead the LLM, mapped to what the value
+# actually measures. contact_height_m is NOT a height (no calibrated vertical
+# coordinate exists — see _extract_raw_metrics) — it's distance from the net
+# along the court. The rename happens only at the LLM boundary
+# (_llm_shot_payload); DB rows, contracts, and the UI keep the internal name
+# so nothing downstream of coaching_reports has to migrate.
+LLM_METRIC_NAMES = {"contact_height_m": "distance_from_net_m"}
+
+
+def _llm_shot_payload(shot: dict) -> dict:
+    """One shot summary (see _shot_summary) with internal metric names
+    swapped for their honest LLM-facing names (LLM_METRIC_NAMES), in the
+    feature_vector keys AND both null-tracking name lists (top-level and the
+    copies nested inside feature_vector). Tolerates partial dicts (tests call
+    generate_llm_tips with bare {contact_id} shots)."""
+    def rename_list(names):
+        return [LLM_METRIC_NAMES.get(n, n) for n in names]
+
+    out = dict(shot)
+    fv = shot.get("feature_vector")
+    if fv:
+        fv = {LLM_METRIC_NAMES.get(k, k): v for k, v in fv.items()}
+        for key in ("low_confidence_metrics", "no_comparison_metrics"):
+            if fv.get(key):
+                fv[key] = rename_list(fv[key])
+        out["feature_vector"] = fv
+    for key in ("low_confidence_metrics", "no_comparison_metrics"):
+        if out.get(key):
+            out[key] = rename_list(out[key])
+    return out
+
+
+def _session_context(vectors_meta: list[tuple[ShotFeatureVector, dict]]) -> dict | None:
+    """Per-player whole-session aggregates for the LLM prompt, built from
+    EVERY scored shot in the video (all of vectors_meta) — not just the
+    <=MAX_TIPS shots that get individual tips. This is what lets the model
+    write a per-player theme grounded in the whole session ("footwork was
+    flagged on 5 of your 14 shots") instead of extrapolating one from the
+    handful of shots it happens to see. Counts only — no raw metric values —
+    so there's nothing here the no-raw-numbers prompt rules could leak.
+    Returns None when there's nothing to summarize."""
+    per_player: dict = {}
+    for vec, contact in vectors_meta:
+        entry = per_player.setdefault(contact.get("player_id"), {
+            "shots_analyzed": 0, "typical_shots": 0, "flagged_by_category": {}})
+        entry["shots_analyzed"] += 1
+        if abs(vec.deviation_score) >= WORST_DEVIATION_THRESHOLD:
+            cats = entry["flagged_by_category"]
+            cats[vec.category] = cats.get(vec.category, 0) + 1
+        elif vec.deviation_score == 0.0:
+            entry["typical_shots"] += 1
+    return {player_label(pid): e for pid, e in per_player.items()} or None
+
+
 TIPS_SCHEMA = {
     "type": "object",
     "properties": {
@@ -629,20 +683,45 @@ TIPS_SCHEMA = {
                 "additionalProperties": False,
             },
         },
+        "player_themes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "player_label": {"type": "string", "description": "Exactly one of the "
+                                     "player_label values present in the shots you were given."},
+                    "theme": {"type": "string", "description": "1-2 sentences, coach voice: the "
+                              "dominant session-wide pattern for this player (what kept showing "
+                              "up, and the one thing to focus on), grounded in session_context "
+                              "and the shots. Same no-raw-numbers/no-anatomy rules as tips."},
+                },
+                "required": ["player_label", "theme"],
+                "additionalProperties": False,
+            },
+        },
     },
-    "required": ["tips"],
+    "required": ["tips", "player_themes"],
     "additionalProperties": False,
 }
 
 SYSTEM = """You are a pickleball coach giving quick, spoken-style tips on
-individual shots from one player's session, based on pose-derived shot
-mechanics (not video) that a computer-vision pipeline extracted at each
-detected contact/swing.
+individual shots from one session, plus one short session theme per player,
+based on pose-derived shot mechanics (not video) that a computer-vision
+pipeline extracted at each detected contact/swing.
 
 You receive a list of shots, each with a category (footwork, paddle_prep,
 contact_point, or follow_through), a deviation_score, a feature_vector of raw
-pose measurements (joint angles in degrees, 0-1 scores, seconds), a
+pose measurements (joint angles in degrees, 0-1 scores, seconds, metres), a
 low_confidence_metrics list, and a no_comparison_metrics list.
+
+One feature_vector field needs special care: distance_from_net_m is where on
+the court (how far from the net, in court-plane metres) the player was when
+they hit — it says NOTHING about how high or low they met the ball. The
+pipeline has no vertical measurement at all. Never make any claim about
+contact height, meeting the ball low/high, or letting the ball drop — that
+information does not exist in this data. Court positioning claims ("you're
+hanging back near the baseline", "you took that one from mid-court") are the
+only valid use of this field.
 
 IMPORTANT — deviation_score is relative to THIS PLAYER, not a universal
 standard: it measures how far this shot falls from THIS PLAYER's OWN typical
@@ -655,6 +734,14 @@ session. Frame feedback that way (e.g. "shallower than your usual knee bend
 on this shot" or "you're not getting as low as you normally do"), never as a
 claim about correct/ideal form in general (never "your knee bend should be
 X degrees" or "that's below the ideal range").
+
+Calibrate how strongly you word a critique to |deviation_score|, translated
+qualitatively and never recited as a number: magnitude around 1-2 means the
+shot drifted a bit outside their usual — note it lightly; 2-4 means it was
+clearly off their normal — be direct about it; above 4 means it was way
+outside anything else they did this session — treat it as the shot to talk
+about. Matching your intensity to the evidence is what keeps the feedback
+credible.
 
 These raw numbers are internal signal only — NEVER mention degrees, angles, confidence/certainty scores, or anatomical terms (no "elbow extension",
 "shoulder rotation", "knee bend angle", etc.) in your output. Translate them
@@ -676,6 +763,19 @@ deep to the backcourt") may inform your framing but should stay in service of
 a coaching point, not be recited as a stat line. If player_tendencies is
 absent or empty, ignore it — say nothing about session-level tendencies for
 that player.
+
+You may also receive a session_context object: for each player, how many of
+their shots were analyzed across the WHOLE session (not just the shots shown
+to you), how many were typical for them, and how often each category was
+flagged. This is the ground truth for what actually kept happening — a
+pattern that shows up repeatedly in session_context is a theme; a category
+flagged once is a moment, not a pattern. Use it to decide each player's
+theme and to keep individual tips in proportion (don't declare "you always
+rush your prep" off one flagged shot when session_context shows the other
+ten were fine). Like everything else, these counts are internal signal:
+paraphrase qualitatively ("this kept showing up", "most of your shots were
+solid"), never recite tallies. If session_context is absent, base themes
+only on the shots you can see and keep them modest.
 
 IMPORTANT — data gaps are real and marked, not hidden: some feature_vector
 fields are null. A null field means the computer-vision system did NOT get a
@@ -744,67 +844,95 @@ critical where warranted, and encouraging in tone rather than content. For
 each shot with deviation_score == 0, write one "praise" tip: what they're
 doing well and why it works, so they know what to keep doing. Return exactly
 one tip per shot you were given, each referencing that shot's contact_id so
-it can be matched back up. Do not overstate certainty — this is
+it can be matched back up.
+
+Also return player_themes: exactly one entry per distinct player_label
+present in the shots, and none for any label not present. Each theme is 1-2
+sentences in the same coach voice — the through-line of that player's
+session (what kept showing up per session_context, and the single most
+valuable thing to work on), or genuine reinforcement if their session was
+solid. Write each tip so it reads as part of that player's theme when the
+shot fits the pattern, but every tip must still stand alone. All the rules
+above — no raw numbers, no anatomical terms, null and no-comparison
+discipline — apply to themes exactly as they do to tips.
+
+Do not overstate certainty — this is
 computer-vision-derived pose data, not a substitute for in-person coaching."""
 
 
-def generate_llm_tips(shots: list[dict], stats_summary: dict | None = None) -> dict[str, dict]:
-    """Returns {contact_id: {tip, tone}}, or {} (with a logged reason) when
-    the API key is missing, the call fails, or the response can't be parsed —
-    degrades gracefully, same as analysis/reporter.py. Never trusted for
-    frame/timestamp — those are attached from our own contact_events data.
+def generate_llm_tips(shots: list[dict], stats_summary: dict | None = None,
+                       session_context: dict | None = None) -> tuple[dict[str, dict], list[dict]]:
+    """Returns ({contact_id: {tip, tone}}, [{player_label, theme}, ...]), or
+    ({}, []) (with a logged reason) when the API key is missing, the call
+    fails, or the response can't be parsed — degrades gracefully, same as
+    analysis/reporter.py. Never trusted for frame/timestamp/player
+    attribution — those are attached from our own contact_events data
+    (build_report validates each theme's player_label against the players we
+    actually sent, and drops anything unrecognized).
 
-    stats_summary (see _summarize_stats) is optional extra context folded
-    into this same single API call — never a second Anthropic call — and is
-    simply omitted from the prompt input when None/empty rather than
-    zero-filled or fabricated."""
+    stats_summary (see _summarize_stats) and session_context (see
+    _session_context) are optional extra context folded into this same
+    single API call — never a second Anthropic call — and are simply omitted
+    from the prompt input when None/empty rather than zero-filled or
+    fabricated.
+
+    Runs on ANTHROPIC_COACHING_MODEL (not the discrepancy report's
+    ANTHROPIC_REPORT_MODEL): translating weak numeric signal into pointed
+    coaching language under the SYSTEM prompt's never-say-X constraints is a
+    nuanced writing task, and it fires at most once per video on explicit
+    user action, so the heavier model's cost is bounded."""
     if not shots:
-        return {}
+        return {}, []
     if not ANTHROPIC_API_KEY:
         log.warning("ANTHROPIC_API_KEY not set — skipping coaching tips")
-        return {}
+        return {}, []
     import anthropic
 
-    payload: dict = {"shots": shots}
+    payload: dict = {"shots": [_llm_shot_payload(s) for s in shots]}
     if stats_summary:
         payload["player_tendencies"] = stats_summary
+    if session_context:
+        payload["session_context"] = session_context
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     try:
         response = client.messages.create(
-            model=ANTHROPIC_REPORT_MODEL,
-            max_tokens=4000,
-            thinking={"type": "enabled", "budget_tokens": 1500},
+            model=ANTHROPIC_COACHING_MODEL,
+            max_tokens=8000,
+            thinking={"type": "enabled", "budget_tokens": 4000},
             system=SYSTEM,
             output_config={"format": {"type": "json_schema", "schema": TIPS_SCHEMA}},
             messages=[{"role": "user", "content": db.dumps(payload)}],
         )
     except anthropic.RateLimitError:
         log.error("Anthropic rate limit — try generating the coaching report again shortly")
-        return {}
+        return {}, []
     except anthropic.AuthenticationError:
         log.error("Anthropic API key invalid — check .env")
-        return {}
+        return {}, []
     except anthropic.APIStatusError as exc:
         log.error("Anthropic API error %s: %s", exc.status_code, exc.message)
-        return {}
+        return {}, []
     except anthropic.APIConnectionError:
         log.error("network error reaching the Anthropic API")
-        return {}
+        return {}, []
 
     text = next((b.text for b in response.content if b.type == "text"), "")
     try:
         data = db.loads(text, {})
     except Exception:  # noqa: BLE001
         log.error("LLM returned unparseable JSON")
-        return {}
+        return {}, []
 
     out: dict[str, dict] = {}
     for t in data.get("tips") or []:
         cid, tip, tone = t.get("contact_id"), t.get("tip"), t.get("tone")
         if cid and tip and tone in ("improve", "praise"):
             out[cid] = {"tip": tip, "tone": tone}
-    return out
+    themes = [{"player_label": t.get("player_label"), "theme": t.get("theme")}
+              for t in data.get("player_themes") or []
+              if t.get("player_label") and t.get("theme")]
+    return out, themes
 
 
 def _summarize_stats(stats: dict | None) -> dict | None:
@@ -857,13 +985,24 @@ def build_report(video_id: str, vectors_meta: list[tuple[ShotFeatureVector, dict
                   llm_fn=None, stats_summary: dict | None = None) -> CoachingReport:
     llm_fn = llm_fn or generate_llm_tips
     candidates = select_tip_candidates(vectors_meta)
+    session_context = _session_context(vectors_meta)
     # llm_fn is the one Anthropic call for this video. Injected/mocked llm_fns
-    # in tests may only accept the original (shots) signature -- fall back to
-    # that rather than requiring every test double to accept stats_summary.
+    # in tests may only accept the original (shots) or (shots, stats)
+    # signatures -- fall back rather than requiring every test double to
+    # accept every context argument.
     try:
-        tip_text = llm_fn(candidates, stats_summary)
+        result = llm_fn(candidates, stats_summary, session_context)
     except TypeError:
-        tip_text = llm_fn(candidates)
+        try:
+            result = llm_fn(candidates, stats_summary)
+        except TypeError:
+            result = llm_fn(candidates)
+    # generate_llm_tips returns (tips, themes); older-style injected doubles
+    # return just the tips dict -- treat that as "no themes", not an error.
+    if isinstance(result, tuple):
+        tip_text, themes_raw = result
+    else:
+        tip_text, themes_raw = result, []
     # Player attribution is our own data (contact_events.player_id), not
     # trusted from the model's echoed output — attach it here regardless of
     # what the LLM response contains.
@@ -874,7 +1013,19 @@ def build_report(video_id: str, vectors_meta: list[tuple[ShotFeatureVector, dict
                     player_id=c["player_id"], player_label=c["player_label"])
         for c in candidates if c["contact_id"] in tip_text
     ]
-    return CoachingReport(video_id=video_id, tips=tips)
+    # Themes: the model's echoed player_label is only a JOIN KEY back to the
+    # players we actually sent — an unrecognized/duplicated label is dropped
+    # (first occurrence wins), and player_id always comes from our own
+    # contact_events data, mirroring the tip-attribution rule above.
+    label_to_pid = {c["player_label"]: c["player_id"] for c in candidates}
+    player_themes, seen_labels = [], set()
+    for t in themes_raw:
+        lbl = t.get("player_label")
+        if lbl in label_to_pid and lbl not in seen_labels and t.get("theme"):
+            player_themes.append(PlayerTheme(player_id=label_to_pid[lbl],
+                                              player_label=lbl, theme=t["theme"]))
+            seen_labels.add(lbl)
+    return CoachingReport(video_id=video_id, tips=tips, player_themes=player_themes)
 
 
 def exclude_serves(contacts: list[dict]) -> list[dict]:
@@ -982,9 +1133,10 @@ def save_report(report: CoachingReport) -> None:
     # definition — never inherit staleness from whatever row it replaces.
     with db.connect() as con:
         con.execute(
-            "INSERT OR REPLACE INTO coaching_reports (video_id, tips_json, created_at, stale_reason)"
-            " VALUES (?,?,?,NULL)",
-            (report.video_id, db.dumps([asdict(t) for t in report.tips]), db.now()))
+            "INSERT OR REPLACE INTO coaching_reports (video_id, tips_json, themes_json, created_at, stale_reason)"
+            " VALUES (?,?,?,?,NULL)",
+            (report.video_id, db.dumps([asdict(t) for t in report.tips]),
+             db.dumps([asdict(t) for t in report.player_themes]), db.now()))
 
 
 def get_report(video_id: str) -> CoachingReport | None:
@@ -992,9 +1144,12 @@ def get_report(video_id: str) -> CoachingReport | None:
         row = con.execute("SELECT * FROM coaching_reports WHERE video_id=?", (video_id,)).fetchone()
     if row is None:
         return None
+    # themes_json is NULL on pre-themes rows (migration adds the column
+    # without a backfill) — an empty theme list, not an error.
     return CoachingReport(
         video_id=row["video_id"],
         tips=[CoachingTip(**t) for t in db.loads(row["tips_json"], [])],
+        player_themes=[PlayerTheme(**t) for t in db.loads(row["themes_json"] or "[]", [])],
         stale_reason=row["stale_reason"])
 
 

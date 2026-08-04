@@ -55,6 +55,14 @@ ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-5")
 # several-fold vs Sonnet. Override with ANTHROPIC_REPORT_MODEL if you want the
 # heavier model for a particularly gnarly clip.
 ANTHROPIC_REPORT_MODEL = os.getenv("ANTHROPIC_REPORT_MODEL", "claude-haiku-4-5-20251001")
+# Coaching tips are the opposite shape of task from the discrepancy report:
+# weak/noisy numeric signal that must be translated into trustworthy,
+# non-fabricated coaching language under a dense set of never-say-X
+# constraints (see rallyanalysis/coaching.py SYSTEM). That is exactly where a
+# stronger writer earns its cost — and it runs at most once per video, on
+# explicit user action, so the spend is bounded. Kept separate from
+# ANTHROPIC_REPORT_MODEL so tuning one never silently retunes the other.
+ANTHROPIC_COACHING_MODEL = os.getenv("ANTHROPIC_COACHING_MODEL", "claude-sonnet-5")
 
 CV_DEVICE = os.getenv("CV_DEVICE", "auto")
 # YOLO-pose weights for player detection/tracking. Nano is the default: MEASURED

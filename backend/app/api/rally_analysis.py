@@ -30,6 +30,7 @@ def _report_payload(report: CoachingReport) -> dict:
     tips = [asdict(t) for t in report.tips]
     players = sorted({t["player_label"] for t in tips})
     return {"video_id": report.video_id, "tips": tips, "players": players,
+            "player_themes": [asdict(t) for t in report.player_themes],
             "stale_reason": report.stale_reason}
 
 
