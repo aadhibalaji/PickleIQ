@@ -69,6 +69,18 @@ class ShotFeatureVector:
     # itself is trusted here, there's just no personal baseline to compare it
     # against yet.
     no_comparison_metrics: list = field(default_factory=list)
+    # Coarse pose-derived stratification key ("kitchen_soft",
+    # "backcourt_fast", zone-only "midcourt", ...) — see
+    # shot_context.classify_shot_types. None = couldn't be typed (no court
+    # position). A stratification key, NOT a verified stroke label.
+    shot_type: str | None = None
+    # Metrics whose deviation_score comparison fell back to the player's
+    # ALL-shots baseline because their same-shot-type stratum didn't have
+    # enough samples this session (or the shot couldn't be typed at all).
+    # Distinct from no_comparison_metrics: a comparison DID happen here, it
+    # just mixes shot types — cross-type claims ("short follow-through" on a
+    # dink judged against drives) should be made more cautiously downstream.
+    mixed_baseline_metrics: list = field(default_factory=list)
 
 
 @dataclass

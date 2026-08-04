@@ -21,6 +21,7 @@ from ..cv import overlays
 from ..cv.court import NET_Y
 from .contracts import CoachingReport, CoachingTip, PlayerTheme, ShotFeatureVector
 from .readiness import _default_overlay_source, get_analyzable_rallies
+from .shot_context import annotate_rally_context, classify_shot_types
 
 log = logging.getLogger("rallyanalysis.coaching")
 
@@ -415,17 +416,58 @@ def _player_fences_by_metric(raw_by_contact: list[tuple[dict, dict]]) -> dict:
             for pid, metrics in values.items()}
 
 
-def _finalize_vector(contact: dict, raw: dict, fences: dict) -> ShotFeatureVector | None:
+def _stratum_fences_by_metric(raw_by_contact: list[tuple[dict, dict]]) -> dict:
+    """{(player_id, shot_type): {metric_field_name: fence_or_None}} — the
+    same fence construction as _player_fences_by_metric, but stratified by
+    the contact's pose-derived shot_type (see shot_context.classify_shot_
+    types) so a soft kitchen exchange is judged against this player's OTHER
+    soft kitchen exchanges, not their drives. Untyped contacts
+    (shot_type None) contribute to no stratum — they only ever compare
+    against the player-wide baseline (flagged mixed downstream)."""
+    values: dict = {}
+    for contact, raw in raw_by_contact:
+        shot_type = contact.get("shot_type")
+        if shot_type is None:
+            continue
+        key = (contact["player_id"], shot_type)
+        for field_name in METRIC_FIELDS:
+            v = raw[field_name]
+            if v is not None:
+                values.setdefault(key, {}).setdefault(field_name, []).append(v)
+    return {key: {field_name: _robust_fence(vals) for field_name, vals in metrics.items()}
+            for key, metrics in values.items()}
+
+
+def _finalize_vector(contact: dict, raw: dict, fences: dict,
+                      stratum_fences: dict | None = None) -> ShotFeatureVector | None:
     """raw: one _extract_raw_metrics() result. fences: this shot's player's
-    {metric_field_name: fence_or_None}, this video (see
-    _player_fences_by_metric). Returns None when no category has any real
+    ALL-shots {metric_field_name: fence_or_None}, this video (see
+    _player_fences_by_metric). stratum_fences: the same-shot-type slice for
+    this shot's (player, shot_type) (see _stratum_fences_by_metric), or
+    None/{} when the shot is untyped or its stratum is empty.
+
+    Per metric, the same-type fence wins when it exists; falling back to the
+    all-shots fence still yields a real comparison but is recorded in
+    mixed_baseline_metrics (the comparison crosses shot types — see
+    contracts.ShotFeatureVector). Returns None when no category has any real
     (comparable) metric — same "nothing to score" degrade as before, just
     driven by relative comparability now instead of confident pose alone."""
-    devs = {f: _rel_dev(raw[f], fences.get(f)) for f in METRIC_FIELDS}
+    stratum_fences = stratum_fences or {}
+    devs: dict = {}
+    mixed_baseline_metrics: list[str] = []
+    for f in METRIC_FIELDS:
+        fence = stratum_fences.get(f)
+        if fence is None:
+            fence = fences.get(f)
+            if fence is not None and raw[f] is not None:
+                mixed_baseline_metrics.append(f)
+        devs[f] = _rel_dev(raw[f], fence)
     category, deviation_score = _classify(devs)
     if category is None:
         return None
-    no_comparison_metrics = [f for f in METRIC_FIELDS if raw[f] is not None and fences.get(f) is None]
+    no_comparison_metrics = [f for f in METRIC_FIELDS
+                              if raw[f] is not None
+                              and stratum_fences.get(f) is None and fences.get(f) is None]
     return ShotFeatureVector(
         contact_id=contact["contact_id"], category=category,
         knee_bend_deg=raw["knee_bend_deg"], shoulder_rotation_deg=raw["shoulder_rotation_deg"],
@@ -434,24 +476,28 @@ def _finalize_vector(contact: dict, raw: dict, fences: dict) -> ShotFeatureVecto
         follow_through_completion_score=raw["follow_through_completion_score"],
         split_step_delay_s=raw["split_step_delay_s"], deviation_score=deviation_score,
         low_confidence_metrics=raw["low_confidence_metrics"],
-        no_comparison_metrics=no_comparison_metrics)
+        no_comparison_metrics=no_comparison_metrics,
+        shot_type=contact.get("shot_type"),
+        mixed_baseline_metrics=mixed_baseline_metrics)
 
 
 def compute_feature_vector(contact: dict, entries: list[dict], fps: float,
-                            player_fences: dict | None = None) -> ShotFeatureVector | None:
+                            player_fences: dict | None = None,
+                            stratum_fences: dict | None = None) -> ShotFeatureVector | None:
     """Single-shot convenience wrapper around _extract_raw_metrics +
     _finalize_vector. player_fences (see _player_fences_by_metric, one
     player's slice of it): the calling video's per-metric fences for this
     shot's player, or None/omitted to score every metric as "no comparison
     available" (e.g. calling this in isolation without a video's worth of
-    other shots to build a fence from). generate_coaching_report calls
+    other shots to build a fence from). stratum_fences: the same-shot-type
+    slice (see _stratum_fences_by_metric). generate_coaching_report calls
     _extract_raw_metrics/_finalize_vector directly instead, so it can build
     every shot's raw metrics once before deriving fences across the whole
     video, rather than paying for entries/pose extraction twice per shot."""
     raw = _extract_raw_metrics(contact, entries, fps)
     if raw is None:
         return None
-    return _finalize_vector(contact, raw, player_fences or {})
+    return _finalize_vector(contact, raw, player_fences or {}, stratum_fences)
 
 
 # ---------------------------------------------------------------------------
@@ -476,12 +522,22 @@ def _shot_summary(vec: ShotFeatureVector, contact: dict) -> dict:
         "shot_side": contact.get("shot_side"),
         "is_serve": bool(contact.get("is_serve")),
         "confidence": contact.get("confidence"),
+        # Shot-type stratification + rally-outcome context (see
+        # shot_context.py). rally fields are None/absent-safe: contacts
+        # annotated before serve-exclusion carry them; synthetic test
+        # contacts without them simply pass None through.
+        "shot_type": vec.shot_type,
+        "rally_shot_index": contact.get("rally_shot_index"),
+        "rally_shot_count": contact.get("rally_shot_count"),
+        "is_rally_ending": bool(contact.get("is_rally_ending")),
+        "seconds_until_rally_end": contact.get("seconds_until_rally_end"),
         # Surfaced at top level (not just nested in feature_vector) so the LLM
         # prompt, the UI, and any aggregate stats can all see at a glance
         # which metrics this shot has NO confident reading for, without
         # having to inspect every field of feature_vector for a null.
         "low_confidence_metrics": list(vec.low_confidence_metrics),
         "no_comparison_metrics": list(vec.no_comparison_metrics),
+        "mixed_baseline_metrics": list(vec.mixed_baseline_metrics),
         "feature_vector": asdict(vec),
     }
 
@@ -761,6 +817,38 @@ clearly off their normal — be direct about it; above 4 means it was way
 outside anything else they did this session — treat it as the shot to talk
 about. Matching your intensity to the evidence is what keeps the feedback
 credible.
+
+Each shot may carry a shot_type — a coarse, pose-derived stratification key:
+court zone plus whether the swing was soft or fast RELATIVE TO THAT PLAYER'S
+OWN session (e.g. "kitchen_soft", "backcourt_fast", or just a zone like
+"midcourt" when tempo couldn't be judged). It is NOT a verified stroke
+label: treat "kitchen_soft" as "one of their slower swings taken up at the
+kitchen" — plausibly a dink exchange — never as certainty about which stroke
+they hit. Use it to keep advice appropriate to the situation (don't coach a
+soft kitchen exchange like a baseline drive), and prefer situational
+phrasing ("on those soft exchanges at the kitchen") over asserting stroke
+names as fact.
+
+When the player hit enough shots of the same shot_type this session,
+deviation_score is computed against those same-type shots — that is what
+stops a soft shot being "flagged" merely for not looking like a drive.
+mixed_baseline_metrics lists the metrics where that wasn't possible and the
+comparison fell back to ALL of their shots regardless of type. A critique
+leaning on a metric in mixed_baseline_metrics crosses shot types, so soften
+cross-type claims accordingly — especially follow-through and swing-size
+claims on soft/kitchen shots, where "shorter than your usual" may only mean
+"shorter than your drives".
+
+Rally context: rally_shot_index / rally_shot_count place the shot inside its
+rally, and is_rally_ending marks the LAST detected shot of a rally — the
+point ended on or right after it. The data does NOT say whether that shot
+was a winner or an error, and you must never assert either (no "that one
+won you the point", no "that's the shot that cost you the rally"). What you
+MAY do: use it for stakes-aware framing ("this was the last shot of that
+rally — worth getting right"), and for pattern-spotting — several
+rally-ending shots sharing the same flaw is exactly the kind of theme worth
+naming. seconds_until_rally_end is internal timing signal under the same
+rules as every other raw number: never recite it.
 
 These raw numbers are internal signal only — NEVER mention degrees, angles, confidence/certainty scores, or anatomical terms (no "elbow extension",
 "shoulder rotation", "knee bend angle", etc.) in your output. Translate them
@@ -1142,10 +1230,16 @@ def generate_coaching_report(video_id: str, rally_source: str | None = None,
         contacts = db.rows_to_dicts(con.execute(
             "SELECT * FROM contact_events WHERE video_id=? ORDER BY frame_idx",
             (video_id,)).fetchall())
+    fps = float(vrow["fps"]) if vrow and vrow["fps"] else 30.0
     contacts = [c for c in contacts if c["rally_id"] in ready_rally_ids]
+    # Rally context BEFORE serve exclusion so rally_shot_index/count describe
+    # the real rally (serve = shot 1); shot types AFTER the singles merge so
+    # phantom-identity contacts feed the right player's tempo median.
+    contacts = annotate_rally_context(contacts, rallies, fps)
     contacts = exclude_serves(contacts)
     contacts = merge_singles_players(contacts, vrow["match_type"] if vrow else None)
-    fps = float(vrow["fps"]) if vrow and vrow["fps"] else 30.0
+    shot_types = classify_shot_types(contacts)
+    contacts = [{**c, "shot_type": shot_types.get(c["contact_id"])} for c in contacts]
 
     pre_frames, post_frames = int(PRE_WINDOW_S * fps), int(POST_WINDOW_S * fps)
     # Two passes: first pull every shot's raw (un-scored) metrics, then derive
@@ -1162,9 +1256,11 @@ def generate_coaching_report(video_id: str, rally_source: str | None = None,
             raw_by_contact.append((c, raw))
 
     player_fences = _player_fences_by_metric(raw_by_contact)
+    stratum_fences = _stratum_fences_by_metric(raw_by_contact)
     vectors_meta: list[tuple[ShotFeatureVector, dict]] = []
     for c, raw in raw_by_contact:
-        vec = _finalize_vector(c, raw, player_fences.get(c["player_id"], {}))
+        vec = _finalize_vector(c, raw, player_fences.get(c["player_id"], {}),
+                                stratum_fences.get((c["player_id"], c.get("shot_type"))))
         if vec is not None:
             vectors_meta.append((vec, c))
 

@@ -111,6 +111,8 @@ export const api = {
   getTrajectories: (id) => fetch(`/api/rally-analysis/${id}/trajectories`).then(j),
   generateCoachingReport: (id) =>
     fetch(`/api/rally-analysis/${id}/coaching-report`, { method: 'POST' }).then(j),
+  processSingleRally: (id) =>
+    fetch(`/api/rally-analysis/${id}/process-single-rally`, { method: 'POST' }).then(j),
 
   chat: (videoId, messages) =>
     fetch('/api/chat', {

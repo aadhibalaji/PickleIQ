@@ -77,6 +77,20 @@ export default function RallyAnalysisPanel({ videoId, video, onUpdateVideo }) {
     }).catch(() => {}).finally(() => setGenerating(false))
   }
 
+  // Coaching-only fast path for a pre-trimmed clip that IS one rally:
+  // replaces this video's pass1 rally labels with a single whole-clip rally
+  // and reruns Pass 2 (which chains contact detection). Destructive to
+  // existing pass1 labels, hence the confirm.
+  const [markingSingleRally, setMarkingSingleRally] = useState(false)
+  const onProcessSingleRally = () => {
+    if (!window.confirm(
+      'Treat this ENTIRE clip as one rally and reprocess Pass 2?\n\n' +
+      'Only use this on a pre-trimmed single-rally clip — it replaces any ' +
+      'detected rally boundaries for this video.')) return
+    setMarkingSingleRally(true)
+    api.processSingleRally(videoId).catch(() => {}).finally(() => setMarkingSingleRally(false))
+  }
+
   const tips = report?.tips || []
   const players = report?.players || []
   const themes = report?.player_themes || []
@@ -121,9 +135,15 @@ export default function RallyAnalysisPanel({ videoId, video, onUpdateVideo }) {
       <div className="panel">
         <div className="row spread">
           <h2>Coaching</h2>
-          <button onClick={onGenerateReport} disabled={generating}>
-            {generating ? 'Generating…' : report ? 'Regenerate report' : 'Generate report'}
-          </button>
+          <div className="row">
+            <button onClick={onProcessSingleRally} disabled={markingSingleRally}
+                    title="For a pre-trimmed clip that is exactly one rally: skip rally detection and process the whole clip as a single rally.">
+              {markingSingleRally ? 'Submitting…' : 'Whole clip = one rally'}
+            </button>
+            <button onClick={onGenerateReport} disabled={generating}>
+              {generating ? 'Generating…' : report ? 'Regenerate report' : 'Generate report'}
+            </button>
+          </div>
         </div>
 
         {!report ? (

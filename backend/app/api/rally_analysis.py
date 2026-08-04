@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 
 from .. import db
 from ..rallyanalysis import coaching, contact_detect, report_stats, trajectory
@@ -37,6 +37,35 @@ def _report_payload(report: CoachingReport) -> dict:
 @router.get("/rally-analysis/health")
 def health():
     return {"status": "ok"}
+
+
+@router.post("/rally-analysis/{video_id}/process-single-rally")
+def process_single_rally(video_id: str):
+    """Coaching-only fast path for a PRE-TRIMMED clip containing exactly one
+    rally: writes a pass1-source rally label spanning the whole clip
+    (replacing any prior pass1 labels for this video — that's why this must
+    only be used on single-rally clips, never a full match), then submits
+    Pass 2 directly via pipeline.reprocess. Pass 2 reads its processing
+    windows from pass1-source rally_labels (see cv/pass2.py run_pass2), so
+    this skips Pass 1's rally detection entirely while the rest of the chain
+    (pass2 overlays -> contacts job -> readiness gate -> Generate report)
+    runs completely unchanged. Court calibration is still required, exactly
+    as for a normal Pass 2 run."""
+    from .. import pipeline
+    with db.connect() as con:
+        vrow = con.execute("SELECT frame_count FROM videos WHERE id=?", (video_id,)).fetchone()
+        if vrow is None:
+            raise HTTPException(status_code=404, detail="video not found")
+        if not vrow["frame_count"]:
+            raise HTTPException(status_code=409, detail="video has no frame_count recorded")
+        con.execute("DELETE FROM rally_labels WHERE video_id=? AND source='pass1'", (video_id,))
+        con.execute(
+            "INSERT INTO rally_labels (id, video_id, source, start_frame, end_frame, meta)"
+            " VALUES (?,?,?,?,?,?)",
+            (db.new_id(), video_id, "pass1", 0, int(vrow["frame_count"]) - 1,
+             db.dumps({"whole_clip_rally": True})))
+    result = pipeline.reprocess(video_id, "pass2")
+    return {"video_id": video_id, "rally_frames": [0, int(vrow["frame_count"]) - 1], **result}
 
 
 @router.post("/rally-analysis/{video_id}/detect-contacts")

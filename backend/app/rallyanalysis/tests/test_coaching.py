@@ -318,6 +318,68 @@ def test_session_context_counts_whole_session_per_player():
     assert _session_context([]) is None
 
 
+# ---------------------------------------------- shot-type stratified fences
+
+def test_finalize_vector_prefers_same_type_fence_over_player_wide():
+    # Player-wide fence says 130 is way out (all-shots values near 20 — think
+    # "drives"); the same-type stratum says 130 is dead normal (their other
+    # soft shots). Stratified scoring must NOT flag the shot.
+    entries = [_pose_frame(90, _kp17(), [0.95] * 17),
+               _pose_frame(100, _kp17(), [0.95] * 17)]
+    raw = _extract_raw_metrics(_pose_contact(), entries, fps=30.0)
+    knee = raw["knee_bend_deg"]
+    contact = {**_pose_contact(), "shot_type": "kitchen_soft"}
+    player_fence = {"knee_bend_deg": _robust_fence([knee + 500.0] * MIN_SAMPLES_FOR_DISTRIBUTION)}
+    stratum_fence = {"knee_bend_deg": _robust_fence([knee] * MIN_SAMPLES_FOR_DISTRIBUTION)}
+
+    vec_stratified = _finalize_vector(contact, raw, player_fence, stratum_fence)
+    assert vec_stratified.deviation_score == 0.0                    # typical among same-type shots
+    assert "knee_bend_deg" not in vec_stratified.mixed_baseline_metrics
+    assert vec_stratified.shot_type == "kitchen_soft"
+
+    vec_mixed = _finalize_vector(contact, raw, player_fence, None)  # no stratum -> falls back
+    assert abs(vec_mixed.deviation_score) > 0                       # cross-type flag fires
+    assert "knee_bend_deg" in vec_mixed.mixed_baseline_metrics      # ...and is labeled as cross-type
+
+
+def test_finalize_vector_no_fence_anywhere_is_no_comparison_not_mixed():
+    entries = [_pose_frame(90, _kp17(), [0.95] * 17),
+               _pose_frame(100, _kp17(), [0.95] * 17)]
+    raw = _extract_raw_metrics(_pose_contact(), entries, fps=30.0)
+    knee_fence = {"knee_bend_deg": _robust_fence([raw["knee_bend_deg"]] * MIN_SAMPLES_FOR_DISTRIBUTION)}
+    vec = _finalize_vector(_pose_contact(), raw, knee_fence, None)
+    assert "shoulder_rotation_deg" in vec.no_comparison_metrics
+    assert "shoulder_rotation_deg" not in vec.mixed_baseline_metrics  # no comparison happened at all
+
+
+def test_stratum_fences_group_by_player_and_type_and_skip_untyped():
+    raw_metrics = {f: 10.0 for f in METRIC_FIELDS} | {"low_confidence_metrics": []}
+    raw_by_contact = (
+        [({"contact_id": f"a{i}", "player_id": 1, "shot_type": "kitchen_soft"}, dict(raw_metrics))
+         for i in range(MIN_SAMPLES_FOR_DISTRIBUTION)]
+        + [({"contact_id": "drive", "player_id": 1, "shot_type": "backcourt_fast"}, dict(raw_metrics))]
+        + [({"contact_id": "untyped", "player_id": 1, "shot_type": None}, dict(raw_metrics))]
+    )
+    from ..coaching import _stratum_fences_by_metric
+    fences = _stratum_fences_by_metric(raw_by_contact)
+    assert fences[(1, "kitchen_soft")]["knee_bend_deg"] is not None
+    assert fences[(1, "backcourt_fast")]["knee_bend_deg"] is None   # 1 shot < min samples
+    assert all(key[1] is not None for key in fences)                 # untyped contributes nowhere
+
+
+def test_shot_summary_carries_shot_type_and_rally_context():
+    vec = _vec("c1", "footwork", -2.0)
+    vec.shot_type = "kitchen_soft"
+    contact = {**_contact("c1"), "shot_type": "kitchen_soft", "rally_shot_index": 4,
+               "rally_shot_count": 4, "is_rally_ending": True, "seconds_until_rally_end": 0.5}
+    worst, _best = select_worst_best([(vec, contact)])
+    s = worst[0]
+    assert s["shot_type"] == "kitchen_soft"
+    assert s["rally_shot_index"] == 4 and s["rally_shot_count"] == 4
+    assert s["is_rally_ending"] is True
+    assert s["mixed_baseline_metrics"] == []
+
+
 # --------------------------------------------- LLM-boundary metric renaming
 
 def test_llm_shot_payload_renames_misleading_metric_names_everywhere():
@@ -705,6 +767,17 @@ def test_system_prompt_covers_session_context_themes_and_severity_bands():
     # Critique intensity must be calibrated to |deviation_score| bands,
     # qualitatively — never recited as a number.
     assert "Calibrate how strongly you word a critique" in SYSTEM
+
+
+def test_system_prompt_covers_shot_types_mixed_baselines_and_rally_outcome():
+    # shot_type is a stratification key, never a verified stroke label...
+    assert "shot_type" in SYSTEM
+    assert "NOT a verified stroke" in SYSTEM
+    # ...cross-type comparisons are labeled and must be softened...
+    assert "mixed_baseline_metrics" in SYSTEM
+    # ...and rally-ending shots must never be asserted as winners OR errors.
+    assert "is_rally_ending" in SYSTEM
+    assert "does NOT say whether that shot" in SYSTEM
 
 
 def test_system_prompt_makes_frames_primary_evidence_without_breaking_voice():
