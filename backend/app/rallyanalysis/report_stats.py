@@ -15,7 +15,7 @@ from .. import db
 from ..cv import overlays
 from ..cv.court import KITCHEN, NET_Y
 from .coaching import merge_singles_players
-from .readiness import _default_overlay_source, get_analyzable_rallies
+from .readiness import default_overlay_source, get_analyzable_rallies
 
 # ---------------------------------------------------------------------------
 # Court-depth zones for stat 3 — derived from the same court constants used
@@ -135,7 +135,7 @@ def shot_zone_counts(contacts: list[dict]) -> dict:
 
 def get_report_stats(video_id: str, rally_source: str | None = None,
                       overlay_source: str | None = None) -> dict:
-    overlay_source = overlay_source or rally_source or _default_overlay_source(video_id)
+    overlay_source = overlay_source or rally_source or default_overlay_source(video_id)
     rallies = get_analyzable_rallies(video_id, rally_source=rally_source, overlay_source=overlay_source)
     ready_rally_ids = {r["id"] for r in rallies}
 

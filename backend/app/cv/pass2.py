@@ -110,10 +110,19 @@ def _upload_window_incremental(video_id: str, source: str, window_index: int,
 def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
               handle: JobHandle, source: str = "pass2",
               p1_source: str = "pass1",
-              on_window=None) -> list[dict]:
+              on_window=None,
+              windows_override: list[tuple[int, int]] | None = None) -> list[dict]:
     """``on_window(last_covered_frame)`` fires after each processing window's
     overlays land — the pipeline hooks the incremental refiner here so Pass 2
-    results stream into the UI per window instead of arriving all at the end."""
+    results stream into the UI per window instead of arriving all at the end.
+
+    ``windows_override``: when given, Pass 2 runs over exactly these
+    (start_frame, end_frame) ranges instead of querying rally_labels — used
+    for a user-specified coaching selection that doesn't come from a Pass 1
+    window at all. Bypasses the merge/pad logic below entirely (that logic
+    exists to stitch adjacent Pass 1 windows together; a single caller-given
+    range needs neither). Leaves default (None) behaviour byte-for-byte
+    unchanged."""
     if H is None or cam is None:
         raise RuntimeError(
             "Pass 2 needs a court calibration (homography). Calibrate the "
@@ -128,7 +137,7 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
 
     with db.connect() as con:
         vrow = con.execute("SELECT * FROM videos WHERE id=?", (video_id,)).fetchone()
-        p1 = con.execute(
+        p1 = [] if windows_override is not None else con.execute(
             "SELECT start_frame, end_frame FROM rally_labels"
             " WHERE video_id=? AND source=? ORDER BY start_frame",
             (video_id, p1_source),
@@ -136,34 +145,42 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
     path = vrow["path"]
     meta = probe(path)
     fps = meta.fps
-    pad = int(params["p1_pad_s"] * fps)
-    merge_gap = int(params["p1_merge_gap_s"] * fps)
     last_frame = meta.frame_count - 1
 
-    # Build the region Pass 2 processes from the Pass 1 windows. This ONLY
-    # defines where detection runs — it produces no boundary output (Pass 1 is
-    # the sole rally source and already pads/merges its own windows).
-    # 1. Merge adjacent Pass 1 windows when the raw gap between them is small.
-    raw: list[list[int]] = []
-    for r in p1:
-        s, e = r["start_frame"], r["end_frame"]
-        if raw and s - raw[-1][1] <= merge_gap:
-            raw[-1][1] = max(raw[-1][1], e)
-        else:
-            raw.append([s, e])
+    if windows_override is not None:
+        # Caller-supplied range(s) — no Pass 1 windows to merge/pad. Clamp to
+        # the clip's real bounds, same as the merge/pad path below does.
+        windows: list[tuple[int, int, int, int]] = [
+            (max(0, s), min(last_frame, e), max(0, s), min(last_frame, e))
+            for s, e in windows_override]
+    else:
+        pad = int(params["p1_pad_s"] * fps)
+        merge_gap = int(params["p1_merge_gap_s"] * fps)
 
-    # 2. Pad each merged window, clamping the pad to at most half the gap to each
-    #    neighbour so two processing windows never overlap. The (gap-1)//2 clamp
-    #    matters: with gap//2 on both sides an EVEN gap made adjacent windows
-    #    share one frame (we_prev == ws_next, both inclusive), so that frame was
-    #    processed twice and its overlay entry written by both windows.
-    windows: list[tuple[int, int, int, int]] = []  # ws, we, raw_start, raw_end
-    for i, (s, e) in enumerate(raw):
-        left_gap = s - raw[i - 1][1] if i > 0 else 10**9
-        right_gap = raw[i + 1][0] - e if i < len(raw) - 1 else 10**9
-        ws = max(0, s - min(pad, max(0, (left_gap - 1) // 2)))
-        we = min(last_frame, e + min(pad, max(0, right_gap // 2)))
-        windows.append((ws, we, s, e))
+        # Build the region Pass 2 processes from the Pass 1 windows. This ONLY
+        # defines where detection runs — it produces no boundary output (Pass 1 is
+        # the sole rally source and already pads/merges its own windows).
+        # 1. Merge adjacent Pass 1 windows when the raw gap between them is small.
+        raw: list[list[int]] = []
+        for r in p1:
+            s, e = r["start_frame"], r["end_frame"]
+            if raw and s - raw[-1][1] <= merge_gap:
+                raw[-1][1] = max(raw[-1][1], e)
+            else:
+                raw.append([s, e])
+
+        # 2. Pad each merged window, clamping the pad to at most half the gap to each
+        #    neighbour so two processing windows never overlap. The (gap-1)//2 clamp
+        #    matters: with gap//2 on both sides an EVEN gap made adjacent windows
+        #    share one frame (we_prev == ws_next, both inclusive), so that frame was
+        #    processed twice and its overlay entry written by both windows.
+        windows = []  # ws, we, raw_start, raw_end
+        for i, (s, e) in enumerate(raw):
+            left_gap = s - raw[i - 1][1] if i > 0 else 10**9
+            right_gap = raw[i + 1][0] - e if i < len(raw) - 1 else 10**9
+            ws = max(0, s - min(pad, max(0, (left_gap - 1) // 2)))
+            we = min(last_frame, e + min(pad, max(0, right_gap // 2)))
+            windows.append((ws, we, s, e))
 
     # Ball detection/tracking is a switchable stage. OFF right now (PASS2_BALL=0)
     # so Pass 2 is player-detection only — faster, and safe because the ball

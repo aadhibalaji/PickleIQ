@@ -1,6 +1,7 @@
 """Upload, video streaming (range requests), job status, reprocess."""
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -10,10 +11,12 @@ from fastapi import APIRouter, HTTPException, Request, UploadFile
 from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 
-from .. import db, pipeline, results_export, storage_s3
+from .. import db, pipeline, results_export, self_stop, storage_s3
 from ..config import RUN_PROCESSING, STORAGE_BACKEND, VIDEO_DIR
 from ..cv.video_io import probe
 from ..jobs import runner
+
+log = logging.getLogger("api.media")
 
 router = APIRouter()
 
@@ -288,6 +291,31 @@ def cancel_job(job_id: str):
 @router.post("/videos/{video_id}/cancel")
 def cancel_video_jobs(video_id: str):
     return {"cancelled": runner.cancel_video(video_id)}
+
+
+class SelfStopIn(BaseModel):
+    enabled: bool
+
+
+@router.get("/self-stop")
+def get_self_stop():
+    """Current state of the EC2 self-stop-on-empty-queue toggle (see
+    self_stop.py) — testing/ops control, unrelated to manual start/stop."""
+    return {"enabled": self_stop.get_enabled()}
+
+
+@router.post("/self-stop")
+def set_self_stop(body: SelfStopIn):
+    self_stop.set_enabled(body.enabled)
+    if STORAGE_BACKEND == "s3":
+        # Mirrors to S3 so the separate EC2 worker instance (which never sees
+        # this container's local filesystem directly) picks it up on its next
+        # cloud_ingest poll — see cloud_ingest._sync_self_stop.
+        try:
+            storage_s3.upload_self_stop_state(body.enabled)
+        except Exception:
+            log.exception("failed to sync self-stop toggle to S3 (non-fatal)")
+    return {"enabled": body.enabled}
 
 
 _RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")

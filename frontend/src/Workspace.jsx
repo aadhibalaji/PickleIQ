@@ -33,6 +33,7 @@ export default function Workspace({ videoId, onBack }) {
   const [gt, setGt] = useState({ step: 'idle', pending: null, choice: 'in', sel: null })
   const wasActiveRef = useRef(false)
   const playerRef = useRef(null)
+  const [selfStopEnabled, setSelfStopEnabled] = useState(null) // null = not loaded yet
 
   const loadRallies = useCallback(() => {
     api.getRallies(videoId).then((r) => {
@@ -81,6 +82,18 @@ export default function Workspace({ videoId, onBack }) {
     loadRefined()
     loadCalibration()
   }, [videoId, loadRallies, loadRefined, loadCalibration])
+
+  // Testing/ops control: EC2 self-stop-on-empty-queue toggle. Disruptive
+  // during active testing (instance disappears mid-session), so this lets it
+  // be turned off without touching manual start/stop.
+  useEffect(() => {
+    api.getSelfStop().then((r) => setSelfStopEnabled(r.enabled)).catch(() => {})
+  }, [])
+  const toggleSelfStop = () => {
+    const next = !selfStopEnabled
+    setSelfStopEnabled(next) // optimistic
+    api.setSelfStop(next).catch((e) => { setSelfStopEnabled(!next); note(`self-stop toggle failed: ${e.message}`) })
+  }
 
   // Poll jobs + streamed results while processing runs in the background.
   useEffect(() => {
@@ -279,6 +292,12 @@ export default function Workspace({ videoId, onBack }) {
           </span>
           {video.s3_key && video.run_processing === false &&
             <SyncFromCloudButton videoId={videoId} note={note} />}
+          {selfStopEnabled !== null && (
+            <label className="row" title="When on, the EC2 worker stops itself once its job queue is empty (saves cost). Turn off during active testing so it doesn't disappear mid-session.">
+              <input type="checkbox" checked={selfStopEnabled} onChange={toggleSelfStop} />
+              <span className="muted">EC2 self-stop</span>
+            </label>
+          )}
           <button className={gtMode ? 'active' : ''}
                   style={gtMode ? { borderColor: '#c3ce4a', color: '#c3ce4a' } : undefined}
                   onClick={() => { setGtMode((m) => !m); gtReset(); playerRef.current?.video()?.pause() }}
@@ -401,7 +420,7 @@ export default function Workspace({ videoId, onBack }) {
                    onGrade={gradeWindow} videoId={videoId} note={note} />
         )}
         {tab === 'rally-analysis' && (
-          <RallyAnalysisPanel videoId={videoId} video={video}
+          <RallyAnalysisPanel videoId={videoId} video={video} onSeek={seek}
                                onUpdateVideo={(patch) => api.updateVideo(videoId, patch)
                                  .then((v) => setVideo((old) => ({ ...old, ...v })))
                                  .catch((e) => note(`update failed: ${e.message}`))} />

@@ -27,7 +27,7 @@ import time
 
 import yaml
 
-from . import db, pipeline, storage_s3
+from . import db, pipeline, self_stop, storage_s3
 from .config import DATA_DIR, S3_VIDEO_BUCKET
 from .cv.video_io import probe
 from .refine.config import override_path
@@ -161,10 +161,32 @@ def _sync_refine_config() -> None:
     log.info("cloud ingest: synced refine config override from S3: %s", remote)
 
 
+def _sync_self_stop() -> None:
+    """Mirrors the self-stop toggle from S3 into this instance's own local
+    state (self_stop.py) — same reasoning as _sync_calibration: normally
+    flipped through a separate RUN_PROCESSING=0 UI-only container. Read
+    directly by self_stop.stop_this_instance() right before it would
+    otherwise call ec2:StopInstances, so this poll cycle is what lets a
+    toggle flipped mid-testing actually take effect on the worker."""
+    try:
+        remote = storage_s3.download_self_stop_state()
+    except Exception:
+        log.exception("cloud ingest: self-stop toggle S3 fetch failed (non-fatal, retrying next tick)")
+        return
+    if remote is None:
+        return
+    enabled = bool(remote.get("enabled", True))
+    if self_stop.get_enabled() == enabled:
+        return
+    self_stop.set_enabled(enabled)
+    log.info("cloud ingest: synced self-stop toggle from S3: enabled=%s", enabled)
+
+
 def _tick() -> None:
     _sync_calibration()
     _sync_tracknet_weights()
     _sync_refine_config()
+    _sync_self_stop()
     try:
         keys = storage_s3.list_video_keys()
     except Exception:

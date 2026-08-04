@@ -10,18 +10,51 @@ at 169.254.169.254 doesn't exist at all.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 
 import requests
+
+from .config import DATA_DIR, SELF_STOP_ENABLED_DEFAULT
 
 log = logging.getLogger("self_stop")
 
 _METADATA_BASE = "http://169.254.169.254/latest"
 _TIMEOUT_S = 2.0
 
+# Testing/ops toggle: lets someone disable the automatic stop-on-empty-queue
+# behavior during active testing, without touching manual start/stop or
+# anything else in this module. Persisted to a local file (this process's own
+# state) rather than the DB — it's a single flag read on the hot path right
+# before an instance-stop decision, not data that needs querying/joining.
+# On an EC2 worker, this local file is kept in sync from S3 by
+# cloud_ingest._sync_self_stop on the same poll cycle already used for
+# calibration/refine-config sync (see storage_s3.upload_self_stop_state) —
+# the toggle is normally flipped from a separate UI container that has no
+# other way to reach this instance's local state.
+_STATE_PATH = DATA_DIR / "self_stop_state.json"
+
+
+def get_enabled() -> bool:
+    if not _STATE_PATH.exists():
+        return SELF_STOP_ENABLED_DEFAULT
+    try:
+        return bool(json.loads(_STATE_PATH.read_text())["enabled"])
+    except Exception:
+        log.warning("self_stop_state.json unreadable, defaulting to %s", SELF_STOP_ENABLED_DEFAULT)
+        return SELF_STOP_ENABLED_DEFAULT
+
+
+def set_enabled(enabled: bool) -> None:
+    _STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _STATE_PATH.write_text(json.dumps({"enabled": bool(enabled)}))
+
 
 def stop_this_instance() -> None:
+    if not get_enabled():
+        log.info("self-stop skipped: disabled via toggle (self_stop_enabled=false)")
+        return
     try:
         token = requests.put(
             f"{_METADATA_BASE}/api/token",

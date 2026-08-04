@@ -27,7 +27,7 @@ REASON_STALE = "overlay_stale"
 REASON_READY = "ready"
 
 
-def _default_overlay_source(video_id: str) -> str:
+def default_overlay_source(video_id: str) -> str:
     """Pass 2 overlays carry stable identity slots; prefer them, fall back to
     Pass 1 spot-check overlays if Pass 2 hasn't run."""
     with db.connect() as con:
@@ -79,8 +79,8 @@ def _pass2_ready_reason(video_id: str) -> str | None:
     return None
 
 
-def _covers_rally(entries: list[dict], start_frame: int, end_frame: int,
-                   tolerance: int = COVERAGE_TOLERANCE_FRAMES) -> bool:
+def covers_rally(entries: list[dict], start_frame: int, end_frame: int,
+                  tolerance: int = COVERAGE_TOLERANCE_FRAMES) -> bool:
     """True if entries is non-empty and its frame coverage reaches within
     `tolerance` frames of both start_frame and end_frame."""
     if not entries:
@@ -97,7 +97,7 @@ def get_analyzable_rallies(video_id: str, rally_source: str | None = None,
     coverage still reaches both ends of the rally's current frame range.
     Rallies failing either check are excluded entirely, not partially
     included."""
-    overlay_source = overlay_source or _default_overlay_source(video_id)
+    overlay_source = overlay_source or default_overlay_source(video_id)
     if rally_source is not None:
         with db.connect() as con:
             rows = db.rows_to_dicts(con.execute(
@@ -113,7 +113,7 @@ def get_analyzable_rallies(video_id: str, rally_source: str | None = None,
     out = []
     for r in rows:
         entries = read_range(video_id, overlay_source, r["start_frame"], r["end_frame"])
-        if _covers_rally(entries, r["start_frame"], r["end_frame"]):
+        if covers_rally(entries, r["start_frame"], r["end_frame"]):
             out.append(r)
     return out
 
@@ -122,7 +122,7 @@ def readiness_report(video_id: str, overlay_source: str | None = None) -> dict:
     """{rally_id: {"ready": bool, "reason": "pass2_not_done"|"pass2_running"|
     "overlay_stale"|"ready"}} for every rally currently selected by
     _get_rallies (human > pass2 > pass1 override order)."""
-    overlay_source = overlay_source or _default_overlay_source(video_id)
+    overlay_source = overlay_source or default_overlay_source(video_id)
     rallies = _get_rallies(video_id)
     pass2_reason = _pass2_ready_reason(video_id)
 
@@ -132,7 +132,7 @@ def readiness_report(video_id: str, overlay_source: str | None = None) -> dict:
             report[r["id"]] = {"ready": False, "reason": pass2_reason}
             continue
         entries = read_range(video_id, overlay_source, r["start_frame"], r["end_frame"])
-        if _covers_rally(entries, r["start_frame"], r["end_frame"]):
+        if covers_rally(entries, r["start_frame"], r["end_frame"]):
             report[r["id"]] = {"ready": True, "reason": REASON_READY}
         else:
             report[r["id"]] = {"ready": False, "reason": REASON_STALE}
@@ -142,8 +142,8 @@ def readiness_report(video_id: str, overlay_source: str | None = None) -> dict:
 if __name__ == "__main__":
     # ponytail self-check: coverage tolerance math, no DB.
     entries = [{"f": f} for f in range(100, 201)]
-    assert _covers_rally(entries, 100, 200) is True
-    assert _covers_rally(entries, 100, 250) is False   # far short of end_frame
-    assert _covers_rally(entries, 90, 200, tolerance=15) is True  # within tolerance
-    assert _covers_rally([], 100, 200) is False
+    assert covers_rally(entries, 100, 200) is True
+    assert covers_rally(entries, 100, 250) is False   # far short of end_frame
+    assert covers_rally(entries, 90, 200, tolerance=15) is True  # within tolerance
+    assert covers_rally([], 100, 200) is False
     print("readiness self-check OK")

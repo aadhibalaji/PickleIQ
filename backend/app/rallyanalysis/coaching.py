@@ -20,7 +20,7 @@ from ..config import ANTHROPIC_API_KEY, ANTHROPIC_REPORT_MODEL
 from ..cv import overlays
 from ..cv.court import NET_Y
 from .contracts import CoachingReport, CoachingTip, ShotFeatureVector
-from .readiness import _default_overlay_source, get_analyzable_rallies
+from .readiness import default_overlay_source, get_analyzable_rallies
 
 log = logging.getLogger("rallyanalysis.coaching")
 
@@ -929,7 +929,7 @@ def generate_coaching_report(video_id: str, rally_source: str | None = None,
     # rally_source can be None by default (see contact_detect.py's matching
     # fix) — resolve overlay_source the same way here so the read_range calls
     # below aren't left with an unresolved None.
-    overlay_source = overlay_source or rally_source or _default_overlay_source(video_id)
+    overlay_source = overlay_source or rally_source or default_overlay_source(video_id)
     rallies = get_analyzable_rallies(video_id, rally_source=rally_source, overlay_source=overlay_source)
     ready_rally_ids = {r["id"] for r in rallies}
     with db.connect() as con:
