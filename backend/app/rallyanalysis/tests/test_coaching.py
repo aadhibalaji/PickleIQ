@@ -5,11 +5,12 @@ build_report with an injected fake llm_fn), same pattern as contact_detect
 tests."""
 from __future__ import annotations
 
+from .. import coaching
 from ..coaching import (MAX_PRAISE_TIPS, MAX_TIPS, MIN_SAMPLES_FOR_DISTRIBUTION, SYSTEM,
-                         _classify, _extract_raw_metrics, _finalize_vector, _player_fences_by_metric,
-                         _rel_dev, _robust_fence, _summarize_stats, build_report,
-                         compute_feature_vector, exclude_serves, generate_llm_tips,
-                         select_tip_candidates, select_worst_best)
+                         _classify, _extract_raw_metrics, _finalize_vector, _llm_shot_payload,
+                         _player_fences_by_metric, _rel_dev, _robust_fence, _session_context,
+                         _summarize_stats, build_report, compute_feature_vector, exclude_serves,
+                         generate_llm_tips, select_tip_candidates, select_worst_best)
 from ..contracts import ShotFeatureVector
 
 CATEGORIES = ["footwork", "paddle_prep", "contact_point", "follow_through"]
@@ -227,6 +228,313 @@ def test_build_report_degrades_gracefully_when_llm_fn_returns_empty():
     vectors_meta = [(_vec("c1", "footwork", 0.0), _contact("c1"))]
     report = build_report("vid1", vectors_meta, llm_fn=lambda shots: {})
     assert report.tips == []  # never crashes, never fabricates a tip
+    assert report.player_themes == []  # dict-only (old-style) double -> no themes, no error
+
+
+def test_build_report_attaches_validated_player_themes():
+    # The model's echoed player_label is only a join key: unknown labels are
+    # dropped (hallucinated player), duplicates collapse to the first, and
+    # player_id always comes from our own contact data.
+    def fake_llm(shots, stats=None, ctx=None):
+        return ({s["contact_id"]: {"tip": "t", "tone": "improve"} for s in shots},
+                [{"player_label": "Player 1", "theme": "keep working the feet"},
+                 {"player_label": "Player 99", "theme": "hallucinated player"},
+                 {"player_label": "Player 1", "theme": "duplicate, dropped"}])
+
+    vectors_meta = [(_vec("bad", "footwork", -3.0), _contact("bad"))]
+    report = build_report("vid1", vectors_meta, llm_fn=fake_llm)
+    assert len(report.player_themes) == 1
+    theme = report.player_themes[0]
+    assert theme.player_label == "Player 1"
+    assert theme.player_id == 1
+    assert theme.theme == "keep working the feet"
+
+
+def test_build_report_frames_fn_runs_on_candidates_only_and_feeds_llm_fn():
+    captured = {}
+
+    def fake_frames(candidates):
+        captured["frame_candidates"] = candidates
+        return {c["contact_id"]: [{"label": "contact", "jpeg_b64": "abc"}] for c in candidates}
+
+    def fake_llm(shots, stats=None, ctx=None, frames=None):
+        captured["frames"] = frames
+        return {}
+
+    vectors_meta = [(_vec(f"c{i}", "footwork", -3.0), _contact(f"c{i}", timestamp_s=i * 10.0))
+                     for i in range(20)]
+    build_report("vid1", vectors_meta, llm_fn=fake_llm, frames_fn=fake_frames)
+    # frames extracted only for the shortlisted candidates, never all 20
+    assert len(captured["frame_candidates"]) <= coaching.MAX_LLM_CANDIDATES
+    assert set(captured["frames"]) == {c["contact_id"] for c in captured["frame_candidates"]}
+
+
+def test_build_report_frames_fn_failure_degrades_to_frameless_call():
+    captured = {}
+
+    def fake_llm(shots, stats=None, ctx=None, frames=None):
+        captured["frames"] = frames
+        return {s["contact_id"]: {"tip": "t", "tone": "improve"} for s in shots}
+
+    def broken_frames(candidates):
+        raise RuntimeError("video file missing")
+
+    vectors_meta = [(_vec("bad", "footwork", -3.0), _contact("bad"))]
+    report = build_report("vid1", vectors_meta, llm_fn=fake_llm, frames_fn=broken_frames)
+    assert captured["frames"] is None    # degraded, not raised
+    assert len(report.tips) == 1         # report still produced
+
+
+def test_build_report_passes_whole_session_context_to_llm_fn():
+    # session_context must cover EVERY scored shot (here: 12), not just the
+    # candidates that get individual tips.
+    captured = {}
+
+    def fake_llm(shots, stats=None, ctx=None):
+        captured["shots"] = shots
+        captured["ctx"] = ctx
+        return {}
+
+    vectors_meta = [(_vec(f"c{i}", "footwork", -3.0), _contact(f"c{i}", timestamp_s=i * 10.0))
+                     for i in range(12)]
+    build_report("vid1", vectors_meta, llm_fn=fake_llm)
+    assert captured["ctx"]["Player 1"]["shots_analyzed"] == 12
+    assert len(captured["shots"]) <= coaching.MAX_LLM_CANDIDATES
+
+
+def test_build_report_gives_llm_a_wider_shortlist_but_caps_tips_at_max():
+    # 20 flagged shots -> the LLM sees up to MAX_LLM_CANDIDATES of them (the
+    # widened shortlist for its frame-informed final cut), but even a model
+    # that ignores its selection budget and tips EVERYTHING gets hard-capped
+    # back to MAX_TIPS, keeping the most salient improve tips.
+    captured = {}
+
+    def greedy_llm(shots, stats=None, ctx=None):
+        captured["shots"] = shots
+        return {s["contact_id"]: {"tip": "t", "tone": "improve"} for s in shots}
+
+    vectors_meta = [(_vec(f"c{i}", "footwork", -2.0 - i * 0.1), _contact(f"c{i}", timestamp_s=i * 10.0))
+                     for i in range(20)]
+    report = build_report("vid1", vectors_meta, llm_fn=greedy_llm)
+    assert len(captured["shots"]) == coaching.MAX_LLM_CANDIDATES
+    assert len(report.tips) == MAX_TIPS
+    # hard cap keeps the top-salience shots (largest |deviation| here)
+    kept = {t.contact_id for t in report.tips}
+    assert "c19" in kept and "c0" not in kept
+
+
+# -------------------------------------------------------- salience ranking
+
+def test_salience_rally_ending_outranks_equal_midrally_outlier():
+    # Same deviation magnitude; the shot the rally ended on must win a slot
+    # over the mid-rally one when only one slot exists.
+    midrally = (_vec("midrally", "footwork", -2.0), _contact("midrally", timestamp_s=10.0))
+    ending = (_vec("ending", "footwork", -2.0),
+              {**_contact("ending", timestamp_s=100.0), "is_rally_ending": True})
+    candidates = select_tip_candidates([midrally, ending], limit=1)
+    assert [c["contact_id"] for c in candidates] == ["ending"]
+
+
+def test_salience_multi_metric_breakdown_outranks_single_metric_outlier():
+    # A slightly smaller deviation with THREE metrics deviating together beats
+    # a slightly larger single-metric outlier (likely one noisy keypoint).
+    single = _vec("single", "footwork", -2.2)
+    single.deviating_metrics = ["knee_bend_deg"]
+    multi = _vec("multi", "footwork", -2.0)
+    multi.deviating_metrics = ["knee_bend_deg", "split_step_delay_s", "weight_transfer_score"]
+    candidates = select_tip_candidates(
+        [(single, _contact("single", timestamp_s=10.0)),
+         (multi, _contact("multi", timestamp_s=100.0))], limit=1)
+    assert [c["contact_id"] for c in candidates] == ["multi"]
+
+
+def test_finalize_vector_records_all_deviating_metrics():
+    entries = [_pose_frame(90, _kp17(), [0.95] * 17),
+               _pose_frame(100, _kp17(), [0.95] * 17)]
+    raw = _extract_raw_metrics(_pose_contact(), entries, fps=30.0)
+    fences = {
+        # knee way outside its fence, shoulder inside its own
+        "knee_bend_deg": _robust_fence([raw["knee_bend_deg"] + 500.0] * MIN_SAMPLES_FOR_DISTRIBUTION),
+        "shoulder_rotation_deg": _robust_fence([raw["shoulder_rotation_deg"]] * MIN_SAMPLES_FOR_DISTRIBUTION),
+    }
+    vec = _finalize_vector(_pose_contact(), raw, fences, None)
+    assert "knee_bend_deg" in vec.deviating_metrics
+    assert "shoulder_rotation_deg" not in vec.deviating_metrics
+
+
+# --------------------------------------------------- exemplar praise picking
+
+def test_praise_exemplar_targets_players_most_flagged_category():
+    # Player 1's flags are 2x contact_point, 1x footwork -> the praise pick
+    # must exemplify contact_point, with its category re-pointed and
+    # exemplar_of_category set.
+    vectors_meta = [
+        (_vec("bad1", "contact_point", -2.0), _contact("bad1", timestamp_s=10.0)),
+        (_vec("bad2", "contact_point", -2.5), _contact("bad2", timestamp_s=20.0)),
+        (_vec("bad3", "footwork", -2.0), _contact("bad3", timestamp_s=30.0)),
+        (_vec("clean", "footwork", 0.0), _contact("clean", confidence=0.9, timestamp_s=100.0)),
+    ]
+    _worst, best = select_worst_best(vectors_meta)
+    assert len(best) == 1
+    assert best[0]["contact_id"] == "clean"
+    assert best[0]["category"] == "contact_point"
+    assert best[0]["exemplar_of_category"] == "contact_point"
+
+
+def test_praise_exemplar_never_picks_shot_with_no_real_reading_in_target_category():
+    # The only in-range shot has ALL contact_point metrics null -> it cannot
+    # exemplify contact_point; no praise is fabricated.
+    blind = _vec("blind", "footwork", 0.0)
+    blind.elbow_extension_deg = None
+    blind.weight_transfer_score = None
+    blind.contact_height_m = None
+    vectors_meta = [
+        (_vec("bad", "contact_point", -2.0), _contact("bad", timestamp_s=10.0)),
+        (blind, _contact("blind", confidence=0.9, timestamp_s=100.0)),
+    ]
+    _worst, best = select_worst_best(vectors_meta)
+    assert best == []
+
+
+def test_praise_capped_at_max_praise_tips_prioritizing_flagged_players():
+    # Three players with clean shots; only players 1 and 2 have flags.
+    # MAX_PRAISE_TIPS (2) exemplars total, and the flag-free player 3 loses
+    # the slot — their praise teaches nothing.
+    def meta(cid, pid, dev, ts):
+        return (_vec(cid, "footwork", dev), {**_contact(cid, confidence=0.9, timestamp_s=ts), "player_id": pid})
+
+    vectors_meta = [
+        meta("p1bad", 1, -2.0, 10.0), meta("p1clean", 1, 0.0, 50.0),
+        meta("p2bad", 2, -2.0, 20.0), meta("p2clean", 2, 0.0, 60.0),
+        meta("p3clean", 3, 0.0, 70.0),
+    ]
+    _worst, best = select_worst_best(vectors_meta)
+    assert len(best) == MAX_PRAISE_TIPS
+    assert {b["player_id"] for b in best} == {1, 2}
+
+
+# ------------------------------------------------- session context aggregates
+
+def test_session_context_counts_whole_session_per_player():
+    vectors_meta = [
+        (_vec("a", "footwork", -2.0), _contact("a")),
+        (_vec("b", "footwork", 0.0), _contact("b")),
+        (_vec("c", "contact_point", 1.5), {**_contact("c"), "player_id": 2}),
+    ]
+    ctx = _session_context(vectors_meta)
+    assert ctx["Player 1"]["shots_analyzed"] == 2
+    assert ctx["Player 1"]["typical_shots"] == 1
+    assert ctx["Player 1"]["flagged_by_category"] == {"footwork": 1}
+    assert ctx["Player 2"]["flagged_by_category"] == {"contact_point": 1}
+    assert _session_context([]) is None
+
+
+# ---------------------------------------------- shot-type stratified fences
+
+def test_finalize_vector_prefers_same_type_fence_over_player_wide():
+    # Player-wide fence says 130 is way out (all-shots values near 20 — think
+    # "drives"); the same-type stratum says 130 is dead normal (their other
+    # soft shots). Stratified scoring must NOT flag the shot.
+    entries = [_pose_frame(90, _kp17(), [0.95] * 17),
+               _pose_frame(100, _kp17(), [0.95] * 17)]
+    raw = _extract_raw_metrics(_pose_contact(), entries, fps=30.0)
+    knee = raw["knee_bend_deg"]
+    contact = {**_pose_contact(), "shot_type": "kitchen_soft"}
+    player_fence = {"knee_bend_deg": _robust_fence([knee + 500.0] * MIN_SAMPLES_FOR_DISTRIBUTION)}
+    stratum_fence = {"knee_bend_deg": _robust_fence([knee] * MIN_SAMPLES_FOR_DISTRIBUTION)}
+
+    vec_stratified = _finalize_vector(contact, raw, player_fence, stratum_fence)
+    assert vec_stratified.deviation_score == 0.0                    # typical among same-type shots
+    assert "knee_bend_deg" not in vec_stratified.mixed_baseline_metrics
+    assert vec_stratified.shot_type == "kitchen_soft"
+
+    vec_mixed = _finalize_vector(contact, raw, player_fence, None)  # no stratum -> falls back
+    assert abs(vec_mixed.deviation_score) > 0                       # cross-type flag fires
+    assert "knee_bend_deg" in vec_mixed.mixed_baseline_metrics      # ...and is labeled as cross-type
+
+
+def test_finalize_vector_no_fence_anywhere_is_no_comparison_not_mixed():
+    entries = [_pose_frame(90, _kp17(), [0.95] * 17),
+               _pose_frame(100, _kp17(), [0.95] * 17)]
+    raw = _extract_raw_metrics(_pose_contact(), entries, fps=30.0)
+    knee_fence = {"knee_bend_deg": _robust_fence([raw["knee_bend_deg"]] * MIN_SAMPLES_FOR_DISTRIBUTION)}
+    vec = _finalize_vector(_pose_contact(), raw, knee_fence, None)
+    assert "shoulder_rotation_deg" in vec.no_comparison_metrics
+    assert "shoulder_rotation_deg" not in vec.mixed_baseline_metrics  # no comparison happened at all
+
+
+def test_stratum_fences_group_by_player_and_type_and_skip_untyped():
+    raw_metrics = {f: 10.0 for f in METRIC_FIELDS} | {"low_confidence_metrics": []}
+    raw_by_contact = (
+        [({"contact_id": f"a{i}", "player_id": 1, "shot_type": "kitchen_soft"}, dict(raw_metrics))
+         for i in range(MIN_SAMPLES_FOR_DISTRIBUTION)]
+        + [({"contact_id": "drive", "player_id": 1, "shot_type": "backcourt_fast"}, dict(raw_metrics))]
+        + [({"contact_id": "untyped", "player_id": 1, "shot_type": None}, dict(raw_metrics))]
+    )
+    from ..coaching import _stratum_fences_by_metric
+    fences = _stratum_fences_by_metric(raw_by_contact)
+    assert fences[(1, "kitchen_soft")]["knee_bend_deg"] is not None
+    assert fences[(1, "backcourt_fast")]["knee_bend_deg"] is None   # 1 shot < min samples
+    assert all(key[1] is not None for key in fences)                 # untyped contributes nowhere
+
+
+def test_shot_summary_carries_shot_type_and_rally_context():
+    vec = _vec("c1", "footwork", -2.0)
+    vec.shot_type = "kitchen_soft"
+    contact = {**_contact("c1"), "shot_type": "kitchen_soft", "rally_shot_index": 4,
+               "rally_shot_count": 4, "is_rally_ending": True, "seconds_until_rally_end": 0.5}
+    worst, _best = select_worst_best([(vec, contact)])
+    s = worst[0]
+    assert s["shot_type"] == "kitchen_soft"
+    assert s["rally_shot_index"] == 4 and s["rally_shot_count"] == 4
+    assert s["is_rally_ending"] is True
+    assert s["mixed_baseline_metrics"] == []
+
+
+# --------------------------------------------- LLM-boundary metric renaming
+
+def test_llm_shot_payload_renames_misleading_metric_names_everywhere():
+    shot = {
+        "contact_id": "c1",
+        "low_confidence_metrics": ["knee_bend_deg"],
+        "no_comparison_metrics": ["contact_height_m"],
+        "feature_vector": {"contact_height_m": -1.2, "knee_bend_deg": None,
+                            "low_confidence_metrics": ["knee_bend_deg"],
+                            "no_comparison_metrics": ["contact_height_m"]},
+    }
+    out = _llm_shot_payload(shot)
+    assert "contact_height_m" not in out["feature_vector"]
+    assert out["feature_vector"]["distance_from_net_m"] == -1.2
+    assert out["no_comparison_metrics"] == ["distance_from_net_m"]
+    assert out["feature_vector"]["no_comparison_metrics"] == ["distance_from_net_m"]
+    assert out["low_confidence_metrics"] == ["knee_bend_deg"]  # honest names pass through
+    # LLM-boundary only: the original shot dict (what gets persisted/served)
+    # must keep the internal name untouched.
+    assert shot["feature_vector"]["contact_height_m"] == -1.2
+    assert shot["no_comparison_metrics"] == ["contact_height_m"]
+
+
+def test_llm_shot_payload_tolerates_bare_dicts():
+    assert _llm_shot_payload({"contact_id": "c1"}) == {"contact_id": "c1"}
+
+
+def test_llm_shot_payload_renames_all_four_metric_name_lists():
+    shot = {"contact_id": "c1",
+            "mixed_baseline_metrics": ["contact_height_m"],
+            "deviating_metrics": ["contact_height_m", "knee_bend_deg"]}
+    out = _llm_shot_payload(shot)
+    assert out["mixed_baseline_metrics"] == ["distance_from_net_m"]
+    assert out["deviating_metrics"] == ["distance_from_net_m", "knee_bend_deg"]
+
+
+def test_system_prompt_gives_llm_the_final_cut_with_a_budget():
+    # Phase 2: the model receives a wider shortlist and must (a) know it can
+    # skip pose-noise shots, (b) never exceed the tip budget, (c) treat
+    # exemplar praise as connected to the player's flaws.
+    assert "THE FINAL CUT IS YOURS" in SYSTEM
+    assert f"AT MOST {MAX_TIPS} shots" in SYSTEM
+    assert "SKIP a shot entirely" in SYSTEM
+    assert "exemplar_of_category" in SYSTEM
 
 
 # --------------------------------------------------------- serve exclusion
@@ -312,6 +620,7 @@ def test_generate_llm_tips_includes_stats_in_prompt_when_present(monkeypatch):
         text = '{"tips": []}'
 
     class FakeResponse:
+        stop_reason = "end_turn"
         content = [FakeTextBlock()]
 
     class FakeMessages:
@@ -339,6 +648,104 @@ def test_generate_llm_tips_includes_stats_in_prompt_when_present(monkeypatch):
     captured.clear()
     generate_llm_tips([{"contact_id": "c1"}], stats_summary=None)
     assert "player_tendencies" not in captured["messages"][0]["content"]
+
+
+def test_generate_llm_tips_sends_honest_names_session_context_and_coaching_model(monkeypatch):
+    captured = {}
+
+    class FakeTextBlock:
+        type = "text"
+        text = '{"tips": [], "player_themes": []}'
+
+    class FakeResponse:
+        stop_reason = "end_turn"
+        content = [FakeTextBlock()]
+
+    class FakeMessages:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return FakeResponse()
+
+    class FakeClient:
+        def __init__(self, api_key=None):
+            self.messages = FakeMessages()
+
+    import sys
+    import types
+
+    fake_anthropic = types.SimpleNamespace(
+        Anthropic=FakeClient, RateLimitError=Exception, AuthenticationError=Exception,
+        APIStatusError=Exception, APIConnectionError=Exception)
+    monkeypatch.setitem(sys.modules, "anthropic", fake_anthropic)
+    monkeypatch.setattr("app.rallyanalysis.coaching.ANTHROPIC_API_KEY", "fake-key")
+
+    shots = [{"contact_id": "c1", "feature_vector": {"contact_height_m": 0.5}}]
+    ctx = {"Player 1": {"shots_analyzed": 10, "typical_shots": 7,
+                        "flagged_by_category": {"footwork": 3}}}
+    tips, themes = generate_llm_tips(shots, stats_summary=None, session_context=ctx)
+    assert tips == {} and themes == []
+    content = captured["messages"][0]["content"]
+    # The misleading internal name must never reach the model...
+    assert "contact_height_m" not in content
+    assert "distance_from_net_m" in content
+    # ...the whole-session aggregates ride along in the SAME single call...
+    assert "session_context" in content
+    # ...on the dedicated coaching model, not the discrepancy-report model...
+    assert captured["model"] == coaching.ANTHROPIC_COACHING_MODEL
+    # ...with ADAPTIVE thinking — budget_tokens 400s on claude-sonnet-5.
+    assert captured["thinking"] == {"type": "adaptive"}
+
+    captured.clear()
+    generate_llm_tips(shots, stats_summary=None, session_context=None)
+    assert "session_context" not in captured["messages"][0]["content"]
+
+
+def test_generate_llm_tips_folds_frames_into_the_same_single_call(monkeypatch):
+    captured = {}
+
+    class FakeTextBlock:
+        type = "text"
+        text = '{"tips": [], "player_themes": []}'
+
+    class FakeResponse:
+        stop_reason = "end_turn"
+        content = [FakeTextBlock()]
+
+    class FakeMessages:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            return FakeResponse()
+
+    class FakeClient:
+        def __init__(self, api_key=None):
+            self.messages = FakeMessages()
+
+    import sys
+    import types
+
+    fake_anthropic = types.SimpleNamespace(
+        Anthropic=FakeClient, RateLimitError=Exception, AuthenticationError=Exception,
+        APIStatusError=Exception, APIConnectionError=Exception)
+    monkeypatch.setitem(sys.modules, "anthropic", fake_anthropic)
+    monkeypatch.setattr("app.rallyanalysis.coaching.ANTHROPIC_API_KEY", "fake-key")
+
+    shots = [{"contact_id": "c1"}]
+    frames = {"c1": [{"label": "prep", "jpeg_b64": "AAAA"},
+                     {"label": "contact", "jpeg_b64": "BBBB"}]}
+    generate_llm_tips(shots, frames_by_contact=frames)
+    content = captured["messages"][0]["content"]
+    assert isinstance(content, list)  # block list: JSON text + labeled images
+    image_blocks = [b for b in content if b.get("type") == "image"]
+    assert len(image_blocks) == 2
+    assert image_blocks[0]["source"] == {"type": "base64", "media_type": "image/jpeg", "data": "AAAA"}
+    labels = [b["text"] for b in content if b.get("type") == "text"]
+    assert any("prep" in t and "c1" in t for t in labels)
+
+    # Without frames the message stays a plain JSON string, exactly as before
+    # vision context existed.
+    captured.clear()
+    generate_llm_tips(shots, frames_by_contact=None)
+    assert isinstance(captured["messages"][0]["content"], str)
 
 
 def _kp17():
@@ -478,6 +885,43 @@ def test_system_prompt_encodes_three_beat_supportive_framing():
     assert "three-beat" in SYSTEM
     assert "Do NOT soften, hedge, vague-up, or water down the" in SYSTEM
     assert "NOT a compliment sandwich that pads or dilutes" in SYSTEM
+
+
+def test_system_prompt_describes_distance_from_net_never_height():
+    # The LLM-facing name is the honest one, and the prompt must forbid
+    # reading any vertical/contact-height meaning into it (the pipeline has
+    # no vertical measurement at all).
+    assert "distance_from_net_m" in SYSTEM
+    assert "NOTHING about how high or low" in SYSTEM
+    assert "contact_height_m" not in SYSTEM
+
+
+def test_system_prompt_covers_session_context_themes_and_severity_bands():
+    assert "session_context" in SYSTEM
+    assert "player_themes" in SYSTEM
+    # Critique intensity must be calibrated to |deviation_score| bands,
+    # qualitatively — never recited as a number.
+    assert "Calibrate how strongly you word a critique" in SYSTEM
+
+
+def test_system_prompt_covers_shot_types_mixed_baselines_and_rally_outcome():
+    # shot_type is a stratification key, never a verified stroke label...
+    assert "shot_type" in SYSTEM
+    assert "NOT a verified stroke" in SYSTEM
+    # ...cross-type comparisons are labeled and must be softened...
+    assert "mixed_baseline_metrics" in SYSTEM
+    # ...and rally-ending shots must never be asserted as winners OR errors.
+    assert "is_rally_ending" in SYSTEM
+    assert "does NOT say whether that shot" in SYSTEM
+
+
+def test_system_prompt_makes_frames_primary_evidence_without_breaking_voice():
+    # Frames outrank the noisy 2D pose numbers when both exist...
+    assert "PRIMARY" in SYSTEM
+    # ...visible evidence may override a null metric (but never fabrication)...
+    assert "not describing what is visibly in front of you" in SYSTEM
+    # ...and the coach voice never breaks the fourth wall about images/AI.
+    assert "never mention frames, images, crops, cameras" in SYSTEM
 
 
 if __name__ == "__main__":

@@ -65,12 +65,16 @@ Separate from the discrepancy feedback report (`analysis/reporter.py`).
 ### Flow
 1. Pass 2 finishes → pipeline chains a `contacts` job (must be its own job so Pass 2 is already `done` for the readiness gate).
 2. Contact detection: adaptive wrist-speed peaks from Pass 2 pose overlays (not ball/bounce). Min gap ≥0.35s; serve flag via formation. Also available via `POST .../detect-contacts`.
-3. User clicks **Generate report** → feature vectors → category ratios + worst/best shots → **one** Anthropic call (`ANTHROPIC_REPORT_MODEL`) → persist `coaching_reports`.
+3. User clicks **Generate report** → feature vectors → category ratios + worst/best shots → **one** Anthropic call (`ANTHROPIC_COACHING_MODEL`, default Sonnet — deliberately heavier than the discrepancy report's `ANTHROPIC_REPORT_MODEL`) → persist `coaching_reports` (`tips_json` + `themes_json`).
+   The single call also receives `session_context` (per-player whole-session flag counts, from every scored shot, not just the ≤`MAX_TIPS` shown) and returns one per-player session **theme** alongside the per-shot tips. At the LLM boundary only, `contact_height_m` is renamed `distance_from_net_m` (see caveat below) — DB/UI keep the internal name.
+   **Vision context** (`rallyanalysis/keyframes.py`): the same call carries JPEG crops of the hitting player (prep/contact/follow-through, cropped via overlay boxes, ≤512px) for each selected tip candidate only — extracted fresh from `videos.path`, never persisted. Frames are the model's primary evidence; the pose metrics corroborate. Missing/unopenable video degrades to the frameless call (frames are an upgrade, never a dependency).
+   **Shot-type stratified baselines + rally outcome** (`rallyanalysis/shot_context.py`): each contact gets an in-memory `shot_type` (court zone × soft/fast tempo relative to that player's own session median wrist speed — a stratification key, not a stroke label) and rally context (`rally_shot_index`/`count`, `is_rally_ending`, `seconds_until_rally_end`; annotated before serve exclusion so serve = shot 1). `deviation_score` is judged against the player's own same-shot-type shots when the stratum has ≥3 samples, else falls back to their all-shots fence, flagged in `mixed_baseline_metrics`. Whether a rally-ending shot was a winner or an error is unknowable from pose — prompt forbids asserting either. Nothing here is written to `contact_events` (in-memory, same pattern as `merge_singles_players`). Zone helper moved to `shot_context.py`; `report_stats` re-exports it.
 
 ### Categories / flags
 Per contact: knee bend, shoulder rotation, elbow extension, weight transfer, contact-height proxy, follow-through, split-step delay.  
 Buckets: `footwork`, `paddle_prep`, `contact_point`, `follow_through`.  
 Worst/best are adaptive (deviation thresholds), not fixed top-N.  
+**Tip selection (2026-08-04):** flagged shots are ranked by **salience** = |deviation| + rally-ending bonus + multi-metric-agreement bonus (`coaching._salience`), not raw deviation. Praise = per-player **exemplar** (their cleanest in-range shot in their most-flagged category, `exemplar_of_category`; ≤1/player, ≤`MAX_PRAISE_TIPS`=2 total) — the old detection-confidence "best shot" pick is gone. The LLM receives up to `MAX_LLM_CANDIDATES`=16 candidates and makes the frame-informed **final cut** to ≤`MAX_TIPS`=8 (may skip pose-noise shots); `build_report` hard-caps regardless. Per-tip 👍/👎 lands in `tip_feedback` (snapshot of category/tone/text; upsert on re-rate) — the measured hit-rate for selection changes.  
 **Caveat:** `contact_height_m` is `court_y - NET_Y` (ground-plane proxy), not true height — ranges are coach-tunable defaults.
 
 ### Player attribution + singles/doubles
@@ -89,11 +93,14 @@ been removed from this feature — coaching tips are now the only Rally Analysis
 | Method | Path | Behavior |
 |---|---|---|
 | GET | `/rally-analysis/health` | Liveness |
+| POST | `/rally-analysis/{id}/process-single-rally` | Pre-trimmed single-rally clip fast path: whole clip becomes one pass1 rally label, Pass 2 submitted directly (skips Pass 1 rally detection; replaces existing pass1 labels — single-rally clips only) |
 | POST | `/rally-analysis/{id}/detect-contacts` | Run + replace `contact_events` |
 | GET | `/rally-analysis/{id}/contact-events` | List contacts |
 | GET | `/rally-analysis/{id}/readiness` | Per-rally Pass 2 readiness |
-| POST | `/rally-analysis/{id}/coaching-report` | Generate + persist (1 Anthropic call); returns `{video_id, tips, players}` |
+| POST | `/rally-analysis/{id}/coaching-report` | Generate + persist (1 Anthropic call); returns `{video_id, tips, players, player_themes}` |
 | GET | `/rally-analysis/{id}/coaching-report` | Cached report or `{report: null}` |
+| POST | `/rally-analysis/{id}/tip-feedback` | Store per-tip 👍/👎 `{contact_id, rating: 1\|-1, category?, tone?, tip?}` (upsert per video+contact) |
+| GET | `/rally-analysis/{id}/tip-feedback` | `{ratings: {contact_id: rating}, summary: {helpful, not_helpful}}` |
 | PATCH | `/videos/{id}` | Set per-clip metadata (currently `match_type`) |
 
 UI: `frontend/src/RallyAnalysis/RallyAnalysisPanel.jsx` — singles/doubles toggle, Generate/Regenerate, a

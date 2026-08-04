@@ -198,6 +198,22 @@ CREATE TABLE IF NOT EXISTS coaching_selections (
   created_at REAL NOT NULL
 );
 
+-- Per-tip user feedback (thumbs up/down in the Rally Analysis UI). Keyed by
+-- (video_id, contact_id) so re-rating replaces the prior verdict; category/
+-- tone/tip_text are SNAPSHOTS taken at rating time so the signal survives
+-- report regeneration (which replaces coaching_reports wholesale) and stays
+-- analyzable per-category even after contacts are re-detected.
+CREATE TABLE IF NOT EXISTS tip_feedback (
+  video_id TEXT NOT NULL,
+  contact_id TEXT NOT NULL,
+  rating INTEGER NOT NULL,          -- 1 = helpful, -1 = not helpful
+  category TEXT,
+  tone TEXT,
+  tip_text TEXT,
+  created_at REAL NOT NULL,
+  PRIMARY KEY (video_id, contact_id)
+);
+
 CREATE TABLE IF NOT EXISTS model_registry (
   version INTEGER PRIMARY KEY AUTOINCREMENT,
   kind TEXT NOT NULL,               -- 'rally_end' | 'serve_start' | 'tracknet'
@@ -235,6 +251,11 @@ _ADDED_COLUMNS = [
     # backfill in init_db below). TEXT rather than a single-purpose boolean so
     # a future different staleness reason doesn't need its own new column.
     ("coaching_reports", "stale_reason", "TEXT"),
+    # JSON [{player_id, player_label, theme}] — one per-player session theme
+    # from the same single coaching LLM call as tips_json. NULL/absent on
+    # reports generated before themes existed (rendered as "no theme", never
+    # backfilled — regenerating the report is the upgrade path).
+    ("coaching_reports", "themes_json", "TEXT"),
 ]
 
 STALE_BEFORE_CONFIDENCE_FIX = "generated_before_confidence_fix"

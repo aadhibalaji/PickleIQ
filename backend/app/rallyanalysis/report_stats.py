@@ -17,26 +17,11 @@ from ..cv.court import KITCHEN, NET_Y
 from .coaching import merge_singles_players
 from .readiness import default_overlay_source, get_analyzable_rallies
 
-# ---------------------------------------------------------------------------
-# Court-depth zones for stat 3 — derived from the same court constants used
-# everywhere else (cv/court.py), not hardcoded dimensions. The half-court
-# from net to baseline is NET_Y metres; KITCHEN of that (nearest the net) is
-# the non-volley zone. The remaining distance out to the baseline is split
-# into two equal-width bands: "midcourt" (closer to the kitchen line) and
-# "backcourt" (closer to the baseline).
-# ---------------------------------------------------------------------------
-ZONE_KITCHEN, ZONE_MIDCOURT, ZONE_BACKCOURT = "kitchen", "midcourt", "backcourt"
-_REMAINING_HALF = NET_Y - KITCHEN          # baseline-to-kitchen-line distance
-_MID_BACK_CUTOFF = KITCHEN + _REMAINING_HALF / 2.0  # distance-from-net cutoff
-
-
-def _zone_for_court_y(court_y: float) -> str:
-    dist_from_net = abs(court_y - NET_Y)
-    if dist_from_net <= KITCHEN:
-        return ZONE_KITCHEN
-    if dist_from_net <= _MID_BACK_CUTOFF:
-        return ZONE_MIDCOURT
-    return ZONE_BACKCOURT
+# Court-depth zones moved to shot_context.py (now shared with the coaching
+# shot-type classifier) — re-exported here under the original names so
+# existing imports/tests keep working unchanged.
+from .shot_context import (ZONE_BACKCOURT, ZONE_KITCHEN, ZONE_MIDCOURT,  # noqa: F401
+                            zone_for_court_y as _zone_for_court_y)
 
 
 # ---------------------------------------------------------------------------

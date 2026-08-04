@@ -69,6 +69,24 @@ class ShotFeatureVector:
     # itself is trusted here, there's just no personal baseline to compare it
     # against yet.
     no_comparison_metrics: list = field(default_factory=list)
+    # Coarse pose-derived stratification key ("kitchen_soft",
+    # "backcourt_fast", zone-only "midcourt", ...) — see
+    # shot_context.classify_shot_types. None = couldn't be typed (no court
+    # position). A stratification key, NOT a verified stroke label.
+    shot_type: str | None = None
+    # Metrics whose deviation_score comparison fell back to the player's
+    # ALL-shots baseline because their same-shot-type stratum didn't have
+    # enough samples this session (or the shot couldn't be typed at all).
+    # Distinct from no_comparison_metrics: a comparison DID happen here, it
+    # just mixes shot types — cross-type claims ("short follow-through" on a
+    # dink judged against drives) should be made more cautiously downstream.
+    mixed_baseline_metrics: list = field(default_factory=list)
+    # Names of metrics that deviated (non-zero _rel_dev) on this shot — not
+    # just the single worst one that picked the category. Multiple metrics
+    # deviating together is strong evidence of a real form breakdown rather
+    # than one noisy keypoint reading; coaching._salience uses the count to
+    # rank tip candidates.
+    deviating_metrics: list = field(default_factory=list)
 
 
 @dataclass
@@ -87,10 +105,23 @@ class CoachingTip:
 
 
 @dataclass
+class PlayerTheme:
+    """One per player per report: the session's dominant pattern for that
+    player in coach language, produced by the same single LLM call as the
+    tips. player_id/player_label are attached from our own contact_events
+    data (the model's echoed label is only used to match, never trusted as
+    attribution — see coaching.build_report)."""
+    player_id: int
+    player_label: str
+    theme: str
+
+
+@dataclass
 class CoachingReport:
     """One per video, generated once (explicit user action — LLM call)."""
     video_id: str
     tips: list = field(default_factory=list)  # list[CoachingTip]
+    player_themes: list = field(default_factory=list)  # list[PlayerTheme]
     # None = current (built on the confidence-aware pipeline). Otherwise a
     # short machine-readable reason this report predates a data-accuracy fix
     # and may contain fabricated feature values — see db.STALE_BEFORE_CONFIDENCE_FIX.
