@@ -79,11 +79,39 @@ WORST_DEVIATION_THRESHOLD = 1.0  # |deviation_score| >= this many of the PLAYER'
                                    # own fence baked into _rel_dev's normalization), not a
                                    # fixed top-N count: a clean session naturally clears
                                    # 0-1 shots, a rough one can clear many.
-K_STD_BEST = 0.5          # best-shot z-score threshold over confidence (in-range shots only)
-MIN_BEST_CONFIDENCE = 0.3
+MIN_BEST_CONFIDENCE = 0.3  # absolute floor: a barely-detected contact is never held up as exemplary
 
-MAX_TIPS = 8       # keeps the UI list short and readable regardless of rally count
-MAX_PRAISE_TIPS = 3  # reserves most of the cap for actionable ("improve") tips
+MAX_TIPS = 8       # hard cap on TIPS SHOWN — keeps the UI list deep enough to
+                    # matter but never overwhelming. Also written into the LLM
+                    # prompt's selection budget (see SYSTEM) — keep in sync.
+MAX_PRAISE_TIPS = 2  # total praise across the report (and never more than one
+                      # per player) — the cap exists to spend slots on flaws
+MAX_LLM_CANDIDATES = 16  # statistical shortlist size handed to the LLM, which
+                          # makes the final cut down to MAX_TIPS using the
+                          # frames (see build_report / SYSTEM selection rules)
+
+# ---------------------------------------------------------------------------
+# Salience — ranks WHICH flagged shots deserve one of the MAX_TIPS slots.
+# Deviation magnitude alone finds "most atypical", not "most obviously a
+# mistake"; these bonuses close part of that gap: a shot the rally ended on
+# is far more likely an actual error than an equal mid-rally outlier, and
+# several metrics deviating together is a real form breakdown, where a
+# single-metric outlier is often one noisy keypoint. Units are IQR-widths
+# (same scale as deviation_score) so the bonuses stay comparable.
+# ---------------------------------------------------------------------------
+RALLY_ENDING_BONUS = 1.0
+MULTI_METRIC_BONUS = 0.5   # per deviating metric beyond the first
+MULTI_METRIC_BONUS_CAP = 2  # at most this many bonus-earning extra metrics
+
+# category -> the ShotFeatureVector metric fields that drive it. Single
+# source of truth shared by _classify (category assignment) and the praise
+# exemplar picker (does this in-range shot have a REAL reading to praise?).
+CATEGORY_METRICS = {
+    "footwork": ("split_step_delay_s", "knee_bend_deg"),
+    "paddle_prep": ("shoulder_rotation_deg",),
+    "contact_point": ("elbow_extension_deg", "weight_transfer_score", "contact_height_m"),
+    "follow_through": ("follow_through_completion_score",),
+}
 
 MIN_TIP_GAP_S = 4.0  # minimum spacing, in seconds, between two selected tip
                       # moments for the SAME player (worst+best combined, any
@@ -380,13 +408,8 @@ def _classify(devs: dict[str, float | None]) -> tuple[str | None, float | None]:
     compute_category_ratios). Returns (None, None) only if literally no
     category has any real metric (compute_feature_vector treats that as
     unscoreable, same as no pose data at all)."""
-    per_category = {
-        "footwork": [devs["split_step_delay_s"], devs["knee_bend_deg"]],
-        "paddle_prep": [devs["shoulder_rotation_deg"]],
-        "contact_point": [devs["elbow_extension_deg"], devs["weight_transfer_score"],
-                           devs["contact_height_m"]],
-        "follow_through": [devs["follow_through_completion_score"]],
-    }
+    per_category = {cat: [devs[f] for f in fields]
+                    for cat, fields in CATEGORY_METRICS.items()}
     category_dev = {}
     for cat, ds in per_category.items():
         real = [d for d in ds if d is not None]
@@ -465,6 +488,7 @@ def _finalize_vector(contact: dict, raw: dict, fences: dict,
     category, deviation_score = _classify(devs)
     if category is None:
         return None
+    deviating_metrics = [f for f, d in devs.items() if d is not None and d != 0.0]
     no_comparison_metrics = [f for f in METRIC_FIELDS
                               if raw[f] is not None
                               and stratum_fences.get(f) is None and fences.get(f) is None]
@@ -478,7 +502,8 @@ def _finalize_vector(contact: dict, raw: dict, fences: dict,
         low_confidence_metrics=raw["low_confidence_metrics"],
         no_comparison_metrics=no_comparison_metrics,
         shot_type=contact.get("shot_type"),
-        mixed_baseline_metrics=mixed_baseline_metrics)
+        mixed_baseline_metrics=mixed_baseline_metrics,
+        deviating_metrics=deviating_metrics)
 
 
 def compute_feature_vector(contact: dict, entries: list[dict], fps: float,
@@ -508,6 +533,20 @@ def player_label(player_id) -> str:
     return f"Player {player_id}"
 
 
+def _salience(vec: ShotFeatureVector, contact: dict) -> float:
+    """How strongly this shot deserves a tip slot — |deviation| plus a bonus
+    when the rally ended on it (likely an actual error, not just an atypical
+    motion) and when multiple independent metrics deviated together (a real
+    form breakdown, not one noisy keypoint). Ranking only — the flagged/not
+    threshold stays WORST_DEVIATION_THRESHOLD on raw deviation."""
+    s = abs(vec.deviation_score)
+    if contact.get("is_rally_ending"):
+        s += RALLY_ENDING_BONUS
+    extra = max(0, len(vec.deviating_metrics) - 1)
+    s += MULTI_METRIC_BONUS * min(extra, MULTI_METRIC_BONUS_CAP)
+    return s
+
+
 def _shot_summary(vec: ShotFeatureVector, contact: dict) -> dict:
     return {
         "contact_id": vec.contact_id,
@@ -531,6 +570,15 @@ def _shot_summary(vec: ShotFeatureVector, contact: dict) -> dict:
         "rally_shot_count": contact.get("rally_shot_count"),
         "is_rally_ending": bool(contact.get("is_rally_ending")),
         "seconds_until_rally_end": contact.get("seconds_until_rally_end"),
+        # Ranking signal (see _salience) + which metrics actually deviated —
+        # both surfaced so the LLM's final cut and any eval tooling can see
+        # WHY a shot ranked where it did.
+        "salience": _salience(vec, contact),
+        "deviating_metrics": list(vec.deviating_metrics),
+        # Set only on praise candidates by _select_praise_exemplars: the
+        # category this shot exemplifies done WELL (the player's most-flagged
+        # category). None on improve candidates.
+        "exemplar_of_category": None,
         # Surfaced at top level (not just nested in feature_vector) so the LLM
         # prompt, the UI, and any aggregate stats can all see at a glance
         # which metrics this shot has NO confident reading for, without
@@ -548,13 +596,13 @@ def _suppress_close_duplicates(worst: list[dict], best: list[dict]) -> tuple[lis
     player a second apart are near-duplicates regardless of category) whose
     timestamp_s fall within MIN_TIP_GAP_S of each other. Different players are
     never suppressed against each other. Greedy by rank: process candidates
-    most-instructive-first (worst before best; within a type, larger
-    |deviation_score| or higher confidence first) and keep a candidate only if
+    most-instructive-first (worst before best; within a type, higher
+    salience or higher confidence first) and keep a candidate only if
     no already-kept candidate for the same player is within the gap. A
     candidate with no timestamp_s is never suppressed and never suppresses
     another (missing metric, not "close")."""
     ranked = (
-        [(0, -abs(s["deviation_score"]), s) for s in worst]
+        [(0, -s["salience"], s) for s in worst]
         + [(1, -(s.get("confidence") or 0.0), s) for s in best]
     )
     ranked.sort(key=lambda r: (r[0], r[1]))
@@ -575,84 +623,131 @@ def _suppress_close_duplicates(worst: list[dict], best: list[dict]) -> tuple[lis
             [s for s in best if s["contact_id"] in kept_ids])
 
 
+def _select_praise_exemplars(vectors_meta: list[tuple[ShotFeatureVector, dict]],
+                              worst_summaries: list[dict]) -> list[dict]:
+    """At most ONE praise candidate per player, at most MAX_PRAISE_TIPS
+    total — chosen to be pedagogically CONNECTED to that player's flaws, not
+    random encouragement: the exemplar is their most confident in-range shot
+    that has a REAL (non-null) reading in their MOST-FLAGGED category, i.e.
+    "this is what your footwork looks like when it's right". Its summary
+    category is re-pointed at that category (exemplar_of_category marks it)
+    so the tip lines up with the improve tips it reinforces.
+
+    A player with no flagged shots (clean session) still gets a plain
+    highest-confidence exemplar — encouragement isn't dropped, just
+    deprioritized: when total praise exceeds MAX_PRAISE_TIPS, players with
+    MORE flagged shots keep their exemplar first (their praise is doing
+    teaching work). A player with no qualifying in-range shot simply gets
+    none — never fabricated. This replaces the old detection-confidence
+    z-score "best shot" pick, which measured wrist-peak detection strength,
+    not shot quality."""
+    flagged_cats_by_player: dict = {}
+    for s in worst_summaries:
+        flagged_cats_by_player.setdefault(s["player_id"], []).append(s["category"])
+
+    in_range_by_player: dict = {}
+    for vec, contact in vectors_meta:
+        if vec.deviation_score == 0.0:
+            in_range_by_player.setdefault(contact.get("player_id"), []).append((vec, contact))
+
+    prioritized = []  # (n_flagged, confidence, summary)
+    for pid, shots in in_range_by_player.items():
+        flagged = flagged_cats_by_player.get(pid, [])
+        target_cat = max(set(flagged), key=flagged.count) if flagged else None
+        candidates = []
+        for vec, contact in shots:
+            conf = float(contact.get("confidence") or 0.0)
+            if conf < MIN_BEST_CONFIDENCE:
+                continue
+            if target_cat and all(getattr(vec, f) is None for f in CATEGORY_METRICS[target_cat]):
+                continue  # nothing real to praise in the category that matters
+            candidates.append((conf, vec, contact))
+        if not candidates:
+            continue
+        conf, vec, contact = max(candidates, key=lambda c: c[0])
+        summary = _shot_summary(vec, contact)
+        if target_cat:
+            summary["category"] = target_cat
+            summary["exemplar_of_category"] = target_cat
+        prioritized.append((len(flagged), conf, summary))
+
+    prioritized.sort(key=lambda t: (-t[0], -t[1]))
+    return [summary for _n, _c, summary in prioritized[:MAX_PRAISE_TIPS]]
+
+
 def select_worst_best(vectors_meta: list[tuple[ShotFeatureVector, dict]]) -> tuple[list[dict], list[dict]]:
     """Adaptive severity selection — NOT a fixed top-N. worst_shots: shots
     whose |deviation_score| clears WORST_DEVIATION_THRESHOLD reference-range-
     widths beyond their category's own good-form bound (deviation_score is
     already normalized per-category, so the same threshold constant is an
-    adaptive-per-category bar, not an absolute one). best_shots: in-range
-    shots (deviation_score == 0) whose detection confidence clears
-    mean + K_STD_BEST * std of confidence among this video's in-range shots,
-    with an absolute confidence floor so a low-confidence "in range"
-    detection never gets held up as exemplary. A clean session can surface
-    0-1 worst shots; a rough one can surface many — count is whatever
-    clears the bar, never a fixed N."""
+    adaptive-per-category bar, not an absolute one); they carry a salience
+    score (deviation + rally-ending + multi-metric bonuses, see _salience)
+    that downstream ranking uses. best_shots: per-player praise exemplars
+    tied to each player's most-flagged category (see
+    _select_praise_exemplars). A clean session can surface 0-1 worst shots;
+    a rough one can surface many — count is whatever clears the bar, never
+    a fixed N."""
     if not vectors_meta:
         return [], []
 
     worst = [_shot_summary(vec, contact) for vec, contact in vectors_meta
              if abs(vec.deviation_score) >= WORST_DEVIATION_THRESHOLD]
-
-    in_range = [(vec, contact) for vec, contact in vectors_meta if vec.deviation_score == 0.0]
-    best = []
-    if in_range:
-        confs = np.array([float(contact.get("confidence") or 0.0) for _vec, contact in in_range])
-        threshold = confs.mean() + K_STD_BEST * confs.std()
-        for (vec, contact), conf in zip(in_range, confs):
-            if conf >= threshold and conf >= MIN_BEST_CONFIDENCE:
-                best.append(_shot_summary(vec, contact))
-
+    best = _select_praise_exemplars(vectors_meta, worst)
     return _suppress_close_duplicates(worst, best)
 
 
-def select_tip_candidates(vectors_meta: list[tuple[ShotFeatureVector, dict]]) -> list[dict]:
-    """Bounds select_worst_best's adaptive output to at most MAX_TIPS shots so
-    the tip list stays short — worst shots (the actionable ones) get
-    priority, with at most MAX_PRAISE_TIPS praise slots reserved so a clean
-    session still surfaces some encouragement rather than an empty list.
+def select_tip_candidates(vectors_meta: list[tuple[ShotFeatureVector, dict]],
+                           limit: int = MAX_TIPS) -> list[dict]:
+    """Bounds select_worst_best's adaptive output to at most `limit` shots —
+    worst shots (the actionable ones) get priority, ranked by SALIENCE (not
+    raw deviation — see _salience: rally-ending mistakes and multi-metric
+    breakdowns outrank equal-magnitude single-metric outliers), with at most
+    MAX_PRAISE_TIPS exemplar praise slots so a clean session still surfaces
+    some encouragement rather than an empty list.
+
+    limit defaults to MAX_TIPS (the UI budget); build_report passes
+    MAX_LLM_CANDIDATES instead so the LLM — which can see the frames — makes
+    the final cut down to MAX_TIPS (see the SYSTEM selection rules).
 
     Budget is split as evenly as practical across the distinct players
     present (not hardcoded to 2 or 4 — a video may carry any count,
     especially before Part 0's singles-merge stopgap runs). A player short on
     notable contacts simply yields their unused share back to the pool
-    rather than getting a padded/fabricated tip."""
+    rather than getting a padded/fabricated tip. Returned order is improve
+    tips salience-first, praise last — build_report relies on that when
+    hard-capping the LLM's output back to MAX_TIPS."""
     worst, best = select_worst_best(vectors_meta)
-    worst = sorted(worst, key=lambda s: -abs(s["deviation_score"]))
+    worst = sorted(worst, key=lambda s: -s["salience"])
     best = sorted(best, key=lambda s: -(s.get("confidence") or 0.0))
     players = sorted({s["player_id"] for s in worst + best})
     if not players:
         return []
 
-    per_player = max(1, MAX_TIPS // len(players))
-    per_player_praise = max(1, MAX_PRAISE_TIPS // len(players))
+    per_player = max(1, limit // len(players))
     selected: list[dict] = []
     used_ids: set[str] = set()
     for pid in players:
-        p_best = [s for s in best if s["player_id"] == pid][:per_player_praise]
+        p_best = [s for s in best if s["player_id"] == pid][:1]  # ≤1 praise per player by construction
         p_worst = [s for s in worst if s["player_id"] == pid][:max(0, per_player - len(p_best))]
         for s in p_worst + p_best:
             selected.append(s)
             used_ids.add(s["contact_id"])
 
     # Fill any budget left by players who didn't have enough candidates to
-    # fill their share, worst-first, then praise (still capped by MAX_TIPS
-    # and MAX_PRAISE_TIPS overall).
-    n_praise = sum(1 for s in selected if s["deviation_score"] == 0.0)
+    # fill their share, salience-first (best is already ≤MAX_PRAISE_TIPS
+    # total, so no praise re-fill is needed).
     for s in worst:
-        if len(selected) >= MAX_TIPS:
+        if len(selected) >= limit:
             break
         if s["contact_id"] not in used_ids:
             selected.append(s)
             used_ids.add(s["contact_id"])
-    for s in best:
-        if len(selected) >= MAX_TIPS or n_praise >= MAX_PRAISE_TIPS:
-            break
-        if s["contact_id"] not in used_ids:
-            selected.append(s)
-            used_ids.add(s["contact_id"])
-            n_praise += 1
 
-    return selected[:MAX_TIPS]
+    # Improve tips salience-first, praise at the end, capped at limit.
+    improve = sorted([s for s in selected if s["deviation_score"] != 0.0],
+                     key=lambda s: -s["salience"])
+    praise = [s for s in selected if s["deviation_score"] == 0.0]
+    return (improve + praise)[:limit]
 
 
 # ---------------------------------------------------------------------------
@@ -680,13 +775,15 @@ def _llm_shot_payload(shot: dict) -> dict:
 
     out = dict(shot)
     fv = shot.get("feature_vector")
+    metric_list_keys = ("low_confidence_metrics", "no_comparison_metrics",
+                         "mixed_baseline_metrics", "deviating_metrics")
     if fv:
         fv = {LLM_METRIC_NAMES.get(k, k): v for k, v in fv.items()}
-        for key in ("low_confidence_metrics", "no_comparison_metrics"):
+        for key in metric_list_keys:
             if fv.get(key):
                 fv[key] = rename_list(fv[key])
         out["feature_vector"] = fv
-    for key in ("low_confidence_metrics", "no_comparison_metrics"):
+    for key in metric_list_keys:
         if out.get(key):
             out[key] = rename_list(out[key])
     return out
@@ -945,13 +1042,14 @@ Notice the critique itself (low weight transfer, low contact point, the
 fix) is exactly as specific and direct in both versions — only the framing
 around it changed.
 
-For each shot given a deviation_score != 0, write one "improve" tip: what to
-change and a bit of why it matters, in 2-3 short sentences, concrete,
-critical where warranted, and encouraging in tone rather than content. For
-each shot with deviation_score == 0, write one "praise" tip: what they're
-doing well and why it works, so they know what to keep doing. Return exactly
-one tip per shot you were given, each referencing that shot's contact_id so
-it can be matched back up.
+For each shot you SELECT (see the selection rules below) with a
+deviation_score != 0, write one "improve" tip: what to change and a bit of
+why it matters, in 2-3 short sentences, concrete, critical where warranted,
+and encouraging in tone rather than content. For each selected shot with
+deviation_score == 0, write one "praise" tip: what they're doing well and
+why it works, so they know what to keep doing. Return exactly one tip per
+SELECTED shot, each referencing that shot's contact_id so it can be matched
+back up; shots you don't select simply get no entry.
 
 Also return player_themes: exactly one entry per distinct player_label
 present in the shots, and none for any label not present. Each theme is 1-2
@@ -964,7 +1062,31 @@ above — no raw numbers, no anatomical terms, null and no-comparison
 discipline — apply to themes exactly as they do to tips.
 
 Do not overstate certainty — this is
-computer-vision-derived pose data, not a substitute for in-person coaching."""
+computer-vision-derived pose data, not a substitute for in-person coaching.
+
+""" + f"""THE FINAL CUT IS YOURS. You may be given more shots than you
+should write about — up to {MAX_LLM_CANDIDATES} candidates, pre-ranked by a
+statistical salience score (larger deviations, rally-ending shots, and
+multi-metric breakdowns rank higher). The numbers cannot see the video; you
+can. Write tips for AT MOST {MAX_TIPS} shots total (praise included),
+choosing the most instructive coaching moments:
+  1. Prefer shots where the frames VISIBLY show the flagged problem — a
+     mistake a player could see themselves making.
+  2. Prefer rally-ending mistakes (is_rally_ending) — the moments that
+     cost points teach best.
+  3. Prefer covering each player and their recurring theme over piling
+     several tips onto one issue.
+SKIP a shot entirely — no tip at all — when its frames clearly contradict
+what the metrics claim (pose-tracking noise) or show nothing coachable;
+never write a tip you can't stand behind from the evidence you can see.
+Never exceed {MAX_TIPS} tips, and never more than one "praise" tip per
+player.
+
+A shot with exemplar_of_category set is a PRAISE candidate: that player's
+cleanest example of the category their flagged shots struggle with. If you
+select it, tone is "praise" and the tip should point at what doing that
+category well looks like for them, so it reinforces the improve tips
+rather than being generic encouragement."""
 
 
 def generate_llm_tips(shots: list[dict], stats_summary: dict | None = None,
@@ -1117,7 +1239,11 @@ def build_report(video_id: str, vectors_meta: list[tuple[ShotFeatureVector, dict
                   llm_fn=None, stats_summary: dict | None = None,
                   frames_fn=None) -> CoachingReport:
     llm_fn = llm_fn or generate_llm_tips
-    candidates = select_tip_candidates(vectors_meta)
+    # Hand the LLM a WIDER statistical shortlist than the tip budget — it can
+    # see the frames, so it makes the final cut down to MAX_TIPS (see the
+    # SYSTEM selection rules), dropping pose-noise false positives that the
+    # statistics alone can't distinguish from real mistakes.
+    candidates = select_tip_candidates(vectors_meta, limit=MAX_LLM_CANDIDATES)
     session_context = _session_context(vectors_meta)
     # frames_fn (candidates -> {contact_id: [{label, jpeg_b64}, ...]} | None)
     # is called AFTER selection so keyframes are only ever extracted for the
@@ -1154,13 +1280,17 @@ def build_report(video_id: str, vectors_meta: list[tuple[ShotFeatureVector, dict
     # Player attribution is our own data (contact_events.player_id), not
     # trusted from the model's echoed output — attach it here regardless of
     # what the LLM response contains.
+    # Candidates are ordered improve-by-salience then praise (see
+    # select_tip_candidates), so if the model ignores its selection budget
+    # and tips more than MAX_TIPS shots, the hard cap below keeps the most
+    # salient improve tips and drops praise/low-salience overflow first.
     tips = [
         CoachingTip(contact_id=c["contact_id"], frame=c["frame_idx"], timestamp_s=c["timestamp_s"],
                     category=c["category"], tip=tip_text[c["contact_id"]]["tip"],
                     tone=tip_text[c["contact_id"]]["tone"],
                     player_id=c["player_id"], player_label=c["player_label"])
         for c in candidates if c["contact_id"] in tip_text
-    ]
+    ][:MAX_TIPS]
     # Themes: the model's echoed player_label is only a JOIN KEY back to the
     # players we actually sent — an unrecognized/duplicated label is dropped
     # (first occurrence wins), and player_id always comes from our own

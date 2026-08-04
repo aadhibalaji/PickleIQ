@@ -113,6 +113,11 @@ export const api = {
     fetch(`/api/rally-analysis/${id}/coaching-report`, { method: 'POST' }).then(j),
   processSingleRally: (id) =>
     fetch(`/api/rally-analysis/${id}/process-single-rally`, { method: 'POST' }).then(j),
+  getTipFeedback: (id) => fetch(`/api/rally-analysis/${id}/tip-feedback`).then(j),
+  sendTipFeedback: (id, body) =>
+    fetch(`/api/rally-analysis/${id}/tip-feedback`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    }).then(j),
 
   chat: (videoId, messages) =>
     fetch('/api/chat', {

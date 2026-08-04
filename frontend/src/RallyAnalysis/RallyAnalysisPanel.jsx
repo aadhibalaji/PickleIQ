@@ -58,15 +58,30 @@ export default function RallyAnalysisPanel({ videoId, video, onUpdateVideo }) {
   const [selectedTip, setSelectedTip] = useState(null)
   const [stats, setStats] = useState(null)
   const [statsError, setStatsError] = useState(false)
+  // {contact_id: 1 | -1} — per-tip thumbs feedback, persisted server-side so
+  // tip-selection changes become a measurable hit-rate across reports.
+  const [tipFeedback, setTipFeedback] = useState({})
 
   useEffect(() => {
     api.getCoachingReport(videoId).then((r) => setReport(r.report)).catch(() => setReport(null))
     setStats(null)
     setStatsError(false)
     api.getReportStats(videoId).then((r) => setStats(r)).catch(() => setStatsError(true))
+    setTipFeedback({})
+    api.getTipFeedback(videoId).then((r) => setTipFeedback(r.ratings || {})).catch(() => {})
     setSelectedPlayer(ALL_PLAYERS)
     setSelectedTip(null)
   }, [videoId])
+
+  const onRateTip = (tip, rating) => {
+    // Optimistic update; re-clicking the active rating keeps it (simplest
+    // contract — the backend upserts, so repeat sends are harmless).
+    setTipFeedback((prev) => ({ ...prev, [tip.contact_id]: rating }))
+    api.sendTipFeedback(videoId, {
+      contact_id: tip.contact_id, rating,
+      category: tip.category, tone: tip.tone, tip: tip.tip,
+    }).catch(() => {})
+  }
 
   const onGenerateReport = () => {
     setGenerating(true)
@@ -188,7 +203,8 @@ export default function RallyAnalysisPanel({ videoId, video, onUpdateVideo }) {
               </div>
             )}
             <CoachingVideo videoId={videoId} tips={tips} selectedPlayer={selectedPlayer}
-                           selectedTip={selectedTip} onSelectTip={setSelectedTip} colorMap={colorMap} />
+                           selectedTip={selectedTip} onSelectTip={setSelectedTip} colorMap={colorMap}
+                           tipFeedback={tipFeedback} onRateTip={onRateTip} />
           </>
         )}
       </div>
@@ -214,7 +230,8 @@ export default function RallyAnalysisPanel({ videoId, video, onUpdateVideo }) {
 // Self-contained video + pin scrubber, independent of the shared Workspace
 // player (separate <video> element, own play/seek state) so the coaching
 // view can be scrubbed/pinned without disturbing Setup/Pass tab playback.
-function CoachingVideo({ videoId, tips, selectedPlayer, selectedTip, onSelectTip, colorMap }) {
+function CoachingVideo({ videoId, tips, selectedPlayer, selectedTip, onSelectTip, colorMap,
+                          tipFeedback, onRateTip }) {
   const videoRef = useRef(null)
   const [duration, setDuration] = useState(0)
 
@@ -285,6 +302,21 @@ function CoachingVideo({ videoId, tips, selectedPlayer, selectedTip, onSelectTip
             </span>
           </div>
           <p className="tip-card-text">{selectedTip.tip}</p>
+          <div className="tip-feedback">
+            <span className="tip-feedback-label">Was this tip helpful?</span>
+            <button
+              className={`tip-feedback-btn${tipFeedback?.[selectedTip.contact_id] === 1 ? ' active' : ''}`}
+              title="Helpful"
+              onClick={() => onRateTip?.(selectedTip, 1)}>
+              👍
+            </button>
+            <button
+              className={`tip-feedback-btn${tipFeedback?.[selectedTip.contact_id] === -1 ? ' active' : ''}`}
+              title="Not helpful"
+              onClick={() => onRateTip?.(selectedTip, -1)}>
+              👎
+            </button>
+          </div>
         </div>
       ) : (
         <div className="clip-list-empty">

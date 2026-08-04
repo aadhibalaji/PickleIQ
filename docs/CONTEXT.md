@@ -74,6 +74,7 @@ Separate from the discrepancy feedback report (`analysis/reporter.py`).
 Per contact: knee bend, shoulder rotation, elbow extension, weight transfer, contact-height proxy, follow-through, split-step delay.  
 Buckets: `footwork`, `paddle_prep`, `contact_point`, `follow_through`.  
 Worst/best are adaptive (deviation thresholds), not fixed top-N.  
+**Tip selection (2026-08-04):** flagged shots are ranked by **salience** = |deviation| + rally-ending bonus + multi-metric-agreement bonus (`coaching._salience`), not raw deviation. Praise = per-player **exemplar** (their cleanest in-range shot in their most-flagged category, `exemplar_of_category`; ≤1/player, ≤`MAX_PRAISE_TIPS`=2 total) — the old detection-confidence "best shot" pick is gone. The LLM receives up to `MAX_LLM_CANDIDATES`=16 candidates and makes the frame-informed **final cut** to ≤`MAX_TIPS`=8 (may skip pose-noise shots); `build_report` hard-caps regardless. Per-tip 👍/👎 lands in `tip_feedback` (snapshot of category/tone/text; upsert on re-rate) — the measured hit-rate for selection changes.  
 **Caveat:** `contact_height_m` is `court_y - NET_Y` (ground-plane proxy), not true height — ranges are coach-tunable defaults.
 
 ### Player attribution + singles/doubles
@@ -98,6 +99,8 @@ been removed from this feature — coaching tips are now the only Rally Analysis
 | GET | `/rally-analysis/{id}/readiness` | Per-rally Pass 2 readiness |
 | POST | `/rally-analysis/{id}/coaching-report` | Generate + persist (1 Anthropic call); returns `{video_id, tips, players, player_themes}` |
 | GET | `/rally-analysis/{id}/coaching-report` | Cached report or `{report: null}` |
+| POST | `/rally-analysis/{id}/tip-feedback` | Store per-tip 👍/👎 `{contact_id, rating: 1\|-1, category?, tone?, tip?}` (upsert per video+contact) |
+| GET | `/rally-analysis/{id}/tip-feedback` | `{ratings: {contact_id: rating}, summary: {helpful, not_helpful}}` |
 | PATCH | `/videos/{id}` | Set per-clip metadata (currently `match_type`) |
 
 UI: `frontend/src/RallyAnalysis/RallyAnalysisPanel.jsx` — singles/doubles toggle, Generate/Regenerate, a

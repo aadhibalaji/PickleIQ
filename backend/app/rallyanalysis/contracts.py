@@ -81,6 +81,12 @@ class ShotFeatureVector:
     # just mixes shot types — cross-type claims ("short follow-through" on a
     # dink judged against drives) should be made more cautiously downstream.
     mixed_baseline_metrics: list = field(default_factory=list)
+    # Names of metrics that deviated (non-zero _rel_dev) on this shot — not
+    # just the single worst one that picked the category. Multiple metrics
+    # deviating together is strong evidence of a real form breakdown rather
+    # than one noisy keypoint reading; coaching._salience uses the count to
+    # rank tip candidates.
+    deviating_metrics: list = field(default_factory=list)
 
 
 @dataclass

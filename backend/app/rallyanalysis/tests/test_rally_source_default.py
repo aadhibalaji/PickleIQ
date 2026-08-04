@@ -79,7 +79,8 @@ def test_generate_coaching_report_finds_pass1_only_rallies_by_default(monkeypatc
     # it to 1 here since this test isn't about relative-scoring behavior.
     monkeypatch.setattr(coaching, "MIN_SAMPLES_FOR_DISTRIBUTION", 1)
     monkeypatch.setattr(coaching, "select_tip_candidates",
-                         lambda vectors_meta: [coaching._shot_summary(vec, c) for vec, c in vectors_meta])
+                         lambda vectors_meta, limit=None: [coaching._shot_summary(vec, c)
+                                                            for vec, c in vectors_meta])
     monkeypatch.setattr(coaching, "generate_llm_tips",
                          lambda shots: {s["contact_id"]: {"tip": "t", "tone": "praise"} for s in shots})
 

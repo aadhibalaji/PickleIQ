@@ -182,6 +182,22 @@ CREATE TABLE IF NOT EXISTS coaching_reports (
   created_at REAL NOT NULL
 );
 
+-- Per-tip user feedback (thumbs up/down in the Rally Analysis UI). Keyed by
+-- (video_id, contact_id) so re-rating replaces the prior verdict; category/
+-- tone/tip_text are SNAPSHOTS taken at rating time so the signal survives
+-- report regeneration (which replaces coaching_reports wholesale) and stays
+-- analyzable per-category even after contacts are re-detected.
+CREATE TABLE IF NOT EXISTS tip_feedback (
+  video_id TEXT NOT NULL,
+  contact_id TEXT NOT NULL,
+  rating INTEGER NOT NULL,          -- 1 = helpful, -1 = not helpful
+  category TEXT,
+  tone TEXT,
+  tip_text TEXT,
+  created_at REAL NOT NULL,
+  PRIMARY KEY (video_id, contact_id)
+);
+
 CREATE TABLE IF NOT EXISTS model_registry (
   version INTEGER PRIMARY KEY AUTOINCREMENT,
   kind TEXT NOT NULL,               -- 'rally_end' | 'serve_start' | 'tracknet'

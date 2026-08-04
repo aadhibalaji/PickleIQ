@@ -264,8 +264,8 @@ def test_build_report_frames_fn_runs_on_candidates_only_and_feeds_llm_fn():
     vectors_meta = [(_vec(f"c{i}", "footwork", -3.0), _contact(f"c{i}", timestamp_s=i * 10.0))
                      for i in range(20)]
     build_report("vid1", vectors_meta, llm_fn=fake_llm, frames_fn=fake_frames)
-    # frames extracted only for the <=MAX_TIPS selected shots, never all 20
-    assert len(captured["frame_candidates"]) <= MAX_TIPS
+    # frames extracted only for the shortlisted candidates, never all 20
+    assert len(captured["frame_candidates"]) <= coaching.MAX_LLM_CANDIDATES
     assert set(captured["frames"]) == {c["contact_id"] for c in captured["frame_candidates"]}
 
 
@@ -287,7 +287,7 @@ def test_build_report_frames_fn_failure_degrades_to_frameless_call():
 
 def test_build_report_passes_whole_session_context_to_llm_fn():
     # session_context must cover EVERY scored shot (here: 12), not just the
-    # <=MAX_TIPS candidates that get individual tips.
+    # candidates that get individual tips.
     captured = {}
 
     def fake_llm(shots, stats=None, ctx=None):
@@ -299,7 +299,118 @@ def test_build_report_passes_whole_session_context_to_llm_fn():
                      for i in range(12)]
     build_report("vid1", vectors_meta, llm_fn=fake_llm)
     assert captured["ctx"]["Player 1"]["shots_analyzed"] == 12
-    assert len(captured["shots"]) <= MAX_TIPS
+    assert len(captured["shots"]) <= coaching.MAX_LLM_CANDIDATES
+
+
+def test_build_report_gives_llm_a_wider_shortlist_but_caps_tips_at_max():
+    # 20 flagged shots -> the LLM sees up to MAX_LLM_CANDIDATES of them (the
+    # widened shortlist for its frame-informed final cut), but even a model
+    # that ignores its selection budget and tips EVERYTHING gets hard-capped
+    # back to MAX_TIPS, keeping the most salient improve tips.
+    captured = {}
+
+    def greedy_llm(shots, stats=None, ctx=None):
+        captured["shots"] = shots
+        return {s["contact_id"]: {"tip": "t", "tone": "improve"} for s in shots}
+
+    vectors_meta = [(_vec(f"c{i}", "footwork", -2.0 - i * 0.1), _contact(f"c{i}", timestamp_s=i * 10.0))
+                     for i in range(20)]
+    report = build_report("vid1", vectors_meta, llm_fn=greedy_llm)
+    assert len(captured["shots"]) == coaching.MAX_LLM_CANDIDATES
+    assert len(report.tips) == MAX_TIPS
+    # hard cap keeps the top-salience shots (largest |deviation| here)
+    kept = {t.contact_id for t in report.tips}
+    assert "c19" in kept and "c0" not in kept
+
+
+# -------------------------------------------------------- salience ranking
+
+def test_salience_rally_ending_outranks_equal_midrally_outlier():
+    # Same deviation magnitude; the shot the rally ended on must win a slot
+    # over the mid-rally one when only one slot exists.
+    midrally = (_vec("midrally", "footwork", -2.0), _contact("midrally", timestamp_s=10.0))
+    ending = (_vec("ending", "footwork", -2.0),
+              {**_contact("ending", timestamp_s=100.0), "is_rally_ending": True})
+    candidates = select_tip_candidates([midrally, ending], limit=1)
+    assert [c["contact_id"] for c in candidates] == ["ending"]
+
+
+def test_salience_multi_metric_breakdown_outranks_single_metric_outlier():
+    # A slightly smaller deviation with THREE metrics deviating together beats
+    # a slightly larger single-metric outlier (likely one noisy keypoint).
+    single = _vec("single", "footwork", -2.2)
+    single.deviating_metrics = ["knee_bend_deg"]
+    multi = _vec("multi", "footwork", -2.0)
+    multi.deviating_metrics = ["knee_bend_deg", "split_step_delay_s", "weight_transfer_score"]
+    candidates = select_tip_candidates(
+        [(single, _contact("single", timestamp_s=10.0)),
+         (multi, _contact("multi", timestamp_s=100.0))], limit=1)
+    assert [c["contact_id"] for c in candidates] == ["multi"]
+
+
+def test_finalize_vector_records_all_deviating_metrics():
+    entries = [_pose_frame(90, _kp17(), [0.95] * 17),
+               _pose_frame(100, _kp17(), [0.95] * 17)]
+    raw = _extract_raw_metrics(_pose_contact(), entries, fps=30.0)
+    fences = {
+        # knee way outside its fence, shoulder inside its own
+        "knee_bend_deg": _robust_fence([raw["knee_bend_deg"] + 500.0] * MIN_SAMPLES_FOR_DISTRIBUTION),
+        "shoulder_rotation_deg": _robust_fence([raw["shoulder_rotation_deg"]] * MIN_SAMPLES_FOR_DISTRIBUTION),
+    }
+    vec = _finalize_vector(_pose_contact(), raw, fences, None)
+    assert "knee_bend_deg" in vec.deviating_metrics
+    assert "shoulder_rotation_deg" not in vec.deviating_metrics
+
+
+# --------------------------------------------------- exemplar praise picking
+
+def test_praise_exemplar_targets_players_most_flagged_category():
+    # Player 1's flags are 2x contact_point, 1x footwork -> the praise pick
+    # must exemplify contact_point, with its category re-pointed and
+    # exemplar_of_category set.
+    vectors_meta = [
+        (_vec("bad1", "contact_point", -2.0), _contact("bad1", timestamp_s=10.0)),
+        (_vec("bad2", "contact_point", -2.5), _contact("bad2", timestamp_s=20.0)),
+        (_vec("bad3", "footwork", -2.0), _contact("bad3", timestamp_s=30.0)),
+        (_vec("clean", "footwork", 0.0), _contact("clean", confidence=0.9, timestamp_s=100.0)),
+    ]
+    _worst, best = select_worst_best(vectors_meta)
+    assert len(best) == 1
+    assert best[0]["contact_id"] == "clean"
+    assert best[0]["category"] == "contact_point"
+    assert best[0]["exemplar_of_category"] == "contact_point"
+
+
+def test_praise_exemplar_never_picks_shot_with_no_real_reading_in_target_category():
+    # The only in-range shot has ALL contact_point metrics null -> it cannot
+    # exemplify contact_point; no praise is fabricated.
+    blind = _vec("blind", "footwork", 0.0)
+    blind.elbow_extension_deg = None
+    blind.weight_transfer_score = None
+    blind.contact_height_m = None
+    vectors_meta = [
+        (_vec("bad", "contact_point", -2.0), _contact("bad", timestamp_s=10.0)),
+        (blind, _contact("blind", confidence=0.9, timestamp_s=100.0)),
+    ]
+    _worst, best = select_worst_best(vectors_meta)
+    assert best == []
+
+
+def test_praise_capped_at_max_praise_tips_prioritizing_flagged_players():
+    # Three players with clean shots; only players 1 and 2 have flags.
+    # MAX_PRAISE_TIPS (2) exemplars total, and the flag-free player 3 loses
+    # the slot — their praise teaches nothing.
+    def meta(cid, pid, dev, ts):
+        return (_vec(cid, "footwork", dev), {**_contact(cid, confidence=0.9, timestamp_s=ts), "player_id": pid})
+
+    vectors_meta = [
+        meta("p1bad", 1, -2.0, 10.0), meta("p1clean", 1, 0.0, 50.0),
+        meta("p2bad", 2, -2.0, 20.0), meta("p2clean", 2, 0.0, 60.0),
+        meta("p3clean", 3, 0.0, 70.0),
+    ]
+    _worst, best = select_worst_best(vectors_meta)
+    assert len(best) == MAX_PRAISE_TIPS
+    assert {b["player_id"] for b in best} == {1, 2}
 
 
 # ------------------------------------------------- session context aggregates
@@ -405,6 +516,25 @@ def test_llm_shot_payload_renames_misleading_metric_names_everywhere():
 
 def test_llm_shot_payload_tolerates_bare_dicts():
     assert _llm_shot_payload({"contact_id": "c1"}) == {"contact_id": "c1"}
+
+
+def test_llm_shot_payload_renames_all_four_metric_name_lists():
+    shot = {"contact_id": "c1",
+            "mixed_baseline_metrics": ["contact_height_m"],
+            "deviating_metrics": ["contact_height_m", "knee_bend_deg"]}
+    out = _llm_shot_payload(shot)
+    assert out["mixed_baseline_metrics"] == ["distance_from_net_m"]
+    assert out["deviating_metrics"] == ["distance_from_net_m", "knee_bend_deg"]
+
+
+def test_system_prompt_gives_llm_the_final_cut_with_a_budget():
+    # Phase 2: the model receives a wider shortlist and must (a) know it can
+    # skip pose-noise shots, (b) never exceed the tip budget, (c) treat
+    # exemplar praise as connected to the player's flaws.
+    assert "THE FINAL CUT IS YOURS" in SYSTEM
+    assert f"AT MOST {MAX_TIPS} shots" in SYSTEM
+    assert "SKIP a shot entirely" in SYSTEM
+    assert "exemplar_of_category" in SYSTEM
 
 
 # --------------------------------------------------------- serve exclusion

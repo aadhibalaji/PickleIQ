@@ -114,6 +114,45 @@ def get_coaching_report(video_id: str):
     return {"video_id": video_id, "report": _report_payload(report) if report else None}
 
 
+@router.post("/rally-analysis/{video_id}/tip-feedback")
+def submit_tip_feedback(video_id: str, payload: dict):
+    """Stores one thumbs verdict for one tip: {contact_id, rating: 1|-1,
+    category?, tone?, tip?}. Re-rating the same tip replaces the prior row
+    (PRIMARY KEY (video_id, contact_id)); category/tone/tip text are
+    snapshotted so the signal stays analyzable after the report is
+    regenerated. This is the measurement layer for tip-selection quality —
+    see get_tip_feedback's aggregate."""
+    contact_id = payload.get("contact_id")
+    rating = payload.get("rating")
+    if not contact_id or rating not in (1, -1):
+        raise HTTPException(status_code=422,
+                            detail="contact_id and rating (1 or -1) are required")
+    with db.connect() as con:
+        con.execute(
+            "INSERT OR REPLACE INTO tip_feedback"
+            " (video_id, contact_id, rating, category, tone, tip_text, created_at)"
+            " VALUES (?,?,?,?,?,?,?)",
+            (video_id, contact_id, int(rating), payload.get("category"),
+             payload.get("tone"), payload.get("tip"), db.now()))
+    return {"video_id": video_id, "contact_id": contact_id, "rating": rating}
+
+
+@router.get("/rally-analysis/{video_id}/tip-feedback")
+def get_tip_feedback(video_id: str):
+    """{ratings: {contact_id: 1|-1}, summary: {helpful, not_helpful}} — the
+    ratings map restores button state in the UI; the summary is the report-
+    level hit-rate that turns tip-selection changes into a measurable number
+    instead of vibes."""
+    with db.connect() as con:
+        rows = con.execute(
+            "SELECT contact_id, rating FROM tip_feedback WHERE video_id=?",
+            (video_id,)).fetchall()
+    ratings = {r["contact_id"]: r["rating"] for r in rows}
+    return {"video_id": video_id, "ratings": ratings,
+            "summary": {"helpful": sum(1 for v in ratings.values() if v == 1),
+                         "not_helpful": sum(1 for v in ratings.values() if v == -1)}}
+
+
 @router.get("/rally-analysis/{video_id}/report-stats")
 def get_report_stats(video_id: str, source: str | None = None):
     """Aggregate coaching-report stats (forward momentum, kitchen arrival,
