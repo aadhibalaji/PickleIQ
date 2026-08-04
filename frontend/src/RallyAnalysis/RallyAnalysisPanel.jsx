@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { api } from '../api.js'
 import ShotHeatmap from './ShotHeatmap.jsx'
+import CoachingSelections from './CoachingSelections.jsx'
 import { buildPlayerColorMap, playerColor, labelToPlayerId } from './playerColors.js'
 
 const ALL_PLAYERS = 'all'
@@ -51,7 +52,7 @@ function assignLanes(blocks) {
   return { laneById, laneCount: laneEnds.length || 1 }
 }
 
-export default function RallyAnalysisPanel({ videoId, video, onUpdateVideo }) {
+export default function RallyAnalysisPanel({ videoId, video, onUpdateVideo, onSeek }) {
   const [report, setReport] = useState(null)
   const [generating, setGenerating] = useState(false)
   const [selectedPlayer, setSelectedPlayer] = useState(ALL_PLAYERS)
@@ -113,6 +114,8 @@ export default function RallyAnalysisPanel({ videoId, video, onUpdateVideo }) {
           </button>
         </div>
       </div>
+
+      <CoachingSelections videoId={videoId} fps={video?.fps || 30} onSeek={onSeek} />
 
       <div className="panel">
         <div className="row spread">

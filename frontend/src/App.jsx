@@ -2,36 +2,6 @@ import React, { useEffect, useState } from 'react'
 import { api } from './api.js'
 import Workspace from './Workspace.jsx'
 import Home from './Home.jsx'
-import PostPass1Selection from './app/PostPass1Selection.jsx'
-
-// Waits for Pass 1 to finish on the current video before handing off to the
-// selection screen — the 'app' flow's counterpart to Workspace.jsx's own job
-// poll, kept separate since this must never import from/touch Workspace.
-function AppFlow({ videoId }) {
-  const [video, setVideo] = useState(null)
-  useEffect(() => {
-    let stop = false
-    const tick = () => api.getVideo(videoId).then((v) => { if (!stop) setVideo(v) }).catch(() => {})
-    tick()
-    const t = setInterval(tick, 3000)
-    return () => { stop = true; clearInterval(t) }
-  }, [videoId])
-
-  if (!video) return <div className="muted">Loading…</div>
-  const pass1 = (video.jobs || []).find((j) => j.kind === 'pass1')
-  if (!pass1 || pass1.status === 'queued' || pass1.status === 'running') {
-    return (
-      <div className="panel">
-        <b>Finding rallies…</b>
-        <div className="muted">{pass1 ? (pass1.message || 'Pass 1 in progress') : 'waiting to start'}</div>
-      </div>
-    )
-  }
-  if (pass1.status === 'error') {
-    return <div className="error">Pass 1 failed: {pass1.message}</div>
-  }
-  return <PostPass1Selection videoId={videoId} />
-}
 
 export default function App() {
   const [view, setView] = useState('app') // 'app' | 'testing'
@@ -98,9 +68,7 @@ export default function App() {
     return (
       <div>
         {nav}
-        {current
-          ? <AppFlow videoId={current} />
-          : <Home videos={videos} current={current} onOpenTesting={() => setView('testing')} />}
+        <Home videos={videos} current={current} onOpenTesting={() => setView('testing')} />
       </div>
     )
   }
