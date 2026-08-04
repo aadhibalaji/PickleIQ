@@ -23,7 +23,7 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Callable
 
-from . import db, self_stop
+from . import config, db, self_stop
 
 log = logging.getLogger("jobs")
 
@@ -39,6 +39,10 @@ class Job:
     kind: str
     fn: Callable[["JobHandle"], None] = field(repr=False)
     cancel: threading.Event = field(default_factory=threading.Event, repr=False)
+    # Set by _loop when this job's timeout fires, so the (still-running,
+    # orphaned) worker thread's own status write — whatever it eventually
+    # does — doesn't clobber the 'error' status the timeout already recorded.
+    timed_out: threading.Event = field(default_factory=threading.Event, repr=False)
 
 
 class JobHandle:
@@ -146,6 +150,57 @@ class JobRunner:
                 (status, message, db.now(), job_id),
             )
 
+    def _run_job_body(self, job: Job) -> None:
+        """Runs job.fn and writes its terminal DB status. Split out of _loop
+        so it can run on its own thread — _loop then bounds it with
+        Thread.join(timeout) instead of blocking the single worker forever on
+        a hung job.fn (see module docstring: a job once hung ~22.8h with zero
+        output). Skips writing 'done'/'cancelled'/'error' if the timeout
+        already fired for this job (job.timed_out) — that status is final."""
+        try:
+            job.fn(JobHandle(job))
+            if not job.timed_out.is_set():
+                self._set_status(job.id, "done")
+        except JobCancelled:
+            if not job.timed_out.is_set():
+                self._set_status(job.id, "cancelled", "cancelled")
+                log.info("job %s (%s) cancelled", job.id, job.kind)
+        except Exception as exc:  # noqa: BLE001 — job errors must not kill the worker
+            if job.timed_out.is_set():
+                log.info("job %s (%s) raised after timing out (%s) — ignored, "
+                          "status already finalized", job.id, job.kind, exc)
+            else:
+                log.error("job %s (%s) failed:\n%s", job.id, job.kind, traceback.format_exc())
+                self._set_status(job.id, "error", f"{type(exc).__name__}: {exc}")
+
+    def _timeout_for(self, kind: str) -> float:
+        if kind == "pass1":
+            return config.JOB_TIMEOUT_PASS1_S
+        if kind == "pass2":
+            return config.JOB_TIMEOUT_PASS2_S
+        if kind.startswith("pass2_range_"):
+            return config.JOB_TIMEOUT_PASS2_RANGE_S
+        if kind == "contacts":
+            return config.JOB_TIMEOUT_CONTACTS_S
+        if kind == "learn":
+            return config.JOB_TIMEOUT_LEARN_S
+        return config.JOB_TIMEOUT_DEFAULT_S
+
+    def _on_timeout(self, job: Job) -> None:
+        message = "job exceeded timeout, likely hung"
+        self._set_status(job.id, "error", message)
+        log.error("job %s (%s) timed out — marked failed, queue continues", job.id, job.kind)
+        if job.kind.startswith("pass2_range_"):
+            # pass2_range jobs are keyed 1:1 with a coaching_selections row
+            # (see api/rally_analysis.py's process_selection) — that row must
+            # not be left stuck on 'processing' just because the job that was
+            # supposed to finish it hung. Lazy import: pipeline imports
+            # jobs.runner at module load, so a top-level import here would
+            # be circular.
+            from . import pipeline
+            selection_id = job.kind[len("pass2_range_"):]
+            pipeline._set_selection_status(selection_id, "failed", message)
+
     def _has_pending_work(self) -> bool:
         """DB-backed, independent of self._q's own in-memory state. submit()
         writes the jobs row (status='queued') BEFORE putting the Job onto
@@ -168,15 +223,21 @@ class JobRunner:
                     self._set_status(job.id, "cancelled", "cancelled before start")
                     continue
                 self._set_status(job.id, "running")
-                try:
-                    job.fn(JobHandle(job))
-                    self._set_status(job.id, "done")
-                except JobCancelled:
-                    self._set_status(job.id, "cancelled", "cancelled")
-                    log.info("job %s (%s) cancelled", job.id, job.kind)
-                except Exception as exc:  # noqa: BLE001 — job errors must not kill the worker
-                    log.error("job %s (%s) failed:\n%s", job.id, job.kind, traceback.format_exc())
-                    self._set_status(job.id, "error", f"{type(exc).__name__}: {exc}")
+                worker = threading.Thread(target=self._run_job_body, args=(job,),
+                                           daemon=True, name=f"job-{job.kind}")
+                worker.start()
+                worker.join(self._timeout_for(job.kind))
+                if worker.is_alive():
+                    job.timed_out.set()
+                    job.cancel.set()  # best-effort nudge — see JobHandle.update()
+                    self._on_timeout(job)
+                    # ponytail: the orphaned worker thread keeps running
+                    # detached in the background (no safe hard-kill for
+                    # threads in Python) and may still write DB rows/overlay
+                    # data after this point. Acceptable for a "don't hang
+                    # forever silently" safeguard; upgrade to a
+                    # process-per-job model (real kill) if stray writes from
+                    # a timed-out job ever bite in practice.
             finally:
                 with self._lock:
                     self._jobs.pop(job.id, None)

@@ -30,6 +30,12 @@ export const api = {
   cancelVideoJobs: (id) => fetch(`/api/videos/${id}/cancel`, { method: 'POST' }).then(j),
   streamUrl: (id) => `/api/videos/${id}/stream`,
 
+  getSelfStop: () => fetch('/api/self-stop').then(j),
+  setSelfStop: (enabled) =>
+    fetch('/api/self-stop', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled }),
+    }).then(j),
+
   getRallies: (id) => fetch(`/api/videos/${id}/rallies`).then(j),
   getRefined: (id, regenerate = 0) =>
     fetch(`/api/videos/${id}/refined${regenerate ? '?regenerate=1' : ''}`).then(j),
@@ -104,6 +110,15 @@ export const api = {
   promoteModel: (version) => fetch(`/api/models/${version}/promote`, { method: 'POST' }).then(j),
   rejectModel: (version) => fetch(`/api/models/${version}/reject`, { method: 'POST' }).then(j),
   getLearningCurve: (kind) => fetch(`/api/models/learning_curve${kind ? `?kind=${kind}` : ''}`).then(j),
+
+  getPass1Candidates: (id) => fetch(`/api/rally-analysis/${id}/pass1-candidates`).then(j),
+  listSelections: (id) => fetch(`/api/rally-analysis/${id}/selections`).then(j),
+  createSelections: (id, items) =>
+    fetch(`/api/rally-analysis/${id}/selections`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(items),
+    }).then(j),
+  processSelection: (id, selectionId) =>
+    fetch(`/api/rally-analysis/${id}/selections/${selectionId}/process`, { method: 'POST' }).then(j),
 
   getCoachingReport: (id) => fetch(`/api/rally-analysis/${id}/coaching-report`).then(j),
   getContactEvents: (id) => fetch(`/api/rally-analysis/${id}/contact-events`).then(j),

@@ -315,6 +315,27 @@ def download_calibration() -> dict | None:
     return _get_json(calibration_key())
 
 
+def self_stop_key() -> str:
+    return "self_stop/state.json"
+
+
+def upload_self_stop_state(enabled: bool) -> str:
+    """Mirrors the self-stop toggle to S3 so the EC2 worker's cloud_ingest
+    poller can pick it up (see cloud_ingest._sync_self_stop) — same reasoning
+    as upload_calibration/upload_refine_config: normally flipped through a
+    RUN_PROCESSING=0 UI-only container, whose local state the separate EC2
+    worker never otherwise sees. Called from api/media.py's set_self_stop."""
+    key = self_stop_key()
+    _put_json(key, {"enabled": bool(enabled)})
+    return key
+
+
+def download_self_stop_state() -> dict | None:
+    """None if the toggle has never been set from any S3-backed container —
+    expected, not an error; caller falls back to the local/default value."""
+    return _get_json(self_stop_key())
+
+
 def tracknet_weights_key() -> str:
     return "models/tracknet_v2.pt"
 

@@ -99,5 +99,26 @@ else:
 HW_PRECISION = _HW_PROFILE["precision"] if _HW_PROFILE else "fp16"
 HW_OPENVINO_ENABLED = _HW_PROFILE["openvino"] if _HW_PROFILE else True
 
+# Job timeout safeguard (jobs.py): a hung job used to sit in 'running'
+# forever with zero output/error (observed once: ~22.8h, nothing). These
+# bound how long any one job of a kind may run before jobs.py marks it
+# 'error' and lets the queue move on — generous enough not to false-positive
+# a real long Pass 2 run, bounded enough to catch a true hang. Override per
+# kind if a real workload routinely needs more.
+JOB_TIMEOUT_PASS1_S = int(os.getenv("JOB_TIMEOUT_PASS1_S", str(2 * 3600)))
+JOB_TIMEOUT_PASS2_S = int(os.getenv("JOB_TIMEOUT_PASS2_S", str(3 * 3600)))
+JOB_TIMEOUT_PASS2_RANGE_S = int(os.getenv("JOB_TIMEOUT_PASS2_RANGE_S", str(3600)))
+JOB_TIMEOUT_CONTACTS_S = int(os.getenv("JOB_TIMEOUT_CONTACTS_S", str(1800)))
+JOB_TIMEOUT_LEARN_S = int(os.getenv("JOB_TIMEOUT_LEARN_S", str(4 * 3600)))
+JOB_TIMEOUT_DEFAULT_S = int(os.getenv("JOB_TIMEOUT_DEFAULT_S", str(3 * 3600)))
+
+# EC2 self-stop toggle (self_stop.py / api/media.py): default True preserves
+# today's behavior (stop the instance once the job queue empties). Flipped
+# off during active testing so the instance doesn't disappear mid-session —
+# see self_stop.get_enabled/set_enabled for the S3-synced local state this
+# seeds.
+SELF_STOP_ENABLED_DEFAULT = os.getenv("SELF_STOP_ENABLED_DEFAULT", "1").strip().lower() not in (
+    "0", "false", "no", "")
+
 for _d in (DATA_DIR, VIDEO_DIR):
     _d.mkdir(parents=True, exist_ok=True)
