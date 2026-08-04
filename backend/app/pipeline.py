@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from . import db, results_export, storage_s3
-from .config import RUN_PROCESSING, STORAGE_BACKEND
+from .config import STORAGE_BACKEND
 from .cv import overlays
 from .cv.court import CameraModel
 from .cv.pass1 import run_pass1
@@ -477,63 +477,6 @@ def _build_do_pass2_range(video_id: str, params: dict, selection_id: str,
         _set_selection_status(selection_id, "ready")
 
     return do_pass2_range
-
-
-def _build_do_pass2_selections(video_id: str, params: dict, selections: list[dict]):
-    """Runs Pass 2 ONCE over every coaching_selections range the user has
-    included/drawn, instead of one job per selection (_build_do_pass2_range,
-    above) — a video with 15 accepted rallies used to queue 15 separate Pass
-    2 jobs; this queues exactly one, via _build_do_pass2's windows_override.
-
-    selections: rows with at least {id, start_frame, end_frame}. Writes to
-    the real "pass2" overlay source (this batch IS now the definitive Pass 2
-    run for the video, same as the old full-video auto-chain was) — so it
-    also chains refine + contacts + finish_chain via the plain _build_do_pass2
-    path, unlike _build_do_pass2_range's isolated ranges.
-
-    User-drawn selections need a rally_labels row for contacts/coaching
-    report/readiness to see them at all (those all key off rally_labels) —
-    callers must have already backfilled one (source='pass1', meta
-    user_drawn=True) before building this, see
-    api/rally_analysis.py's process_selections. That meta flag is what
-    load_pass1_windows filters on to keep them OUT of refine/keep-drop:
-    keep/drop grades Pass 1's own confidence in a candidate, which doesn't
-    exist for a range the user hand-drew themselves."""
-    windows = [(s["start_frame"], s["end_frame"]) for s in selections]
-    base = _build_do_pass2(video_id, params, windows_override=windows)
-
-    def do_pass2_selections(handle: JobHandle) -> None:
-        with db.connect() as con:
-            con.executemany(
-                "UPDATE coaching_selections SET status='processing', error_message=NULL"
-                " WHERE id=?", [(s["id"],) for s in selections])
-        try:
-            base(handle)
-        except Exception as exc:
-            with db.connect() as con:
-                con.executemany(
-                    "UPDATE coaching_selections SET status='failed', error_message=?"
-                    " WHERE id=?", [(f"{type(exc).__name__}: {exc}", s["id"]) for s in selections])
-            raise
-
-        # Completeness check per range, same reasoning as _build_do_pass2_range:
-        # a job that finished without raising but wrote no overlay data for a
-        # given range (degenerate/zero-length, or every frame dropped
-        # upstream) must not look like success for that selection.
-        with db.connect() as con:
-            for s in selections:
-                entries = overlays.read_range(video_id, "pass2", s["start_frame"], s["end_frame"])
-                if entries:
-                    con.execute(
-                        "UPDATE coaching_selections SET status='ready', overlay_source='pass2',"
-                        " error_message=NULL WHERE id=?", (s["id"],))
-                else:
-                    con.execute(
-                        "UPDATE coaching_selections SET status='failed',"
-                        " error_message='pass2 completed but produced no overlay data"
-                        " for this range' WHERE id=?", (s["id"],))
-
-    return do_pass2_selections
 
 
 def start_processing(video_id: str) -> dict:

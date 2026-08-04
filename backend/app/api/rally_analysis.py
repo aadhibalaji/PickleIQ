@@ -16,7 +16,6 @@ Endpoints:
   POST /rally-analysis/{video_id}/selections         create coaching_selections rows (accept a Pass 1 rally or draw one)
   GET  /rally-analysis/{video_id}/selections         list coaching_selections with current status
   POST /rally-analysis/{video_id}/selections/{selection_id}/process   enqueue Pass 2 for one selection
-  POST /rally-analysis/{video_id}/process-selections  enqueue Pass 2 for ALL pending/failed selections in ONE job
 """
 from __future__ import annotations
 
@@ -26,7 +25,6 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from .. import db, pipeline
-from ..config import RUN_PROCESSING
 from ..cv import overlays
 from ..jobs import runner
 from ..learning import params as learned_params
@@ -296,83 +294,9 @@ def process_selection(video_id: str, selection_id: str):
         con.execute(
             "UPDATE coaching_selections SET status='pending', overlay_source=?,"
             " error_message=NULL WHERE id=?", (overlay_source, selection_id))
-    if not RUN_PROCESSING:
-        cloud = pipeline.queue_pass2_on_cloud(video_id, {
-            "mode": "single_range",
-            "selection": {
-                "id": selection_id,
-                "source": sel["source"],
-                "start_frame": sel["start_frame"],
-                "end_frame": sel["end_frame"],
-                "rally_label_id": sel["rally_label_id"],
-                "overlay_source": overlay_source,
-            },
-        })
-        return {"video_id": video_id, "selection_id": selection_id, "status": "queued",
-                "reused_existing_pass2": False, **cloud}
     job_id = runner.submit(
         video_id, f"pass2_range_{selection_id}",
         pipeline._build_do_pass2_range(video_id, params, selection_id,
                                         sel["start_frame"], sel["end_frame"], overlay_source))
     return {"video_id": video_id, "selection_id": selection_id, "job_id": job_id,
             "status": "queued", "reused_existing_pass2": False}
-
-
-@router.post("/rally-analysis/{video_id}/process-selections")
-def process_selections(video_id: str):
-    """Enqueues Pass 2 for every 'pending'/'failed' coaching_selections row on
-    this video in ONE job (pipeline._build_do_pass2_selections), instead of
-    the one-job-per-selection path above — a video with a dozen accepted
-    rallies used to queue a dozen separate Pass 2 jobs.
-
-    User-drawn selections get backfilled with a rally_labels row here (once,
-    if missing) so contacts/coaching-report/readiness — all keyed off
-    rally_labels — see them exactly like an accepted Pass 1 candidate.
-    Tagged meta.user_drawn=True so refine/keep-drop (which grades Pass 1's
-    OWN confidence in a candidate) skips them — see
-    refine/io_loaders.load_pass1_windows."""
-    with db.connect() as con:
-        sels = db.rows_to_dicts(con.execute(
-            "SELECT * FROM coaching_selections WHERE video_id=? AND status IN ('pending','failed')"
-            " ORDER BY start_frame", (video_id,)).fetchall())
-    if not sels:
-        raise HTTPException(400, "no pending selections to process")
-
-    with db.connect() as con:
-        for s in sels:
-            if s["source"] == "user_drawn" and not s["rally_label_id"]:
-                rid = db.new_id()
-                con.execute(
-                    "INSERT INTO rally_labels (id, video_id, source, start_frame, end_frame, meta)"
-                    " VALUES (?,?,?,?,?,?)",
-                    (rid, video_id, "pass1", s["start_frame"], s["end_frame"],
-                     db.dumps({"user_drawn": True})))
-                con.execute("UPDATE coaching_selections SET rally_label_id=? WHERE id=?",
-                            (rid, s["id"]))
-                s["rally_label_id"] = rid
-
-    if not RUN_PROCESSING:
-        # Must not runner.submit on a UI-only container — that was running
-        # Pass 2 on the Mac (CPU) while EC2 sat idle. Hand the selection
-        # payloads to the worker via S3; cloud_ingest rebuilds the rows and
-        # enqueues the real job there.
-        cloud = pipeline.queue_pass2_on_cloud(video_id, {
-            "mode": "selections",
-            "selections": [
-                {"id": s["id"], "source": s["source"],
-                 "start_frame": s["start_frame"], "end_frame": s["end_frame"],
-                 "rally_label_id": s["rally_label_id"]}
-                for s in sels
-            ],
-        })
-        with db.connect() as con:
-            con.executemany(
-                "UPDATE coaching_selections SET status='processing', error_message=NULL"
-                " WHERE id=?", [(s["id"],) for s in sels])
-        return {"video_id": video_id, "selection_ids": [s["id"] for s in sels], **cloud}
-
-    version, params = learned_params.get_latest()
-    job_id = runner.submit(video_id, "pass2",
-                           pipeline._build_do_pass2_selections(video_id, params, sels))
-    return {"video_id": video_id, "job_id": job_id,
-            "selection_ids": [s["id"] for s in sels]}

@@ -52,7 +52,7 @@ function assignLanes(blocks) {
   return { laneById, laneCount: laneEnds.length || 1 }
 }
 
-export default function RallyAnalysisPanel({ videoId, video, onUpdateVideo, onSeek, frame }) {
+export default function RallyAnalysisPanel({ videoId, video, onUpdateVideo, onSeek }) {
   const [report, setReport] = useState(null)
   const [generating, setGenerating] = useState(false)
   const [selectedPlayer, setSelectedPlayer] = useState(ALL_PLAYERS)
@@ -148,7 +148,7 @@ export default function RallyAnalysisPanel({ videoId, video, onUpdateVideo, onSe
         </div>
       </div>
 
-      <CoachingSelections videoId={videoId} fps={video?.fps || 30} onSeek={onSeek} frame={frame} />
+      <CoachingSelections videoId={videoId} fps={video?.fps || 30} onSeek={onSeek} />
 
       <div className="panel">
         <div className="row spread">

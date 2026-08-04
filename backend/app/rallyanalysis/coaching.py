@@ -19,9 +19,8 @@ from .. import db
 from ..config import ANTHROPIC_API_KEY, ANTHROPIC_COACHING_MODEL
 from ..cv import overlays
 from ..cv.court import NET_Y
-from .contracts import CoachingReport, CoachingTip, PlayerTheme, ShotFeatureVector
+from .contracts import CoachingReport, CoachingTip, ShotFeatureVector
 from .readiness import default_overlay_source, get_analyzable_rallies
-from .shot_context import annotate_rally_context, classify_shot_types
 
 log = logging.getLogger("rallyanalysis.coaching")
 
