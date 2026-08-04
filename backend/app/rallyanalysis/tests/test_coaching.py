@@ -620,6 +620,7 @@ def test_generate_llm_tips_includes_stats_in_prompt_when_present(monkeypatch):
         text = '{"tips": []}'
 
     class FakeResponse:
+        stop_reason = "end_turn"
         content = [FakeTextBlock()]
 
     class FakeMessages:
@@ -657,6 +658,7 @@ def test_generate_llm_tips_sends_honest_names_session_context_and_coaching_model
         text = '{"tips": [], "player_themes": []}'
 
     class FakeResponse:
+        stop_reason = "end_turn"
         content = [FakeTextBlock()]
 
     class FakeMessages:
@@ -706,6 +708,7 @@ def test_generate_llm_tips_folds_frames_into_the_same_single_call(monkeypatch):
         text = '{"tips": [], "player_themes": []}'
 
     class FakeResponse:
+        stop_reason = "end_turn"
         content = [FakeTextBlock()]
 
     class FakeMessages:

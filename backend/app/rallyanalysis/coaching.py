@@ -1149,9 +1149,15 @@ def generate_llm_tips(shots: list[dict], stats_summary: dict | None = None,
         # shape is removed and returns a 400 (it still works on the Haiku 4.5
         # discrepancy-report path in analysis/reporter.py — do not "align" the
         # two calls). Depth is steered by output_config.effort instead.
+        # max_tokens caps thinking + response TOGETHER on this model family —
+        # 8000 truncated the tips JSON mid-array on a real 15-candidate run
+        # (adaptive thinking spent most of the budget), which parsed as
+        # garbage and degraded the whole report to zero tips. 16000 leaves
+        # thinking room while staying within non-streaming HTTP-timeout
+        # guidance; if reports ever grow past that, switch to .stream().
         response = client.messages.create(
             model=ANTHROPIC_COACHING_MODEL,
-            max_tokens=8000,
+            max_tokens=16000,
             thinking={"type": "adaptive"},
             system=SYSTEM,
             output_config={"format": {"type": "json_schema", "schema": TIPS_SCHEMA},
@@ -1171,11 +1177,20 @@ def generate_llm_tips(shots: list[dict], stats_summary: dict | None = None,
         log.error("network error reaching the Anthropic API")
         return {}, []
 
+    if response.stop_reason == "refusal":
+        log.error("coaching LLM call was refused (stop_reason=refusal) — no tips generated")
+        return {}, []
     text = next((b.text for b in response.content if b.type == "text"), "")
     try:
         data = db.loads(text, {})
     except Exception:  # noqa: BLE001
-        log.error("LLM returned unparseable JSON")
+        # Distinguish the two real-world causes: a truncated response (raise
+        # max_tokens / lower candidate count) vs genuinely malformed output.
+        if response.stop_reason == "max_tokens":
+            log.error("coaching LLM response TRUNCATED at max_tokens — tips JSON incomplete; "
+                      "raise max_tokens in generate_llm_tips")
+        else:
+            log.error("LLM returned unparseable JSON (stop_reason=%s)", response.stop_reason)
         return {}, []
 
     out: dict[str, dict] = {}
