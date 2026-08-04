@@ -558,8 +558,10 @@ def test_generate_llm_tips_sends_honest_names_session_context_and_coaching_model
     assert "distance_from_net_m" in content
     # ...the whole-session aggregates ride along in the SAME single call...
     assert "session_context" in content
-    # ...on the dedicated coaching model, not the discrepancy-report model.
+    # ...on the dedicated coaching model, not the discrepancy-report model...
     assert captured["model"] == coaching.ANTHROPIC_COACHING_MODEL
+    # ...with ADAPTIVE thinking — budget_tokens 400s on claude-sonnet-5.
+    assert captured["thinking"] == {"type": "adaptive"}
 
     captured.clear()
     generate_llm_tips(shots, stats_summary=None, session_context=None)

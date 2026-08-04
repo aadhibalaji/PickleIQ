@@ -1022,12 +1022,18 @@ def generate_llm_tips(shots: list[dict], stats_summary: dict | None = None,
 
     client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     try:
+        # thinking must be ADAPTIVE here: ANTHROPIC_COACHING_MODEL defaults to
+        # claude-sonnet-5, where the old {"type": "enabled", "budget_tokens": N}
+        # shape is removed and returns a 400 (it still works on the Haiku 4.5
+        # discrepancy-report path in analysis/reporter.py — do not "align" the
+        # two calls). Depth is steered by output_config.effort instead.
         response = client.messages.create(
             model=ANTHROPIC_COACHING_MODEL,
             max_tokens=8000,
-            thinking={"type": "enabled", "budget_tokens": 4000},
+            thinking={"type": "adaptive"},
             system=SYSTEM,
-            output_config={"format": {"type": "json_schema", "schema": TIPS_SCHEMA}},
+            output_config={"format": {"type": "json_schema", "schema": TIPS_SCHEMA},
+                            "effort": "high"},
             messages=[{"role": "user", "content": content}],
         )
     except anthropic.RateLimitError:
