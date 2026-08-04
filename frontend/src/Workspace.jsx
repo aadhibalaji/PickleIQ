@@ -293,7 +293,7 @@ export default function Workspace({ videoId, onBack }) {
           {video.s3_key && video.run_processing === false &&
             <SyncFromCloudButton videoId={videoId} note={note} />}
           {selfStopEnabled !== null && (
-            <label className="row" title="When on, the EC2 worker stops itself once its job queue is empty (saves cost). Turn off during active testing so it doesn't disappear mid-session.">
+            <label className="row" title="ON: stay up after Pass 1 (~10 min) so you can trigger Pass 2, then stop when the Pass 2 chain finishes (or the wait expires). OFF: same Pass 1 wait, but only stop after a Pass 2 chain finishes or the wait expires — idle boots won't self-stop.">
               <input type="checkbox" checked={selfStopEnabled} onChange={toggleSelfStop} />
               <span className="muted">EC2 self-stop</span>
             </label>

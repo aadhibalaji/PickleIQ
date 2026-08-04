@@ -26,6 +26,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from .. import db, pipeline
+from ..config import RUN_PROCESSING
 from ..cv import overlays
 from ..jobs import runner
 from ..learning import params as learned_params
@@ -74,6 +75,11 @@ def process_single_rally(video_id: str):
             " VALUES (?,?,?,?,?,?)",
             (db.new_id(), video_id, "pass1", 0, int(vrow["frame_count"]) - 1,
              db.dumps({"whole_clip_rally": True})))
+    if not RUN_PROCESSING:
+        # UI-only container: hand Pass 2 to the EC2 worker via S3 (same
+        # path as process-selections) instead of runner.submit here.
+        cloud = pipeline.queue_pass2_on_cloud(video_id, {"mode": "full_pass2"})
+        return {"video_id": video_id, "rally_frames": [0, int(vrow["frame_count"]) - 1], **cloud}
     result = pipeline.reprocess(video_id, "pass2")
     return {"video_id": video_id, "rally_frames": [0, int(vrow["frame_count"]) - 1], **result}
 
@@ -290,6 +296,20 @@ def process_selection(video_id: str, selection_id: str):
         con.execute(
             "UPDATE coaching_selections SET status='pending', overlay_source=?,"
             " error_message=NULL WHERE id=?", (overlay_source, selection_id))
+    if not RUN_PROCESSING:
+        cloud = pipeline.queue_pass2_on_cloud(video_id, {
+            "mode": "single_range",
+            "selection": {
+                "id": selection_id,
+                "source": sel["source"],
+                "start_frame": sel["start_frame"],
+                "end_frame": sel["end_frame"],
+                "rally_label_id": sel["rally_label_id"],
+                "overlay_source": overlay_source,
+            },
+        })
+        return {"video_id": video_id, "selection_id": selection_id, "status": "queued",
+                "reused_existing_pass2": False, **cloud}
     job_id = runner.submit(
         video_id, f"pass2_range_{selection_id}",
         pipeline._build_do_pass2_range(video_id, params, selection_id,
@@ -330,6 +350,26 @@ def process_selections(video_id: str):
                 con.execute("UPDATE coaching_selections SET rally_label_id=? WHERE id=?",
                             (rid, s["id"]))
                 s["rally_label_id"] = rid
+
+    if not RUN_PROCESSING:
+        # Must not runner.submit on a UI-only container — that was running
+        # Pass 2 on the Mac (CPU) while EC2 sat idle. Hand the selection
+        # payloads to the worker via S3; cloud_ingest rebuilds the rows and
+        # enqueues the real job there.
+        cloud = pipeline.queue_pass2_on_cloud(video_id, {
+            "mode": "selections",
+            "selections": [
+                {"id": s["id"], "source": s["source"],
+                 "start_frame": s["start_frame"], "end_frame": s["end_frame"],
+                 "rally_label_id": s["rally_label_id"]}
+                for s in sels
+            ],
+        })
+        with db.connect() as con:
+            con.executemany(
+                "UPDATE coaching_selections SET status='processing', error_message=NULL"
+                " WHERE id=?", [(s["id"],) for s in sels])
+        return {"video_id": video_id, "selection_ids": [s["id"] for s in sels], **cloud}
 
     version, params = learned_params.get_latest()
     job_id = runner.submit(video_id, "pass2",

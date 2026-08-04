@@ -120,13 +120,17 @@ JOB_TIMEOUT_CONTACTS_S = int(os.getenv("JOB_TIMEOUT_CONTACTS_S", str(1800)))
 JOB_TIMEOUT_LEARN_S = int(os.getenv("JOB_TIMEOUT_LEARN_S", str(4 * 3600)))
 JOB_TIMEOUT_DEFAULT_S = int(os.getenv("JOB_TIMEOUT_DEFAULT_S", str(3 * 3600)))
 
-# EC2 self-stop toggle (self_stop.py / api/media.py): default True preserves
-# today's behavior (stop the instance once the job queue empties). Flipped
-# off during active testing so the instance doesn't disappear mid-session —
-# see self_stop.get_enabled/set_enabled for the S3-synced local state this
-# seeds.
+# EC2 self-stop toggle (self_stop.py / api/media.py): default True enables
+# smart auto-stop (stay up after Pass 1 for user selections, stop after the
+# Pass 2 full chain or when the post-Pass-1 grace expires). Flipped off to
+# suppress most auto-stops during active testing — see self_stop.should_auto_stop.
 SELF_STOP_ENABLED_DEFAULT = os.getenv("SELF_STOP_ENABLED_DEFAULT", "1").strip().lower() not in (
     "0", "false", "no", "")
+
+# After Pass 1 finishes, keep the instance up this long so the user can pick
+# rallies and trigger Pass 2 without paying the ~4 min cold-start. Applies
+# when self-stop is deciding whether an "empty queue" is safe to stop on.
+SELF_STOP_PASS1_GRACE_S = int(os.getenv("SELF_STOP_PASS1_GRACE_S", str(10 * 60)))
 
 for _d in (DATA_DIR, VIDEO_DIR):
     _d.mkdir(parents=True, exist_ok=True)

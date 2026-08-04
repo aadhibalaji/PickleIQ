@@ -161,10 +161,12 @@ class JobRunner:
             job.fn(JobHandle(job))
             if not job.timed_out.is_set():
                 self._set_status(job.id, "done")
+                self._maybe_arm_self_stop(job.kind)
         except JobCancelled:
             if not job.timed_out.is_set():
                 self._set_status(job.id, "cancelled", "cancelled")
                 log.info("job %s (%s) cancelled", job.id, job.kind)
+                self._maybe_arm_self_stop(job.kind)
         except Exception as exc:  # noqa: BLE001 — job errors must not kill the worker
             if job.timed_out.is_set():
                 log.info("job %s (%s) raised after timing out (%s) — ignored, "
@@ -172,6 +174,15 @@ class JobRunner:
             else:
                 log.error("job %s (%s) failed:\n%s", job.id, job.kind, traceback.format_exc())
                 self._set_status(job.id, "error", f"{type(exc).__name__}: {exc}")
+                self._maybe_arm_self_stop(job.kind)
+
+    @staticmethod
+    def _maybe_arm_self_stop(kind: str) -> None:
+        """Pass 2 full chain (pass2 → contacts) or a selection-range Pass 2
+        reaching any terminal status arms OFF-mode self-stop — failed/
+        cancelled count as complete per the ops policy in self_stop.py."""
+        if kind in ("pass2", "contacts") or kind.startswith("pass2_range_"):
+            self_stop.arm_after_pass2_chain()
 
     def _timeout_for(self, kind: str) -> float:
         if kind == "pass1":
@@ -190,6 +201,7 @@ class JobRunner:
         message = "job exceeded timeout, likely hung"
         self._set_status(job.id, "error", message)
         log.error("job %s (%s) timed out — marked failed, queue continues", job.id, job.kind)
+        self._maybe_arm_self_stop(job.kind)
         if job.kind.startswith("pass2_range_"):
             # pass2_range jobs are keyed 1:1 with a coaching_selections row
             # (see api/rally_analysis.py's process_selection) — that row must

@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from . import db, results_export, storage_s3
-from .config import STORAGE_BACKEND
+from .config import RUN_PROCESSING, STORAGE_BACKEND
 from .cv import overlays
 from .cv.court import CameraModel
 from .cv.pass1 import run_pass1
@@ -20,6 +20,24 @@ from .learning import params as learned_params
 from .hw_profile import active_profile
 
 log = logging.getLogger("pipeline")
+
+
+def queue_pass2_on_cloud(video_id: str, request: dict) -> dict:
+    """RUN_PROCESSING=0 only — writes a Pass 2 work request to S3 for the
+    EC2 worker's cloud_ingest poller (see storage_s3.upload_pass2_request /
+    cloud_ingest._ingest_pass2_request). Mirrors a local pass2 jobs row so
+    the UI shows cloud progress the same way it does after a video upload.
+    Never calls runner.submit on this container."""
+    if RUN_PROCESSING:
+        raise RuntimeError("queue_pass2_on_cloud is only for RUN_PROCESSING=0 containers")
+    if STORAGE_BACKEND != "s3":
+        raise RuntimeError("queue_pass2_on_cloud requires STORAGE_BACKEND=s3")
+    payload = {**request, "video_id": video_id, "requested_at": db.now()}
+    storage_s3.upload_pass2_request(video_id, payload)
+    _upsert_mirror_job(video_id, "pass1", "done", "")
+    _upsert_mirror_job(video_id, "pass2", "queued",
+                       "waiting for cloud worker to run Pass 2")
+    return {"queued_for_cloud": True, "job_id": None}
 
 
 def seed_cloud_placeholder(video_id: str) -> None:
@@ -84,6 +102,17 @@ def mirror_cloud_chain_status(video_id: str, chain_status: dict[str, dict]) -> N
         if not info or info["status"] == "not_run":
             continue
         _upsert_mirror_job(video_id, kind, info["status"], info.get("message") or "")
+    # Local coaching_selections were flipped to 'processing' when the UI
+    # wrote the S3 pass2 request — once the cloud reports pass2 terminal,
+    # mirror that so the Rally Analysis panel doesn't stay stuck.
+    p2 = chain_status.get("pass2") or {}
+    if p2.get("status") in ("done", "error", "cancelled"):
+        new_status = "ready" if p2["status"] == "done" else "failed"
+        with db.connect() as con:
+            con.execute(
+                "UPDATE coaching_selections SET status=?, error_message=? WHERE video_id=?"
+                " AND status='processing'",
+                (new_status, p2.get("message") or None, video_id))
 
 
 def mirror_cloud_progress(video_id: str, progress_payload: dict) -> None:
