@@ -316,10 +316,19 @@ def _detect_contacts_after_pass2(video_id: str) -> None:
         log.exception("contact detection failed (non-fatal)")
 
 
-def _build_do_pass2(video_id: str, params: dict):
-    """Shared by start_processing (chained after Pass 1) and reprocess
-    (standalone 'pass2' re-run) so the cancel/error handling below only has
-    to be written — and reviewed — once.
+def _build_do_pass2(video_id: str, params: dict,
+                     windows_override: list[tuple[int, int]] | None = None):
+    """Shared by reprocess (standalone 'pass2' re-run, all Pass 1 windows) and
+    _build_do_pass2_selections (below — user-curated windows only) so the
+    cancel/error handling below only has to be written — and reviewed —
+    once.
+
+    windows_override, when given, is threaded straight through to
+    run_pass2's own windows_override: Pass 2 processes exactly these ranges
+    instead of querying every rally_labels(pass1) row. refine/keep-drop and
+    contacts still key off rally_labels the normal way (see
+    _build_do_pass2_selections's docstring for how user-drawn ranges reach
+    rally_labels without being graded by keep/drop).
 
     run_pass2 raises JobCancelled (via handle.update()'s cooperative check,
     called roughly every 100 frames — see jobs.py) when the user hits
@@ -348,7 +357,8 @@ def _build_do_pass2(video_id: str, params: dict):
         on_window = _window_refiner(video_id)
         on_window(-1)   # drop stale refine JSON before the pass starts
         try:
-            run_pass2(video_id, params, H, cam, handle, on_window=on_window)
+            run_pass2(video_id, params, H, cam, handle, on_window=on_window,
+                      windows_override=windows_override)
         except JobCancelled:
             _finish_chain(video_id, run_contacts=False,
                           status_override={"pass2": {"status": "cancelled",
@@ -440,8 +450,71 @@ def _build_do_pass2_range(video_id: str, params: dict, selection_id: str,
     return do_pass2_range
 
 
+def _build_do_pass2_selections(video_id: str, params: dict, selections: list[dict]):
+    """Runs Pass 2 ONCE over every coaching_selections range the user has
+    included/drawn, instead of one job per selection (_build_do_pass2_range,
+    above) — a video with 15 accepted rallies used to queue 15 separate Pass
+    2 jobs; this queues exactly one, via _build_do_pass2's windows_override.
+
+    selections: rows with at least {id, start_frame, end_frame}. Writes to
+    the real "pass2" overlay source (this batch IS now the definitive Pass 2
+    run for the video, same as the old full-video auto-chain was) — so it
+    also chains refine + contacts + finish_chain via the plain _build_do_pass2
+    path, unlike _build_do_pass2_range's isolated ranges.
+
+    User-drawn selections need a rally_labels row for contacts/coaching
+    report/readiness to see them at all (those all key off rally_labels) —
+    callers must have already backfilled one (source='pass1', meta
+    user_drawn=True) before building this, see
+    api/rally_analysis.py's process_selections. That meta flag is what
+    load_pass1_windows filters on to keep them OUT of refine/keep-drop:
+    keep/drop grades Pass 1's own confidence in a candidate, which doesn't
+    exist for a range the user hand-drew themselves."""
+    windows = [(s["start_frame"], s["end_frame"]) for s in selections]
+    base = _build_do_pass2(video_id, params, windows_override=windows)
+
+    def do_pass2_selections(handle: JobHandle) -> None:
+        with db.connect() as con:
+            con.executemany(
+                "UPDATE coaching_selections SET status='processing', error_message=NULL"
+                " WHERE id=?", [(s["id"],) for s in selections])
+        try:
+            base(handle)
+        except Exception as exc:
+            with db.connect() as con:
+                con.executemany(
+                    "UPDATE coaching_selections SET status='failed', error_message=?"
+                    " WHERE id=?", [(f"{type(exc).__name__}: {exc}", s["id"]) for s in selections])
+            raise
+
+        # Completeness check per range, same reasoning as _build_do_pass2_range:
+        # a job that finished without raising but wrote no overlay data for a
+        # given range (degenerate/zero-length, or every frame dropped
+        # upstream) must not look like success for that selection.
+        with db.connect() as con:
+            for s in selections:
+                entries = overlays.read_range(video_id, "pass2", s["start_frame"], s["end_frame"])
+                if entries:
+                    con.execute(
+                        "UPDATE coaching_selections SET status='ready', overlay_source='pass2',"
+                        " error_message=NULL WHERE id=?", (s["id"],))
+                else:
+                    con.execute(
+                        "UPDATE coaching_selections SET status='failed',"
+                        " error_message='pass2 completed but produced no overlay data"
+                        " for this range' WHERE id=?", (s["id"],))
+
+    return do_pass2_selections
+
+
 def start_processing(video_id: str) -> dict:
-    """Kick off Pass 1 immediately (background); Pass 2 chains after it."""
+    """Kick off Pass 1 immediately (background). Pass 2 no longer auto-runs
+    after it: it's now user-triggered from the Rally Analysis tab once the
+    user has reviewed Pass 1's candidates and picked what to include/draw
+    (see api/rally_analysis.py's process_selections /
+    _build_do_pass2_selections) — Pass 2 used to blindly process 100% of
+    Pass 1's candidate windows, most of which a user typically doesn't want
+    analyzed."""
     version, params = learned_params.get_latest()
     params = _with_hw_overrides(params)
     with db.connect() as con:
@@ -463,10 +536,6 @@ def start_processing(video_id: str) -> dict:
             # status back to 'running' — see storage_s3.delete_progress.
             if STORAGE_BACKEND == "s3":
                 storage_s3.delete_progress(video_id)
-        # Chain Pass 2 automatically (unless Pass 1 was cancelled). It will
-        # fail with a clear message if the court is not calibrated yet.
-        if not handle.cancelled():
-            runner.submit(video_id, "pass2", _build_do_pass2(video_id, params))
 
     job_id = runner.submit(video_id, "pass1", do_pass1)
     return {"job_id": job_id, "learned_params_version": version}

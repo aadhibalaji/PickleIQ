@@ -380,7 +380,17 @@ def run_pass1(video_id: str, params: dict, H, handle: JobHandle,
         # 99-100% right before "done". Ticking every 100 sampled frames
         # instead (same cadence cv/pass2.py already uses) keeps updates
         # flowing through that tail.
-        if f % (100 * step) == 0:
+        #
+        # 100 wasn't tight enough in practice: cv2's CAP_PROP_FRAME_COUNT
+        # (meta.frame_count, the progress denominator) is a container-header
+        # estimate that's commonly a few percent off real decodable frame
+        # count. The last tick before the loop actually exhausts lands near
+        # that error margin (often ~99%), and everything after it — up to
+        # 100*step real frames of genuine ball/pose work — runs with zero
+        # visible ticks, reading as a stall even though it's progressing.
+        # 20*step keeps the same per-tick DB write cost cv/pass2.py accepts
+        # while shrinking that blind tail 5x.
+        if f % (20 * step) == 0:
             # update() also raises if cancelled — a long Pass 1 yields the
             # worker promptly so shorter queued jobs can run.
             progress = f / max(meta.frame_count, 1)
