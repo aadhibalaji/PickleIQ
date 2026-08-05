@@ -75,6 +75,30 @@ export async function retryPass1Processing(videoId) {
   return api.reprocess(videoId, 'pass1')
 }
 
+// Pass 2 is never auto-chained after Pass 1 (see pipeline.start_processing) —
+// the internal dev tool's Coaching Selections step is what normally reviews
+// Pass 1's candidates and explicitly queues Pass 2 for the ones to keep.
+// PickleIQ has no such review screen, so it stands in for that step here:
+// every Pass 1 rally is treated as accepted (Pass 1's own filtering already
+// decided what's worth keeping) and Pass 2 is queued for all of them.
+// Safe to call more than once for the same video (e.g. a remount): skips
+// creating selections again if any already exist, and treats "no pending
+// selections to process" as success rather than an error.
+export async function ensurePass2Queued(videoId, retainedRallies) {
+  const existing = await api.listSelections(videoId).catch(() => ({ selections: [] }))
+  if (!(existing.selections || []).length) {
+    const items = safeArray(retainedRallies)
+      .filter((rally) => rally?.id)
+      .map((rally) => ({ source: 'pass1_accepted', rally_label_id: rally.id }))
+    if (items.length) await api.createSelections(videoId, items)
+  }
+  try {
+    await api.processSelections(videoId)
+  } catch (error) {
+    if (!/no pending selections/i.test(error.message || '')) throw error
+  }
+}
+
 function normalizeDecision(verdict) {
   if (verdict === 'rally') return 'kept'
   if (verdict === 'rejected') return 'rejected'
