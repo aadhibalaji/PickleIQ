@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react'
+import HomeLink from './components/HomeLink.jsx'
 import PrimaryButton from './components/PrimaryButton.jsx'
 import ProcessingError from './components/ProcessingError.jsx'
 import ProcessingProgress from './components/ProcessingProgress.jsx'
@@ -20,6 +21,13 @@ function formatTime(frame, fps) {
 export default function RallyReviewScreen({ videoId, localFile, pass1Result, onComplete, onHome }) {
   const candidates = pass1Result?.retainedRallies || []
   const fps = pass1Result?.fps || 30
+  // Same fallback Pass1Screen/Pass2Screen/AnalysisScreen already use: null
+  // during a live upload (localFile carries the video instead), set to
+  // api.streamUrl(videoId) when resuming a clip with no local File object
+  // (see PickleIQApp's history-review path) — from here it also flows
+  // through automatically to Pass2Screen/AnalysisScreen, since they already
+  // read pass1Result.previewUrl the same way.
+  const previewUrl = pass1Result?.previewUrl || null
   const playerRef = useRef(null)
 
   const [stage, setStage] = useState(candidates.length ? 'review' : 'draw') // 'review' | 'draw' | 'submitting'
@@ -102,6 +110,7 @@ export default function RallyReviewScreen({ videoId, localFile, pass1Result, onC
   if (stage === 'submitting') {
     return (
       <main className="pickleiq-page pickleiq-processing-page" aria-labelledby="pickleiq-review-title">
+        <HomeLink onHome={onHome} />
         <h1 id="pickleiq-review-title">Starting Pass 2...</h1>
         {submitError ? (
           <ProcessingError message={submitError} onRetry={submit} onHome={onHome} retryLabel="Retry" />
@@ -124,20 +133,26 @@ export default function RallyReviewScreen({ videoId, localFile, pass1Result, onC
     }))
     return (
       <main className="pickleiq-page pickleiq-processing-page" aria-labelledby="pickleiq-review-title">
+        <HomeLink onHome={onHome} />
         <h1 id="pickleiq-review-title">Review Rallies</h1>
-        <section className="pickleiq-processing-content" aria-label={`Rally ${reviewIndex + 1} of ${candidates.length}`}>
-          <p className="pickleiq-review-count">Rally {reviewIndex + 1} of {candidates.length}</p>
-          <div className="pickleiq-review-card">
-            <p className="pickleiq-review-time">
-              {formatTime(candidate.start_frame, fps)} – {formatTime(candidate.end_frame, fps)}
-            </p>
-            <p className="pickleiq-review-duration">
-              {formatTime(candidate.end_frame - candidate.start_frame, fps)} long
-            </p>
+        <section className="pickleiq-review-shell" aria-label={`Rally ${reviewIndex + 1} of ${candidates.length}`}>
+          <div className="pickleiq-review-scroll">
+            <p className="pickleiq-review-count">Rally {reviewIndex + 1} of {candidates.length}</p>
+            <div className="pickleiq-review-card">
+              <p className="pickleiq-review-time">
+                {formatTime(candidate.start_frame, fps)} – {formatTime(candidate.end_frame, fps)}
+              </p>
+              <p className="pickleiq-review-duration">
+                {formatTime(candidate.end_frame - candidate.start_frame, fps)} long
+              </p>
+            </div>
+            <VideoPreview previewUrl={previewUrl} localFile={localFile} previewKind="original-local" playerRef={playerRef} />
+            <RallyTimeline sections={timelineSections} fps={fps} durationSeconds={pass1Result?.durationSeconds}
+              onSeek={seekTo} emptyLabel="No rallies detected" />
           </div>
-          <VideoPreview localFile={localFile} previewKind="original-local" playerRef={playerRef} />
-          <RallyTimeline sections={timelineSections} fps={fps} durationSeconds={pass1Result?.durationSeconds}
-            onSeek={seekTo} emptyLabel="No rallies detected" />
+          {/* Pinned below the scrollable video/timeline area (not inside it)
+              so Keep/Skip stay reachable no matter how tall that content is —
+              see .pickleiq-review-shell. */}
           <div className="pickleiq-review-actions">
             <button type="button" className="pickleiq-secondary-button" onClick={() => decide(false)}>
               Skip
@@ -155,27 +170,31 @@ export default function RallyReviewScreen({ videoId, localFile, pass1Result, onC
   // stage === 'draw'
   return (
     <main className="pickleiq-page pickleiq-processing-page" aria-labelledby="pickleiq-review-title">
+      <HomeLink onHome={onHome} />
       <h1 id="pickleiq-review-title">Add a Missed Rally?</h1>
-      <section className="pickleiq-processing-content" aria-label="Mark a missed rally">
-        <p className="pickleiq-review-summary">{keptIds.length} kept so far.</p>
-        <VideoPreview localFile={localFile} previewKind="original-local" playerRef={playerRef} />
-        <div className="pickleiq-review-draw-actions">
-          <PrimaryButton onClick={markStart} disabled={pendingStart !== null}>
-            Mark start
-          </PrimaryButton>
-          <PrimaryButton onClick={markEnd} disabled={pendingStart === null}>
-            Mark end
-          </PrimaryButton>
-        </div>
-        {pendingStart !== null && (
-          <p className="pickleiq-review-summary">Range open since {formatTime(pendingStart, fps)} — scrub to the end and tap "Mark end".</p>
-        )}
-        {drawnRanges.map((range, i) => (
-          <div key={i} className="pickleiq-review-drawn-row">
-            <span>{formatTime(range.start_frame, fps)} – {formatTime(range.end_frame, fps)}</span>
-            <button type="button" className="pickleiq-secondary-button" onClick={() => removeDrawn(i)}>Remove</button>
+      <section className="pickleiq-review-shell" aria-label="Mark a missed rally">
+        <div className="pickleiq-review-scroll">
+          <p className="pickleiq-review-summary">{keptIds.length} kept so far.</p>
+          <VideoPreview previewUrl={previewUrl} localFile={localFile} previewKind="original-local" playerRef={playerRef} />
+          <div className="pickleiq-review-draw-actions">
+            <PrimaryButton onClick={markStart} disabled={pendingStart !== null}>
+              Mark start
+            </PrimaryButton>
+            <PrimaryButton onClick={markEnd} disabled={pendingStart === null}>
+              Mark end
+            </PrimaryButton>
           </div>
-        ))}
+          {pendingStart !== null && (
+            <p className="pickleiq-review-summary">Range open since {formatTime(pendingStart, fps)} — scrub to the end and tap "Mark end".</p>
+          )}
+          {drawnRanges.map((range, i) => (
+            <div key={i} className="pickleiq-review-drawn-row">
+              <span>{formatTime(range.start_frame, fps)} – {formatTime(range.end_frame, fps)}</span>
+              <button type="button" className="pickleiq-secondary-button" onClick={() => removeDrawn(i)}>Remove</button>
+            </div>
+          ))}
+        </div>
+        {/* Pinned below the scrollable area — see .pickleiq-review-shell. */}
         {drawError && <p className="pickleiq-error" style={{ position: 'static' }}>{drawError}</p>}
         <PrimaryButton className="pickleiq-start-button-inline" onClick={submit} disabled={totalSelected === 0}>
           Start Pass 2

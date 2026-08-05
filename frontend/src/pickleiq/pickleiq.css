@@ -638,6 +638,12 @@ button.pickleiq-timeline-span.is-rejected:hover {
   left: clamp(16px, 3vw, 24px);
   z-index: 5;
 }
+.pickleiq-home-link {
+  position: absolute;
+  top: clamp(16px, 3vh, 24px);
+  left: clamp(16px, 3vw, 24px);
+  z-index: 5;
+}
 .pickleiq-clip-list {
   list-style: none;
   margin: 0 0 20px;
@@ -676,6 +682,7 @@ button.pickleiq-timeline-span.is-rejected:hover {
   font-size: 13px;
 }
 .pickleiq-clip-status.is-ready { color: var(--pickleiq-green); }
+.pickleiq-clip-status.is-needs-review { color: var(--pickleiq-blue); }
 .pickleiq-history-back { margin-top: 8px; }
 
 @media (max-height: 720px) {
@@ -712,6 +719,33 @@ button.pickleiq-timeline-span.is-rejected:hover {
 }
 .pickleiq-self-stop input { cursor: pointer; }
 
+/* Review/draw stages stack more content (video + timeline + action
+   buttons) than other processing screens, and .pickleiq-page can't scroll
+   (overflow:hidden) — anchored top AND bottom (not a fixed height) so the
+   shell's height always equals the real available space, with only the
+   variable-height video/timeline area scrolling internally. Without this,
+   action buttons below a tall video can render past the bottom edge with
+   no way to reach them. */
+.pickleiq-review-shell {
+  position: absolute;
+  top: clamp(140px, 18vh, 168px);
+  bottom: clamp(24px, 4vh, 40px);
+  left: 50%;
+  width: clamp(640px, 55vw, 780px);
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+}
+.pickleiq-review-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+}
+.pickleiq-review-shell .pickleiq-video-preview { margin-top: 10px; }
+.pickleiq-review-shell .pickleiq-video-preview video,
+.pickleiq-review-shell .pickleiq-video-placeholder {
+  max-height: 34vh;
+}
 .pickleiq-review-count {
   margin: 0 0 4px;
   color: var(--pickleiq-muted);

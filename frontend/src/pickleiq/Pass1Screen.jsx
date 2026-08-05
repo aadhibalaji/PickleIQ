@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
+import HomeLink from './components/HomeLink.jsx'
 import ProcessingError from './components/ProcessingError.jsx'
 import ProcessingProgress from './components/ProcessingProgress.jsx'
 import RallyTimeline from './components/RallyTimeline.jsx'
@@ -53,6 +54,7 @@ export default function Pass1Screen({ videoId, localFile, onComplete, onHome }) 
 
   return (
     <main className="pickleiq-page pickleiq-processing-page" aria-labelledby="pickleiq-pass1-title">
+      <HomeLink onHome={onHome} />
       <h1 ref={headingRef} tabIndex="-1" id="pickleiq-pass1-title">Clipping Video...</h1>
       {error ? (
         <ProcessingError message={error} onRetry={retry} onHome={onHome} retrying={retrying} />

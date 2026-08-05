@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import HomeLink from './components/HomeLink.jsx'
 import ProcessingError from './components/ProcessingError.jsx'
 import ProcessingProgress from './components/ProcessingProgress.jsx'
 import TimeRemaining from './components/TimeRemaining.jsx'
@@ -116,6 +117,7 @@ export default function AnalysisScreen({ videoId, localFile, pass2Result, finalV
   return (
     <main className="pickleiq-page pickleiq-processing-page pickleiq-analysis-page"
       aria-labelledby="pickleiq-analysis-title">
+      <HomeLink onHome={onHome} />
       <h1 ref={headingRef} tabIndex="-1" id="pickleiq-analysis-title">Analyzing players</h1>
       <section className="pickleiq-processing-content" aria-label="Player analysis progress">
         <TimeRemaining seconds={estimate} />

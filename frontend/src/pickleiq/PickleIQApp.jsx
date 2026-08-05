@@ -9,7 +9,7 @@ import AnalysisScreen from './AnalysisScreen.jsx'
 import ResultsScreen from './ResultsScreen.jsx'
 import PastClipsList from './PastClipsList.jsx'
 import SelfStopToggle from './components/SelfStopToggle.jsx'
-import { loadClipResults, startPickleIQAnalysis } from './processingAdapter.js'
+import { loadClipResults, resumeReviewState, startPickleIQAnalysis } from './processingAdapter.js'
 
 const GAME_OPTIONS = [
   { value: 'singles', label: 'Singles' },
@@ -84,9 +84,29 @@ export default function PickleIQApp() {
 
   const openHistory = () => setStage('past-clips')
 
-  const selectPastClip = async (videoId) => {
+  const selectPastClip = async (videoId, status) => {
     setHistoryError('')
     try {
+      if (status === 'needs-review') {
+        // Pass 1 already finished for this clip but nobody ever submitted
+        // rally selections for it (interrupted tab, refresh, etc.) — jump
+        // straight back into the same 'review' stage a live upload uses,
+        // reusing its whole downstream chain (review -> pass2 -> analysis
+        // -> results) unchanged. No local File object exists for a resumed
+        // clip; resumeReviewState seeds a streamed previewUrl instead,
+        // which RallyReviewScreen/Pass2Screen/AnalysisScreen already know
+        // how to fall back to.
+        const resumed = await resumeReviewState(videoId)
+        if (!resumed) {
+          setHistoryError('That clip has no detected rallies to review.')
+          return
+        }
+        setVideoRecord({ id: videoId })
+        setVideo(null)
+        setPass1Output(resumed)
+        setStage('review')
+        return
+      }
       const result = await loadClipResults(videoId)
       if (!result) {
         setHistoryError('That clip has not finished generating feedback yet.')

@@ -33,11 +33,11 @@ export default function PastClipsList({ onSelect, onHome, selectError }) {
             {clips.map((clip) => (
               <li key={clip.id}>
                 <button type="button" className="pickleiq-clip-row" disabled={!clip.ready}
-                  onClick={() => onSelect(clip.id)}>
+                  onClick={() => onSelect(clip.id, clip.status)}>
                   <span className="pickleiq-clip-name">{clip.filename}</span>
                   <span className="pickleiq-clip-meta">
                     {formatDate(clip.uploadedAt)}
-                    <span className={`pickleiq-clip-status${clip.ready ? ' is-ready' : ''}`}>
+                    <span className={`pickleiq-clip-status${clip.ready ? ` is-${clip.status}` : ''}`}>
                       {clip.statusLabel}
                     </span>
                   </span>

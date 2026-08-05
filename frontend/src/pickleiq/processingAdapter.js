@@ -331,23 +331,50 @@ export async function generatePlayerAnalysis(videoId, finalVideoUrl, signal) {
 // Home page "Past Clips" — browse every video this user has ever uploaded
 // and jump straight to its cached feedback, without replaying the
 // upload/Pass1/review/Pass2/analysis pipeline for a video that's already
-// done. A video only gets a per-clip coaching-report check (one extra
-// request each) since /videos doesn't carry that; fine at the scale of one
-// user's own upload history.
+// done. Three states per clip: 'ready' (has a coaching report — jump to
+// results), 'needs-review' (Pass 1 finished but nobody ever submitted rally
+// selections for it — e.g. the tab was closed/refreshed mid-review, so
+// Pass 2 never got queued and never will on its own; jump back into
+// RallyReviewScreen), 'processing' (still waiting on Pass 1/2/contacts,
+// nothing to resume into yet). Each video costs a couple of extra requests
+// (report, and for non-ready ones, jobs + selections) since none of that
+// rides along with /videos; fine at the scale of one user's own history.
 export async function listPastClips() {
   const videos = await api.listVideos().catch(() => [])
   const withStatus = await Promise.all(safeArray(videos).map(async (v) => {
+    const base = { id: v.id, filename: v.filename || v.id, uploadedAt: Number(v.uploaded_at) || 0 }
     const reportResp = await api.getCoachingReport(v.id).catch(() => null)
-    const ready = Boolean(reportResp?.report)
-    return {
-      id: v.id,
-      filename: v.filename || v.id,
-      uploadedAt: Number(v.uploaded_at) || 0,
-      ready,
-      statusLabel: ready ? 'Feedback ready' : 'Still processing',
+    if (reportResp?.report) {
+      return { ...base, status: 'ready', ready: true, statusLabel: 'Feedback ready' }
     }
+    const [videoDetail, selectionsResp] = await Promise.all([
+      api.getVideo(v.id).catch(() => null),
+      api.listSelections(v.id).catch(() => null),
+    ])
+    const pass1Job = (videoDetail?.jobs || []).find((job) => job.kind === 'pass1')
+    const hasSelections = safeArray(selectionsResp?.selections).length > 0
+    const needsReview = pass1Job?.status === 'done' && !hasSelections
+    return needsReview
+      ? { ...base, status: 'needs-review', ready: true, statusLabel: 'Needs review' }
+      : { ...base, status: 'processing', ready: false, statusLabel: 'Still processing' }
   }))
   return withStatus.sort((a, b) => b.uploadedAt - a.uploadedAt)
+}
+
+// Reconstructs a RallyReviewScreen-ready pass1Result for a clip whose Pass 1
+// finished but was never reviewed (see listPastClips' 'needs-review'
+// status) — same shape Pass1Screen hands off on live completion, plus a
+// previewUrl (api.streamUrl) since there's no local File object to fall
+// back on. That previewUrl rides along through pass1Result into
+// Pass2Screen/AnalysisScreen too (they already read pass1Result.previewUrl
+// the same way Pass1Screen does), so video playback keeps working for the
+// rest of the pipeline without any further wiring. Returns null if Pass 1
+// somehow isn't actually done/has no rallies after all (caller should
+// treat that as "nothing to resume").
+export async function resumeReviewState(videoId) {
+  const pass1State = await getPass1ProcessingState(videoId)
+  if (pass1State.status !== 'done' || !pass1State.retainedRallies.length) return null
+  return { ...pass1State, previewUrl: api.streamUrl(videoId) }
 }
 
 // Reconstructs a ResultsScreen-ready {analysisResult, pass2Result} pair for
