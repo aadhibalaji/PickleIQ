@@ -234,6 +234,9 @@ _ADDED_COLUMNS = [
     ("videos", "last_labels_hash", "TEXT"),
     ("videos", "model_versions", "TEXT"),
     ("videos", "match_type", "TEXT"),  # 'singles' | 'doubles' | NULL (unset)
+    # 'form' | 'positioning' | NULL (unset = form). Which metric family the
+    # coaching report evaluates — see rallyanalysis/coaching.resolve_focus.
+    ("videos", "coaching_focus", "TEXT"),
     ("videos", "s3_key", "TEXT"),      # set when STORAGE_BACKEND=s3; NULL in local mode
     # Ground-truth ball-event marks (viewer marking mode). NULL event_type =
     # legacy row = plain position mark. in_out is the human's call on a bounce;
@@ -254,8 +257,16 @@ _ADDED_COLUMNS = [
     # JSON [{player_id, player_label, theme}] — one per-player session theme
     # from the same single coaching LLM call as tips_json. NULL/absent on
     # reports generated before themes existed (rendered as "no theme", never
-    # backfilled — regenerating the report is the upgrade path).
+    # backfilled — regenerating the report is the upgrade path). Superseded by
+    # general_json on new reports; kept so legacy reports still render.
     ("coaching_reports", "themes_json", "TEXT"),
+    # Which metric family this report was generated under ('form' |
+    # 'positioning'); NULL on reports that predate selectable focus (= form).
+    ("coaching_reports", "focus", "TEXT"),
+    # JSON [{player_id, player_label, praise, improve}] — per-player general
+    # feedback (one positive + one negative) from the same single LLM call.
+    # Replaces themes_json on new reports; NULL on older ones.
+    ("coaching_reports", "general_json", "TEXT"),
 ]
 
 STALE_BEFORE_CONFIDENCE_FIX = "generated_before_confidence_fix"

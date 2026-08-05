@@ -17,34 +17,18 @@ from ..cv.court import KITCHEN, NET_Y
 from .coaching import merge_singles_players
 from .readiness import default_overlay_source, get_analyzable_rallies
 
-# Court-depth zones moved to shot_context.py (now shared with the coaching
-# shot-type classifier) — re-exported here under the original names so
-# existing imports/tests keep working unchanged.
+# Court-depth zones and position_samples moved to shot_context.py (now shared
+# with the coaching shot-type classifier and positioning.py) — re-exported
+# here under the original names so existing imports/tests keep working
+# unchanged.
 from .shot_context import (ZONE_BACKCOURT, ZONE_KITCHEN, ZONE_MIDCOURT,  # noqa: F401
+                            position_samples as _position_samples,
                             zone_for_court_y as _zone_for_court_y)
 
 
 # ---------------------------------------------------------------------------
 # Stat 1 + 2: position-derived, from overlay cxy. Pure, unit-tested directly.
 # ---------------------------------------------------------------------------
-
-def _position_samples(entries: list[dict]) -> dict[int, list[tuple[int, float, float, str | None]]]:
-    """player_id -> sorted [(frame, court_x, court_y, team), ...] for every
-    overlay frame carrying a real cxy for that player. Players with zero
-    samples in this range are simply absent from the returned dict — never
-    zero-filled."""
-    by_pid: dict[int, list] = {}
-    for e in entries:
-        for p in e.get("players", []):
-            cxy = p.get("cxy")
-            if not cxy:
-                continue
-            pid = p.get("id")
-            by_pid.setdefault(pid, []).append(
-                (e["f"], float(cxy[0]), float(cxy[1]), p.get("team")))
-    for pid in by_pid:
-        by_pid[pid].sort(key=lambda t: t[0])
-    return by_pid
 
 
 def forward_momentum_series(samples: list[tuple[int, float, float, str | None]],
