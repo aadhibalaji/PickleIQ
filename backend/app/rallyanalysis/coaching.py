@@ -97,7 +97,15 @@ MAX_LLM_CANDIDATES = 16  # statistical shortlist size handed to the LLM, which
 # summary. The LLM final cut keeps full skip authority (see the SYSTEM
 # selection rules), so borderline filler still gets dropped when the frames
 # don't back it up — this widens what the LLM sees, not what gets flagged.
-FILL_TO_LIMIT = True
+#
+# DISABLED (2026-08-05): suspected of tipping the whole response toward
+# skipping everything (including the real flags) on sessions with few real
+# flags — a candidate list stuffed with "skip freely"-framed filler shots is
+# more prompt than signal. Flip back to True only after confirming reports
+# come back clean with it off; if that fixes it, the padding needs a lighter
+# touch (fewer filler shots, or framing them less prominently) rather than
+# reverting outright.
+FILL_TO_LIMIT = False
 
 # ---------------------------------------------------------------------------
 # Salience — ranks WHICH flagged shots deserve one of the MAX_TIPS slots.
@@ -1695,8 +1703,11 @@ def build_report(video_id: str, vectors_meta: list[tuple[ShotFeatureVector, dict
                                         category_cap=max(2, MAX_LLM_CANDIDATES // 2))
     session_context = _session_context(vectors_meta)
     general_context = _general_context(vectors_meta)
-    log.info("coaching: %d/%d scored moments selected as LLM candidates (focus=%s, fill_to_limit=%s)",
-              len(candidates), len(vectors_meta), focus, FILL_TO_LIMIT)
+    real_flagged = sum(1 for c in candidates if not c.get("below_threshold"))
+    log.info("coaching: %d/%d scored moments selected as LLM candidates (%d real flag(s), "
+              "%d filler) (focus=%s, fill_to_limit=%s)",
+              len(candidates), len(vectors_meta), real_flagged, len(candidates) - real_flagged,
+              focus, FILL_TO_LIMIT)
     if llm_fn is None:
         # The real LLM call gets the focus-composed prompt, the general-
         # feedback aggregates and the tip-rating history; injected test
