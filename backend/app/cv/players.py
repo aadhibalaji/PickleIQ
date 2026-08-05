@@ -111,6 +111,14 @@ class PlayerObs:
     team: str | None = None                 # 'near' | 'far'
     number: int | None = None
     slot: int | None = None                 # persistent match-stable identity id
+    # True when identity.py's assignment for this detection this frame was a
+    # near-tie against another identity on the same team (position AND
+    # colour both failed to separate them decisively) — e.g. same-kit
+    # doubles partners crossing. slot/number are still the tracker's best
+    # guess, but callers that care about identity confidence (not just pose
+    # confidence) should treat this frame's slot as uncertain rather than
+    # authoritative. See identity.py's _match/AMBIGUITY_MARGIN.
+    identity_ambiguous: bool = False
 
 
 class PoseTracker:

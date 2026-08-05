@@ -470,7 +470,13 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
                      # "kp" itself is unchanged, so every existing reader of it
                      # keeps working untouched.
                      "kp_conf": [round(c, 3) for c in o.kp_conf]
-                                if o.kp_conf else None}
+                                if o.kp_conf else None,
+                     # True = identity.py's slot pick for this player this frame
+                     # was a near-tie against another same-team identity (colour
+                     # + position both failed to separate them — e.g. same-kit
+                     # doubles crossing). An explicit uncertainty flag, not a
+                     # dropped/fabricated id — see cv/identity.py.
+                     "id_ambiguous": bool(o.identity_ambiguous)}
                     for o in obs
                     # identity.py caps real identity slots at MAX_PER_TEAM (2) per
                     # team for the whole match, and force-binds every detection to
