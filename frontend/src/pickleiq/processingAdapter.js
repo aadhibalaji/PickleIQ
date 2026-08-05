@@ -76,21 +76,23 @@ export async function retryPass1Processing(videoId) {
 }
 
 // Pass 2 is never auto-chained after Pass 1 (see pipeline.start_processing) —
-// the internal dev tool's Coaching Selections step is what normally reviews
-// Pass 1's candidates and explicitly queues Pass 2 for the ones to keep.
-// PickleIQ has no such review screen, so it stands in for that step here:
-// every Pass 1 rally is treated as accepted (Pass 1's own filtering already
-// decided what's worth keeping) and Pass 2 is queued for all of them.
-// Safe to call more than once for the same video (e.g. a remount): skips
+// someone has to review Pass 1's candidates and explicitly queue Pass 2 for
+// the ones to keep (the internal dev tool's Coaching Selections step does
+// this; PickleIQ's RallyReviewScreen is the consumer-facing equivalent).
+// keptRallyIds are rally_labels ids the user chose to keep; drawnRanges are
+// user-marked {start_frame, end_frame} spans Pass 1 missed. Safe to call more
+// than once for the same video (e.g. a retry after a network error): skips
 // creating selections again if any already exist, and treats "no pending
 // selections to process" as success rather than an error.
-export async function ensurePass2Queued(videoId, retainedRallies) {
+export async function submitRallySelections(videoId, { keptRallyIds = [], drawnRanges = [] } = {}) {
+  const items = [
+    ...safeArray(keptRallyIds).filter(Boolean).map((id) => ({ source: 'pass1_accepted', rally_label_id: id })),
+    ...safeArray(drawnRanges).map((r) => ({ source: 'user_drawn', start_frame: r.start_frame, end_frame: r.end_frame })),
+  ]
+  if (!items.length) throw new Error('Select at least one rally before continuing.')
   const existing = await api.listSelections(videoId).catch(() => ({ selections: [] }))
   if (!(existing.selections || []).length) {
-    const items = safeArray(retainedRallies)
-      .filter((rally) => rally?.id)
-      .map((rally) => ({ source: 'pass1_accepted', rally_label_id: rally.id }))
-    if (items.length) await api.createSelections(videoId, items)
+    await api.createSelections(videoId, items)
   }
   try {
     await api.processSelections(videoId)

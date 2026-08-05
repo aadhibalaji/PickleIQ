@@ -3,9 +3,11 @@ import PrimaryButton from './components/PrimaryButton.jsx'
 import SegmentedControl from './components/SegmentedControl.jsx'
 import VideoUploadControl from './components/VideoUploadControl.jsx'
 import Pass1Screen from './Pass1Screen.jsx'
+import RallyReviewScreen from './RallyReviewScreen.jsx'
 import Pass2Screen from './Pass2Screen.jsx'
 import AnalysisScreen from './AnalysisScreen.jsx'
 import ResultsScreen from './ResultsScreen.jsx'
+import SelfStopToggle from './components/SelfStopToggle.jsx'
 import { startPickleIQAnalysis } from './processingAdapter.js'
 
 const GAME_OPTIONS = [
@@ -77,6 +79,10 @@ export default function PickleIQApp() {
 
   const finishPass1 = useCallback((output) => {
     setPass1Output(output)
+    setStage('review')
+  }, [])
+
+  const finishReview = useCallback(() => {
     setStage('pass2')
   }, [])
 
@@ -103,6 +109,11 @@ export default function PickleIQApp() {
       onComplete={finishPass1} onHome={returnHome} />
   }
 
+  if (stage === 'review') {
+    return <RallyReviewScreen videoId={videoRecord.id} localFile={video} pass1Result={pass1Output}
+      onComplete={finishReview} onHome={returnHome} />
+  }
+
   if (stage === 'pass2') {
     return <Pass2Screen videoId={videoRecord.id} localFile={video} pass1Result={pass1Output}
       onComplete={finishPass2} onHome={returnHome} />
@@ -122,6 +133,7 @@ export default function PickleIQApp() {
 
   return (
     <main className="pickleiq-page" aria-labelledby="pickleiq-title">
+      <SelfStopToggle />
       <h1 className="pickleiq-wordmark" id="pickleiq-title">PickleIQ</h1>
       <section className="pickleiq-control-stack" aria-label="Analysis setup">
         <VideoUploadControl file={video} disabled={uploading}

@@ -609,3 +609,93 @@ button.pickleiq-timeline-span.is-rejected:hover {
   .pickleiq-page * { transition: none !important; }
   .pickleiq-progress-track.is-indeterminate > span { animation: none; left: 36%; }
 }
+
+.pickleiq-self-stop {
+  position: absolute;
+  top: clamp(16px, 3vh, 24px);
+  left: clamp(16px, 3vw, 24px);
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--pickleiq-muted);
+  font-size: 13px;
+}
+.pickleiq-self-stop input { cursor: pointer; }
+
+.pickleiq-review-page > h1 {
+  position: absolute;
+  top: clamp(40px, 6vh, 62px);
+  left: clamp(48px, 6vw, 86px);
+  margin: 0;
+  font: 600 clamp(35px, 3.4vw, 50px)/1.15 Domine, Georgia, serif;
+  letter-spacing: -0.025em;
+}
+.pickleiq-review-count {
+  position: absolute;
+  top: clamp(100px, 13vh, 122px);
+  left: clamp(48px, 6vw, 86px);
+  margin: 0;
+  color: var(--pickleiq-muted);
+  font-size: 15px;
+}
+.pickleiq-review-card {
+  position: absolute;
+  top: 46%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: clamp(320px, 34vw, 420px);
+  padding: 40px 32px;
+  border: 1px solid var(--pickleiq-line);
+  border-radius: 14px;
+  text-align: center;
+}
+.pickleiq-review-time {
+  margin: 0;
+  font: 600 32px/1.2 Domine, Georgia, serif;
+}
+.pickleiq-review-duration {
+  margin: 8px 0 0;
+  color: var(--pickleiq-muted);
+  font-size: 15px;
+}
+.pickleiq-review-actions {
+  position: absolute;
+  left: 50%;
+  bottom: clamp(96px, 15vh, 130px);
+  transform: translateX(-50%);
+  display: flex;
+  gap: 14px;
+}
+.pickleiq-review-back {
+  position: absolute;
+  left: 50%;
+  bottom: clamp(56px, 9vh, 80px);
+  transform: translateX(-50%);
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--pickleiq-muted);
+  font: 400 14px/1 "Libertinus Serif", Georgia, serif;
+  cursor: pointer;
+}
+.pickleiq-review-back:hover { color: var(--pickleiq-cream); }
+.pickleiq-review-summary {
+  margin: 0 0 8px;
+  color: var(--pickleiq-muted);
+  font-size: 15px;
+}
+.pickleiq-review-draw-actions {
+  margin-top: 14px;
+  display: flex;
+  gap: 10px;
+}
+.pickleiq-review-drawn-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(244, 239, 228, 0.14);
+  font-size: 14px;
+}
+.pickleiq-start-button-inline { margin-top: 20px; }
