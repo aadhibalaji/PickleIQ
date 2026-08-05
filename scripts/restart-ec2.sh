@@ -39,6 +39,36 @@ REGION="${AWS_REGION:-us-east-2}"
 
 sudo mkdir -p "$DATA_DIR"
 
+# DLAMI points Docker's data-root at the ephemeral NVMe
+# (/opt/dlami/nvme/docker). Instance stop/start wipes that volume, so the
+# mount comes back empty and `docker run` fails with:
+#   mkdir /opt/dlami/nvme/docker/containers/<id>: no such file or directory
+# Recreate the data-root and bounce dockerd whenever it's missing — must
+# run before any docker login/pull/run below. deploy.sh always stop/starts
+# the box when it was stopped, so this hits essentially every cold deploy.
+_ensure_docker_data_root() {
+  local data_root="/opt/dlami/nvme/docker"
+  if [[ -f /etc/docker/daemon.json ]] && command -v python3 >/dev/null 2>&1; then
+    local parsed
+    parsed="$(python3 -c 'import json; print(json.load(open("/etc/docker/daemon.json")).get("data-root",""))' 2>/dev/null || true)"
+    if [[ -n "${parsed}" ]]; then
+      data_root="$parsed"
+    fi
+  fi
+  if [[ ! -d "$data_root" ]]; then
+    echo "==> recreating Docker data-root at $data_root (wiped by instance stop/start)"
+    sudo mkdir -p "$data_root"
+    sudo systemctl restart docker
+    # dockerd needs a moment before login/pull work again
+    sleep 3
+  elif ! sudo docker info >/dev/null 2>&1; then
+    echo "==> Docker daemon unhealthy — restarting"
+    sudo systemctl restart docker
+    sleep 3
+  fi
+}
+_ensure_docker_data_root
+
 echo "==> logging in to ECR (uses this instance's IAM role)"
 aws ecr get-login-password --region "$REGION" \
   | sudo docker login --username AWS --password-stdin 051404302327.dkr.ecr.us-east-2.amazonaws.com

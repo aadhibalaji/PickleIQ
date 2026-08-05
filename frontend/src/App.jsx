@@ -9,6 +9,7 @@ export default function App() {
   const [current, setCurrent] = useState(null)
   const [uploading, setUploading] = useState(null) // progress 0..1
   const [error, setError] = useState('')
+  const [matchType, setMatchType] = useState('') // required at upload — see api/media.py
 
   const refresh = () => api.listVideos().then(setVideos).catch((e) => setError(e.message))
   useEffect(() => { refresh() }, [])
@@ -16,13 +17,19 @@ export default function App() {
   const onUpload = async (e) => {
     const file = e.target.files?.[0]
     if (!file) return
+    if (!matchType) {
+      setError('Select singles or doubles before uploading.')
+      e.target.value = ''
+      return
+    }
     setError('')
     setUploading(0)
     try {
       // Pass 1 starts in the background immediately — jump straight into the
       // workspace so labeling can begin while it runs.
-      const v = await api.uploadVideo(file, setUploading)
+      const v = await api.uploadVideo(file, matchType, setUploading)
       setUploading(null)
+      setMatchType('')
       setCurrent(v.id)
       refresh()
     } catch (err) {
@@ -90,11 +97,21 @@ export default function App() {
         <div className="row spread">
           <div>
             <label className="row">
-              <input type="file" accept="video/*" onChange={onUpload} disabled={uploading !== null} />
+              Match type:
+              <select value={matchType} onChange={(e) => setMatchType(e.target.value)} disabled={uploading !== null}>
+                <option value="">Select…</option>
+                <option value="singles">Singles</option>
+                <option value="doubles">Doubles</option>
+              </select>
+            </label>
+            <label className="row">
+              <input type="file" accept="video/*" onChange={onUpload}
+                     disabled={uploading !== null || !matchType} />
             </label>
             <div className="muted">
               Upload a fixed-camera clip. Pass 1 processing starts immediately in the
-              background — you can label rallies while it runs.
+              background — you can label rallies while it runs. Match type is required —
+              it caps how many players the tracker will identify per side.
             </div>
           </div>
           {uploading !== null && (
