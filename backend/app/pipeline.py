@@ -122,11 +122,11 @@ def mirror_cloud_progress(video_id: str, progress_payload: dict) -> None:
     this carries a real progress fraction, so the local UI shows genuine
     "Pass 1: N rallies so far, 47%" status instead of just "waiting for
     cloud worker" for however long Pass 1 takes. The snapshot object is
-    deleted by the cloud side once Pass 1 finishes (see
-    storage_s3.delete_progress) specifically so this never fires again with
-    stale 'running' state after the video has moved on — mirror_cloud_progress
-    itself always trusts whatever payload it's given without re-checking
-    staleness, by design; that's delete_progress's job, not this function's.
+    overwritten with a terminal status ('done'/'error'/'cancelled') by the
+    cloud side once Pass 1 finishes (see _upload_pass1_terminal_progress) —
+    mirror_cloud_progress itself always trusts whatever payload it's given
+    without distinguishing live vs. terminal, by design; that's the
+    uploader's job, not this function's.
 
     Also merges any rally_labels riding along in the same snapshot (see
     cv/pass1.py's _upload_progress_incremental) — this is what lets the
@@ -536,6 +536,20 @@ def _build_do_pass2_selections(video_id: str, params: dict, selections: list[dic
     return do_pass2_selections
 
 
+def _upload_pass1_terminal_progress(video_id: str, status: str, message: str) -> None:
+    """Overwrites Pass 1's live S3 progress snapshot (storage_s3.
+    upload_progress) with a terminal one instead of deleting it — best
+    effort, must never fail Pass 1 itself over a mirroring nicety for a
+    UI-only container that may not even exist."""
+    try:
+        storage_s3.upload_progress(video_id, {
+            "stage": "pass1", "status": status, "progress": 1.0 if status == "done" else 0.0,
+            "message": message,
+        })
+    except Exception:
+        log.warning("could not upload terminal pass1 progress for %s", video_id, exc_info=True)
+
+
 def start_processing(video_id: str) -> dict:
     """Kick off Pass 1 immediately (background). Pass 2 no longer auto-runs
     after it: it's now user-triggered from the Rally Analysis tab once the
@@ -555,16 +569,30 @@ def start_processing(video_id: str) -> dict:
         H, _, _ = effective_calibration(video_id)
         try:
             run_pass1(video_id, params, H, handle)
-        finally:
-            # Covers normal completion AND any exception (JobCancelled or a
-            # real failure) — run_pass1's periodic progress snapshot (see
-            # cv/pass1.py's _upload_progress_incremental) must never be left
-            # behind showing stale 'running' state once this job is no
-            # longer actually running, or a later poll-cloud-windows tick
-            # could re-mirror it and flip an already-finalized local job
-            # status back to 'running' — see storage_s3.delete_progress.
+        except JobCancelled:
             if STORAGE_BACKEND == "s3":
-                storage_s3.delete_progress(video_id)
+                _upload_pass1_terminal_progress(video_id, "cancelled", "")
+            raise
+        except Exception as exc:
+            if STORAGE_BACKEND == "s3":
+                _upload_pass1_terminal_progress(video_id, "error", str(exc))
+            raise
+        else:
+            # A RUN_PROCESSING=0 UI-only container has NO other way to learn
+            # Pass 1 finished: since Pass 2 no longer auto-chains after it
+            # (see this function's docstring), the chain-end result.json
+            # that sync-from-cloud/mirror_cloud_chain_status waits for won't
+            # exist until the user reviews candidates and Pass 2 actually
+            # runs — which could be minutes or never. Without this, the
+            # local mirror is stuck forever on the last 'running' progress
+            # snapshot poll-cloud-windows saw before this job's real Pass 1
+            # finished (looks exactly like "stalled at 100%"). Overwriting
+            # the live snapshot with a terminal one — instead of the old
+            # delete_progress approach — means poll-cloud-windows's very
+            # next tick mirrors 'done' locally, same path it already uses
+            # for live progress.
+            if STORAGE_BACKEND == "s3":
+                _upload_pass1_terminal_progress(video_id, "done", "")
 
     job_id = runner.submit(video_id, "pass1", do_pass1)
     return {"job_id": job_id, "learned_params_version": version}

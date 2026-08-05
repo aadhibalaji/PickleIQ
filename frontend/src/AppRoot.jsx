@@ -19,13 +19,22 @@ const btnStyle = (active) => ({
 export default function AppRoot() {
   const [mode, setMode] = useState(isTestingRoute ? 'testing' : 'consumer')
 
+  // Both stay mounted at all times — switching modes only toggles which is
+  // visible (display:none), so in-progress state (which video, which stage,
+  // upload/poll timers) survives flipping back and forth instead of being
+  // torn down and reset on every switch.
   return (
     <>
       <div style={barStyle}>
         <button style={btnStyle(mode === 'consumer')} onClick={() => setMode('consumer')}>PickleIQ</button>
         <button style={btnStyle(mode === 'testing')} onClick={() => setMode('testing')}>Testing</button>
       </div>
-      {mode === 'consumer' ? <PickleIQApp /> : <App />}
+      <div style={{ display: mode === 'consumer' ? 'block' : 'none' }}>
+        <PickleIQApp />
+      </div>
+      <div style={{ display: mode === 'testing' ? 'block' : 'none' }}>
+        <App />
+      </div>
     </>
   )
 }
