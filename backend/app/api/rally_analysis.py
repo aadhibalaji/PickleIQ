@@ -37,9 +37,15 @@ router = APIRouter()
 
 def _report_payload(report: CoachingReport) -> dict:
     tips = [asdict(t) for t in report.tips]
-    players = sorted({t["player_label"] for t in tips})
+    general = [asdict(g) for g in report.general]
+    # Union: a player can carry general feedback without landing any per-shot
+    # tip — they must still appear in the UI's player filter tabs.
+    players = sorted({t["player_label"] for t in tips}
+                     | {g["player_label"] for g in general})
     return {"video_id": report.video_id, "tips": tips, "players": players,
             "player_themes": [asdict(t) for t in report.player_themes],
+            "general_feedback": general,
+            "focus": report.focus,
             "stale_reason": report.stale_reason}
 
 
@@ -112,11 +118,17 @@ def readiness(video_id: str):
 
 
 @router.post("/rally-analysis/{video_id}/coaching-report")
-def generate_coaching_report(video_id: str, source: str | None = None):
+def generate_coaching_report(video_id: str, source: str | None = None,
+                              focus: str | None = None):
     """Triggers coaching report generation (one Anthropic API call) and
     persists it to coaching_reports, replacing any prior report for this
-    video. Not run automatically anywhere — explicit user action only."""
-    report = coaching.generate_coaching_report(video_id, rally_source=source)
+    video. Not run automatically anywhere — explicit user action only.
+    focus overrides the video's stored coaching_focus for this generation
+    only ('form' | 'positioning'); omitted = the stored value, then form."""
+    if focus is not None and focus not in (coaching.FOCUS_FORM, coaching.FOCUS_POSITIONING):
+        raise HTTPException(status_code=422,
+                            detail="focus must be 'form' or 'positioning'")
+    report = coaching.generate_coaching_report(video_id, rally_source=source, focus=focus)
     return _report_payload(report)
 
 

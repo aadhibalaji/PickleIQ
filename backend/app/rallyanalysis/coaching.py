@@ -19,8 +19,10 @@ from .. import db
 from ..config import ANTHROPIC_API_KEY, ANTHROPIC_COACHING_MODEL
 from ..cv import overlays
 from ..cv.court import NET_Y
-from .contracts import CoachingReport, CoachingTip, ShotFeatureVector
+from . import positioning
+from .contracts import CoachingReport, CoachingTip, GeneralFeedback, PlayerTheme, ShotFeatureVector
 from .readiness import default_overlay_source, get_analyzable_rallies
+from .shot_context import annotate_rally_context, classify_shot_types, position_samples
 
 log = logging.getLogger("rallyanalysis.coaching")
 
@@ -89,6 +91,14 @@ MAX_LLM_CANDIDATES = 16  # statistical shortlist size handed to the LLM, which
                           # makes the final cut down to MAX_TIPS using the
                           # frames (see build_report / SYSTEM selection rules)
 
+# Product decision (2026-08-04): when fewer than MAX_LLM_CANDIDATES moments
+# clear the flag threshold, top the shortlist up with the highest
+# |soft_deviation| moments anyway, each marked below_threshold in its LLM
+# summary. The LLM final cut keeps full skip authority (see the SYSTEM
+# selection rules), so borderline filler still gets dropped when the frames
+# don't back it up — this widens what the LLM sees, not what gets flagged.
+FILL_TO_LIMIT = True
+
 # ---------------------------------------------------------------------------
 # Salience — ranks WHICH flagged shots deserve one of the MAX_TIPS slots.
 # Deviation magnitude alone finds "most atypical", not "most obviously a
@@ -111,6 +121,62 @@ CATEGORY_METRICS = {
     "contact_point": ("elbow_extension_deg", "weight_transfer_score", "contact_height_m"),
     "follow_through": ("follow_through_completion_score",),
 }
+
+# ---------------------------------------------------------------------------
+# UNIVERSAL REFERENCE BANDS — the deliberate, narrow exception to the
+# per-player-relative rule above, closing its structural blind spot: a flaw a
+# player repeats on EVERY shot is, by definition, typical for them, so their
+# own Tukey fence can never flag it (and a player with < MIN_SAMPLES_FOR_
+# DISTRIBUTION shots has no fence at all). These bands catch only GROSS
+# fundamentals that are wrong under any reasonable camera projection and any
+# standard of play — standing straight-legged through a shot, a contact
+# jammed into the body, an arm-only swing or a chopped-off follow-through on
+# a hard drive. Everything subtler stays per-player-relative: 2D image-space
+# joint angles are projection-dependent, which is exactly why the original
+# design refused universal cutoffs for ordinary readings.
+#
+# Shape: (lo, hi, scale, fast_only). Deviation = signed excess beyond
+# [lo, hi] in `scale` units (same units as _rel_dev / positioning._abs_dev,
+# so WORST_DEVIATION_THRESHOLD and salience apply unchanged). fast_only
+# bands are checked only on shots typed *_fast (weight transfer and a full
+# follow-through are non-negotiable on drives, but legitimately tiny on
+# dinks/resets — an untempoed shot gets no check, conservative by default).
+# Constants are JUDGMENT CALLS pending labeled-clip validation, same status
+# as positioning.BANDS:
+#   knee_bend_deg  hip-knee-ankle ~180 = standing dead straight. 168+ reads
+#       as visually straight legs from any angle; scale 6 puts fully locked
+#       (180) at dev 2 ("clearly off").
+#   elbow_extension_deg  shoulder-elbow-wrist < 65 = contact jammed right
+#       into the body; normal volleys/dinks sit ~90-130, so 65 flags only
+#       the cramped extreme.
+#   weight_transfer_score  ~0 forward movement INTO a hard swing = all-arm.
+#   follow_through_completion_score  near-zero wrist path after a hard
+#       swing = chopped-off finish.
+# ---------------------------------------------------------------------------
+REFERENCE_BANDS = {
+    "knee_bend_deg": (0.0, 168.0, 6.0, False),
+    "elbow_extension_deg": (65.0, 180.0, 15.0, False),
+    "weight_transfer_score": (0.1, 1.0, 0.05, True),
+    "follow_through_completion_score": (0.15, 1.0, 0.1, True),
+}
+
+
+def _reference_dev(metric: str, value: float | None, shot_type: str | None) -> float | None:
+    """Signed deviation beyond the universal reference band in scale units —
+    0 inside, None when the metric has no band, no reading, or (for
+    fast_only bands) the shot isn't verifiably fast."""
+    band = REFERENCE_BANDS.get(metric)
+    if band is None or value is None:
+        return None
+    lo, hi, scale, fast_only = band
+    if fast_only and not (shot_type or "").endswith("_fast"):
+        return None
+    if value > hi:
+        return (value - hi) / scale
+    if value < lo:
+        return (value - lo) / scale
+    return 0.0
+
 
 MIN_TIP_GAP_S = 4.0  # minimum spacing, in seconds, between two selected tip
                       # moments for the SAME player (worst+best combined, any
@@ -476,7 +542,9 @@ def _finalize_vector(contact: dict, raw: dict, fences: dict,
     driven by relative comparability now instead of confident pose alone."""
     stratum_fences = stratum_fences or {}
     devs: dict = {}
+    softs: list[float] = []
     mixed_baseline_metrics: list[str] = []
+    reference_flagged_metrics: list[str] = []
     for f in METRIC_FIELDS:
         fence = stratum_fences.get(f)
         if fence is None:
@@ -484,6 +552,28 @@ def _finalize_vector(contact: dict, raw: dict, fences: dict,
             if fence is not None and raw[f] is not None:
                 mixed_baseline_metrics.append(f)
         devs[f] = _rel_dev(raw[f], fence)
+        # Universal reference check (see REFERENCE_BANDS): wins over the
+        # personal comparison only when it's the LARGER signal — so a
+        # habitual gross flaw flags even though it's "typical for them"
+        # (or when they have no personal fence at all), while a shot whose
+        # personal outlier-ness is the bigger story keeps that framing.
+        ref = _reference_dev(f, raw[f], contact.get("shot_type"))
+        if ref is not None and ref != 0.0 and (devs[f] is None or abs(ref) > abs(devs[f])):
+            devs[f] = ref
+            reference_flagged_metrics.append(f)
+        # soft_deviation: continuous distance from the fence midpoint (never
+        # clamped to 0 inside the fence) — fill-to-limit ranking only, see
+        # contracts.ShotFeatureVector.soft_deviation / select_tip_candidates.
+        if raw[f] is not None and fence is not None:
+            q1, q3, iqr = fence
+            mid = (q1 + q3) / 2.0
+            if iqr >= 1e-9:
+                softs.append((raw[f] - mid) / iqr)
+            else:
+                softs.append(0.0 if abs(raw[f] - mid) < 1e-9
+                             else math.copysign(1.0, raw[f] - mid))
+        if ref is not None and ref != 0.0:
+            softs.append(ref)
     category, deviation_score = _classify(devs)
     if category is None:
         return None
@@ -502,7 +592,9 @@ def _finalize_vector(contact: dict, raw: dict, fences: dict,
         no_comparison_metrics=no_comparison_metrics,
         shot_type=contact.get("shot_type"),
         mixed_baseline_metrics=mixed_baseline_metrics,
-        deviating_metrics=deviating_metrics)
+        deviating_metrics=deviating_metrics,
+        soft_deviation=max(softs, key=abs) if softs else None,
+        reference_flagged_metrics=reference_flagged_metrics)
 
 
 def compute_feature_vector(contact: dict, entries: list[dict], fps: float,
@@ -547,7 +639,7 @@ def _salience(vec: ShotFeatureVector, contact: dict) -> float:
 
 
 def _shot_summary(vec: ShotFeatureVector, contact: dict) -> dict:
-    return {
+    summary = {
         "contact_id": vec.contact_id,
         "category": vec.category,
         "deviation_score": vec.deviation_score,
@@ -585,8 +677,27 @@ def _shot_summary(vec: ShotFeatureVector, contact: dict) -> dict:
         "low_confidence_metrics": list(vec.low_confidence_metrics),
         "no_comparison_metrics": list(vec.no_comparison_metrics),
         "mixed_baseline_metrics": list(vec.mixed_baseline_metrics),
+        # Metrics whose deviation came from the conservative UNIVERSAL check
+        # (REFERENCE_BANDS) rather than the player's own fence — the only
+        # metrics the LLM may coach as correct-form claims.
+        "reference_flagged_metrics": list(vec.reference_flagged_metrics),
         "feature_vector": asdict(vec),
     }
+    # Span moments (positioning focus) are stretches of movement, not swings —
+    # surfaced so keyframes.py picks wider offsets and the LLM never describes
+    # them as shots (see positioning.span_moments / the positioning SYSTEM
+    # blocks). Absent on real contacts, never None-filled.
+    if contact.get("kind") == "span":
+        summary["kind"] = "span"
+        summary["span"] = contact.get("span")
+    # Ball-derived context (see ball_context.py) — present only when the
+    # tracker actually measured it; absence means "no ball evidence", so
+    # these keys are never None-filled.
+    if contact.get("tempo_verified"):
+        summary["tempo_verified"] = contact["tempo_verified"]
+    if contact.get("rally_end_ball"):
+        summary["rally_end_ball"] = contact["rally_end_ball"]
+    return summary
 
 
 def _suppress_close_duplicates(worst: list[dict], best: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -623,7 +734,8 @@ def _suppress_close_duplicates(worst: list[dict], best: list[dict]) -> tuple[lis
 
 
 def _select_praise_exemplars(vectors_meta: list[tuple[ShotFeatureVector, dict]],
-                              worst_summaries: list[dict]) -> list[dict]:
+                              worst_summaries: list[dict],
+                              category_metrics: dict = CATEGORY_METRICS) -> list[dict]:
     """At most ONE praise candidate per player, at most MAX_PRAISE_TIPS
     total — chosen to be pedagogically CONNECTED to that player's flaws, not
     random encouragement: the exemplar is their most confident in-range shot
@@ -658,7 +770,7 @@ def _select_praise_exemplars(vectors_meta: list[tuple[ShotFeatureVector, dict]],
             conf = float(contact.get("confidence") or 0.0)
             if conf < MIN_BEST_CONFIDENCE:
                 continue
-            if target_cat and all(getattr(vec, f) is None for f in CATEGORY_METRICS[target_cat]):
+            if target_cat and all(getattr(vec, f) is None for f in category_metrics[target_cat]):
                 continue  # nothing real to praise in the category that matters
             candidates.append((conf, vec, contact))
         if not candidates:
@@ -674,7 +786,8 @@ def _select_praise_exemplars(vectors_meta: list[tuple[ShotFeatureVector, dict]],
     return [summary for _n, _c, summary in prioritized[:MAX_PRAISE_TIPS]]
 
 
-def select_worst_best(vectors_meta: list[tuple[ShotFeatureVector, dict]]) -> tuple[list[dict], list[dict]]:
+def select_worst_best(vectors_meta: list[tuple[ShotFeatureVector, dict]],
+                       category_metrics: dict = CATEGORY_METRICS) -> tuple[list[dict], list[dict]]:
     """Adaptive severity selection — NOT a fixed top-N. worst_shots: shots
     whose |deviation_score| clears WORST_DEVIATION_THRESHOLD reference-range-
     widths beyond their category's own good-form bound (deviation_score is
@@ -691,12 +804,15 @@ def select_worst_best(vectors_meta: list[tuple[ShotFeatureVector, dict]]) -> tup
 
     worst = [_shot_summary(vec, contact) for vec, contact in vectors_meta
              if abs(vec.deviation_score) >= WORST_DEVIATION_THRESHOLD]
-    best = _select_praise_exemplars(vectors_meta, worst)
+    best = _select_praise_exemplars(vectors_meta, worst, category_metrics)
     return _suppress_close_duplicates(worst, best)
 
 
 def select_tip_candidates(vectors_meta: list[tuple[ShotFeatureVector, dict]],
-                           limit: int = MAX_TIPS) -> list[dict]:
+                           limit: int = MAX_TIPS,
+                           category_metrics: dict = CATEGORY_METRICS,
+                           fill_to_limit: bool = False,
+                           category_cap: int | None = None) -> list[dict]:
     """Bounds select_worst_best's adaptive output to at most `limit` shots —
     worst shots (the actionable ones) get priority, ranked by SALIENCE (not
     raw deviation — see _salience: rally-ending mistakes and multi-metric
@@ -712,11 +828,35 @@ def select_tip_candidates(vectors_meta: list[tuple[ShotFeatureVector, dict]],
     present (not hardcoded to 2 or 4 — a video may carry any count,
     especially before Part 0's singles-merge stopgap runs). A player short on
     notable contacts simply yields their unused share back to the pool
-    rather than getting a padded/fabricated tip. Returned order is improve
-    tips salience-first, praise last — build_report relies on that when
-    hard-capping the LLM's output back to MAX_TIPS."""
-    worst, best = select_worst_best(vectors_meta)
+    rather than getting a padded/fabricated tip. Returned order is flagged
+    improve tips salience-first, then below-threshold fill (when
+    fill_to_limit), praise last — build_report relies on that when
+    hard-capping the LLM's output back to MAX_TIPS.
+
+    fill_to_limit (see FILL_TO_LIMIT): tops the shortlist up to `limit` with
+    the highest-|soft_deviation| unflagged moments, each summary marked
+    "below_threshold": True so the LLM (and any eval tooling) can tell filler
+    from real flags. The flagged/not-flagged bar itself never moves — this
+    widens what the LLM gets to see, not what counts as a problem.
+
+    category_cap: coverage guard — at most this many flagged candidates from
+    any single category, so one dominant failure mode (70 baseline-camping
+    contacts on a real clip) can't monopolize the whole shortlist and crowd
+    every other category out of the LLM's view. Applied salience-first, and
+    ONLY when more than one category flagged (a genuinely one-issue session
+    shouldn't have its list truncated toward nothing). Session-wide counts
+    (session_context / _general_context) are built from ALL of vectors_meta,
+    so capped-out shots still shape the aggregate story."""
+    worst, best = select_worst_best(vectors_meta, category_metrics)
     worst = sorted(worst, key=lambda s: -s["salience"])
+    if category_cap is not None and len({s["category"] for s in worst}) > 1:
+        kept, by_cat = [], {}
+        for s in worst:
+            if by_cat.get(s["category"], 0) >= category_cap:
+                continue
+            kept.append(s)
+            by_cat[s["category"]] = by_cat.get(s["category"], 0) + 1
+        worst = kept
     best = sorted(best, key=lambda s: -(s.get("confidence") or 0.0))
     players = sorted({s["player_id"] for s in worst + best})
     if not players:
@@ -742,11 +882,49 @@ def select_tip_candidates(vectors_meta: list[tuple[ShotFeatureVector, dict]],
             selected.append(s)
             used_ids.add(s["contact_id"])
 
-    # Improve tips salience-first, praise at the end, capped at limit.
-    improve = sorted([s for s in selected if s["deviation_score"] != 0.0],
+    # Membership sets, not deviation_score == 0 checks: below-threshold fill
+    # can carry a 0.0 deviation (in-band) without being praise.
+    praise_ids = {s["contact_id"] for s in best}
+    improve = sorted([s for s in selected if s["contact_id"] not in praise_ids],
                      key=lambda s: -s["salience"])
-    praise = [s for s in selected if s["deviation_score"] == 0.0]
-    return (improve + praise)[:limit]
+    praise = [s for s in selected if s["contact_id"] in praise_ids]
+
+    fill: list[dict] = []
+    if fill_to_limit and len(improve) + len(praise) < limit:
+        # Respect the same per-player MIN_TIP_GAP_S spacing the flagged
+        # selection got — filler must never reintroduce a near-duplicate
+        # moment that _suppress_close_duplicates already rejected.
+        kept_times: dict = {}
+        for s in improve + praise:
+            if s.get("timestamp_s") is not None:
+                kept_times.setdefault(s["player_id"], []).append(s["timestamp_s"])
+        # Genuinely-unflagged moments only: a flagged shot missing from
+        # `selected` was excluded deliberately (near-duplicate suppression or
+        # the category cap) — re-adding it as "below_threshold" filler would
+        # both mislabel it and defeat the exclusion.
+        pool = [(vec, c) for vec, c in vectors_meta
+                if c["contact_id"] not in used_ids and vec.soft_deviation is not None
+                and abs(vec.deviation_score) < WORST_DEVIATION_THRESHOLD]
+        pool.sort(key=lambda vm: (-abs(vm[0].soft_deviation),
+                                   -(vm[1].get("confidence") or 0.0)))
+        for vec, c in pool:
+            if len(improve) + len(praise) + len(fill) >= limit:
+                break
+            ts = c.get("timestamp_s")
+            times = kept_times.setdefault(c.get("player_id"), [])
+            if ts is not None and any(abs(ts - t) < MIN_TIP_GAP_S for t in times):
+                continue
+            s = _shot_summary(vec, c)
+            s["below_threshold"] = True
+            fill.append(s)
+            used_ids.add(c["contact_id"])
+            if ts is not None:
+                times.append(ts)
+
+    # Flagged improve salience-first, then fill, praise at the end, capped at
+    # limit — the MAX_TIPS hard cap in build_report keeps the front, so
+    # over-budget LLM output sheds praise, then filler, before real flags.
+    return (improve + fill + praise)[:limit]
 
 
 # ---------------------------------------------------------------------------
@@ -775,7 +953,8 @@ def _llm_shot_payload(shot: dict) -> dict:
     out = dict(shot)
     fv = shot.get("feature_vector")
     metric_list_keys = ("low_confidence_metrics", "no_comparison_metrics",
-                         "mixed_baseline_metrics", "deviating_metrics")
+                         "mixed_baseline_metrics", "deviating_metrics",
+                         "reference_flagged_metrics")
     if fv:
         fv = {LLM_METRIC_NAMES.get(k, k): v for k, v in fv.items()}
         for key in metric_list_keys:
@@ -810,6 +989,49 @@ def _session_context(vectors_meta: list[tuple[ShotFeatureVector, dict]]) -> dict
     return {player_label(pid): e for pid, e in per_player.items()} or None
 
 
+# A category needs at least this many analyzed moments for one player before
+# "cleanest category" is a meaningful praise pick — 1-2 clean moments is
+# absence of evidence, not evidence of a strength.
+MIN_GENERAL_CATEGORY_SAMPLES = 3
+
+
+def _general_context(vectors_meta: list[tuple[ShotFeatureVector, dict]]) -> dict | None:
+    """Deterministic per-player session aggregates behind general_feedback
+    (one praise + one improve per player) — the coarse pass: pure
+    category-level math over EVERY scored moment, no LLM. Besides the raw
+    counts, two deterministic picks per player: strongest_negative_category
+    (most flagged — what the improve piece should be about) and
+    strongest_positive_category (their best-sampled cleanest category — what
+    the praise piece should be about). A None pick is an honest gap ("the
+    data doesn't support a call"), never backfilled; the same category is
+    never both picks."""
+    per_player: dict = {}
+    for vec, contact in vectors_meta:
+        cats = per_player.setdefault(contact.get("player_id"), {})
+        entry = cats.setdefault(vec.category, {"n": 0, "flagged": 0})
+        entry["n"] += 1
+        if abs(vec.deviation_score) >= WORST_DEVIATION_THRESHOLD:
+            entry["flagged"] += 1
+
+    out: dict = {}
+    for pid, cats in per_player.items():
+        flagged = {c: e for c, e in cats.items() if e["flagged"] > 0}
+        negative = (max(flagged, key=lambda c: (flagged[c]["flagged"],
+                                                 flagged[c]["flagged"] / flagged[c]["n"]))
+                    if flagged else None)
+        sampled = {c: e for c, e in cats.items()
+                   if e["n"] >= MIN_GENERAL_CATEGORY_SAMPLES and c != negative}
+        positive = (min(sampled, key=lambda c: (sampled[c]["flagged"] / sampled[c]["n"],
+                                                 -sampled[c]["n"]))
+                    if sampled else None)
+        out[player_label(pid)] = {
+            "by_category": cats,
+            "strongest_negative_category": negative,
+            "strongest_positive_category": positive,
+        }
+    return out or None
+
+
 TIPS_SCHEMA = {
     "type": "object",
     "properties": {
@@ -835,34 +1057,52 @@ TIPS_SCHEMA = {
                 "additionalProperties": False,
             },
         },
-        "player_themes": {
+        "general_feedback": {
             "type": "array",
             "items": {
                 "type": "object",
                 "properties": {
                     "player_label": {"type": "string", "description": "Exactly one of the "
                                      "player_label values present in the shots you were given."},
-                    "theme": {"type": "string", "description": "1-2 sentences, coach voice: the "
-                              "dominant session-wide pattern for this player (what kept showing "
-                              "up, and the one thing to focus on), grounded in session_context "
-                              "and the shots. Same no-raw-numbers/no-anatomy rules as tips."},
+                    "praise": {"type": "string", "description": "1-2 sentences, coach voice: the "
+                               "ONE thing genuinely working for this player this session — real "
+                               "reinforcement of something observed, never filler. Grounded in "
+                               "general_context/session_context and the shots. Same "
+                               "no-raw-numbers/no-anatomy rules as tips."},
+                    "improve": {"type": "string", "description": "1-2 sentences, coach voice: the "
+                                "single most valuable thing for this player to fix — the dominant "
+                                "negative session pattern, one pointed fix, not a list. Same "
+                                "rules as tips."},
                 },
-                "required": ["player_label", "theme"],
+                "required": ["player_label", "praise", "improve"],
                 "additionalProperties": False,
             },
         },
     },
-    "required": ["tips", "player_themes"],
+    "required": ["tips", "general_feedback"],
     "additionalProperties": False,
 }
 
-SYSTEM = """You are a pickleball coach giving quick, spoken-style tips on
-individual shots from one session, plus one short session theme per player,
-based on pose-derived shot mechanics that a computer-vision pipeline
-extracted at each detected contact/swing — and, when available, actual
-still frames of the player taking each shot.
+# ---------------------------------------------------------------------------
+# SYSTEM prompt — composed per focus by system_prompt() below from shared
+# blocks plus focus-specific ones (which metric family the shots carry and
+# how deviation_score was computed for it: form = per-player Tukey fences,
+# positioning = absolute court-geometry bands — the framings are mutually
+# exclusive, never show both). The form composition is bound to module-level
+# SYSTEM so existing imports and the substring-pinning tests keep working.
+# ---------------------------------------------------------------------------
 
-You receive a list of shots, each with a category (footwork, paddle_prep,
+FOCUS_FORM = "form"
+FOCUS_POSITIONING = "positioning"
+
+_SYS_INTRO_FORM = """You are a pickleball coach giving quick, spoken-style tips on
+individual shots from one session — plus, for each player, one thing that's
+genuinely working and one thing to fix — based on pose-derived shot
+mechanics that a computer-vision pipeline extracted at each detected
+contact/swing — and, when available, actual still frames of the player
+taking each shot."""
+
+_SYS_INPUT_FORM = """You receive a list of shots, each with a category (footwork, paddle_prep,
 contact_point, or follow_through), a deviation_score, a feature_vector of raw
 pose measurements (joint angles in degrees, 0-1 scores, seconds, metres), a
 low_confidence_metrics list, and a no_comparison_metrics list.
@@ -874,9 +1114,9 @@ pipeline has no vertical measurement at all. Never make any claim about
 contact height, meeting the ball low/high, or letting the ball drop — that
 information does not exist in this data. Court positioning claims ("you're
 hanging back near the baseline", "you took that one from mid-court") are the
-only valid use of this field.
+only valid use of this field."""
 
-Some or all shots may come with labeled still frames (prep / contact /
+_SYS_FRAMES = """Some or all shots may come with labeled still frames (prep / contact /
 follow-through — cropped around the hitting player, matched to the shot by
 contact_id). When frames are present for a shot they are your PRIMARY
 evidence: look at them first, and ground the critique in what the player is
@@ -892,29 +1132,42 @@ honesty to the image itself: small crops can be blurry or ambiguous, so if
 you can't clearly make something out, don't claim it. Speak like a coach
 reviewing film with the player ("I can see you're...", "look at where your
 feet are here") — never mention frames, images, crops, cameras, or that
-you're an AI looking at pictures.
+you're an AI looking at pictures."""
 
-IMPORTANT — deviation_score is relative to THIS PLAYER, not a universal
-standard: it measures how far this shot falls from THIS PLAYER's OWN typical
-value for that category's metric(s), computed across their OTHER shots in
-this same session. Negative/positive = notably outside their own usual range
-for this category and needs work; 0 = typical for them, a solid shot. There
-is no validated "correct" biomechanical range this pipeline compares against
-— only how consistent this shot was with the rest of this player's own
-session. Frame feedback that way (e.g. "shallower than your usual knee bend
-on this shot" or "you're not getting as low as you normally do"), never as a
-claim about correct/ideal form in general (never "your knee bend should be
-X degrees" or "that's below the ideal range").
+_SYS_DEVIATION_FORM = """IMPORTANT — deviation_score is relative to THIS PLAYER by default, not a
+universal standard: it measures how far this shot falls from THIS PLAYER's
+OWN typical value for that category's metric(s), computed across their
+OTHER shots in this same session. Negative/positive = notably outside their
+own usual range for this category and needs work; 0 = typical for them, a
+solid shot. Frame those critiques as consistency feedback (e.g. "shallower
+than your usual knee bend on this shot" or "you're not getting as low as
+you normally do"), never as a claim about correct/ideal form in general
+(never "your knee bend should be X degrees" or "that's below the ideal
+range").
 
-Calibrate how strongly you word a critique to |deviation_score|, translated
+The ONE exception: metrics listed in a shot's reference_flagged_metrics
+failed a deliberately conservative universal check — a gross fundamental
+that is off under any reasonable standard of play (standing straight-legged
+through a shot, a contact jammed right into the body, an arm-only swing or
+a chopped-off follow-through on a hard drive). For THOSE metrics only, you
+MAY coach correct form directly ("bend your knees and get low", "step into
+it and finish your swing") — that is exactly the feedback a player with a
+CONSISTENT flaw needs, because a habit they repeat on every shot never
+stands out from their own baseline. When the same metric keeps appearing in
+reference_flagged_metrics across many shots, treat it as one recurring
+habit worth a theme, not many separate discoveries. For every other metric
+there is no validated universal range and personal consistency is the only
+honest comparison."""
+
+_SYS_SEVERITY = """Calibrate how strongly you word a critique to |deviation_score|, translated
 qualitatively and never recited as a number: magnitude around 1-2 means the
 shot drifted a bit outside their usual — note it lightly; 2-4 means it was
 clearly off their normal — be direct about it; above 4 means it was way
 outside anything else they did this session — treat it as the shot to talk
 about. Matching your intensity to the evidence is what keeps the feedback
-credible.
+credible."""
 
-Each shot may carry a shot_type — a coarse, pose-derived stratification key:
+_SYS_SHOT_TYPE_FORM = """Each shot may carry a shot_type — a coarse, pose-derived stratification key:
 court zone plus whether the swing was soft or fast RELATIVE TO THAT PLAYER'S
 OWN session (e.g. "kitchen_soft", "backcourt_fast", or just a zone like
 "midcourt" when tempo couldn't be judged). It is NOT a verified stroke
@@ -933,9 +1186,9 @@ comparison fell back to ALL of their shots regardless of type. A critique
 leaning on a metric in mixed_baseline_metrics crosses shot types, so soften
 cross-type claims accordingly — especially follow-through and swing-size
 claims on soft/kitchen shots, where "shorter than your usual" may only mean
-"shorter than your drives".
+"shorter than your drives"."""
 
-Rally context: rally_shot_index / rally_shot_count place the shot inside its
+_SYS_RALLY = """Rally context: rally_shot_index / rally_shot_count place the shot inside its
 rally, and is_rally_ending marks the LAST detected shot of a rally — the
 point ended on or right after it. The data does NOT say whether that shot
 was a winner or an error, and you must never assert either (no "that one
@@ -944,16 +1197,33 @@ MAY do: use it for stakes-aware framing ("this was the last shot of that
 rally — worth getting right"), and for pattern-spotting — several
 rally-ending shots sharing the same flaw is exactly the kind of theme worth
 naming. seconds_until_rally_end is internal timing signal under the same
-rules as every other raw number: never recite it.
+rules as every other raw number: never recite it."""
 
-These raw numbers are internal signal only — NEVER mention degrees, angles, confidence/certainty scores, or anatomical terms (no "elbow extension",
+_SYS_BALL = """Some sessions include ball-tracking evidence; when a shot carries it:
+- tempo_verified ('soft' | 'fast'): the swing's tempo measured from the
+  actual tracked ball speed rather than inferred from the player's motion.
+  A shot_type built on it is trustworthy about tempo — coach the situation
+  accordingly, and trust it over any impression the pose numbers give.
+- rally_end_ball, only ever on a rally's FINAL shot: 'landed_out' means the
+  tracked ball's bounce after that swing was called outside the court — you
+  MAY treat that shot as the error that ended the rally ("that one sailed
+  long on you") and give it that weight; 'landed_in_unreturned' means it
+  bounced in and was never returned — you MAY treat it as the shot that won
+  the point and praise what made it work. These are measured outcomes, the
+  ONE exception to the winner/error rule above; on any shot without
+  rally_end_ball that rule applies in full.
+Ball readings come from a computer-vision tracker: never recite speeds or
+any other number from them, and if a shot's frames clearly contradict the
+label, trust the frames."""
+
+_SYS_NO_NUMBERS = """These raw numbers are internal signal only — NEVER mention degrees, angles, confidence/certainty scores, or anatomical terms (no "elbow extension",
 "shoulder rotation", "knee bend angle", etc.) in your output. Translate them
 into plain language a rec/intermediate pickleball player would actually
 understand and act on (e.g. "you're rushing your paddle back" instead of
 "delayed unit turn", or "plant your feet before you swing" instead of
-"insufficient weight transfer").
+"insufficient weight transfer")."""
 
-You may also receive a player_tendencies object — small, rounded, per-player
+_SYS_TENDENCIES = """You may also receive a player_tendencies object — small, rounded, per-player
 summaries (session-level tendencies, not per-shot data) such as how quickly a
 player tends to get back to the kitchen after a point, or how their shots
 tend to distribute across court zones. Treat these exactly like the pose
@@ -965,22 +1235,33 @@ arrival averages 2 seconds." Small rounded shot counts (e.g. "you rarely hit
 deep to the backcourt") may inform your framing but should stay in service of
 a coaching point, not be recited as a stat line. If player_tendencies is
 absent or empty, ignore it — say nothing about session-level tendencies for
-that player.
+that player."""
 
-You may also receive a session_context object: for each player, how many of
+_SYS_SESSION_CTX = """You may also receive a session_context object: for each player, how many of
 their shots were analyzed across the WHOLE session (not just the shots shown
 to you), how many were typical for them, and how often each category was
 flagged. This is the ground truth for what actually kept happening — a
 pattern that shows up repeatedly in session_context is a theme; a category
 flagged once is a moment, not a pattern. Use it to decide each player's
-theme and to keep individual tips in proportion (don't declare "you always
-rush your prep" off one flagged shot when session_context shows the other
-ten were fine). Like everything else, these counts are internal signal:
-paraphrase qualitatively ("this kept showing up", "most of your shots were
-solid"), never recite tallies. If session_context is absent, base themes
-only on the shots you can see and keep them modest.
+general_feedback and to keep individual tips in proportion (don't declare
+"you always rush your prep" off one flagged shot when session_context shows
+the other ten were fine). Like everything else, these counts are internal
+signal: paraphrase qualitatively ("this kept showing up", "most of your
+shots were solid"), never recite tallies. If session_context is absent,
+base the general feedback only on the shots you can see and keep it
+modest."""
 
-IMPORTANT — data gaps are real and marked, not hidden: some feature_vector
+_SYS_FEEDBACK = """You may also receive tip_feedback_history: for each tip category, how
+often this player has marked past tips in it helpful or not helpful across
+their sessions. Use it only as a light tiebreaker when choosing among
+similarly strong candidates — lean toward categories that have landed
+before, and for a category that keeps getting rejected, rethink the ANGLE
+of the advice (how it's framed), never water down its substance. NEVER
+suppress a clearly severe moment because its category polled badly, never
+mention ratings, and if tip_feedback_history is absent, ignore this
+entirely."""
+
+_SYS_NULLS = """IMPORTANT — data gaps are real and marked, not hidden: some feature_vector
 fields are null. A null field means the computer-vision system did NOT get a
 confident reading for that specific measurement on that specific shot (pose
 tracking lost the joint, or its confidence was too low to trust) — it is not
@@ -1008,9 +1289,9 @@ your usual", "better than your average", "not as extended as normal for you")
 for a field listed in a shot's no_comparison_metrics, even though you may
 still know its raw value. If a shot's category is driven mostly by fields in
 no_comparison_metrics, keep the tip general/encouraging about that category
-rather than inventing a personal baseline that doesn't exist yet.
+rather than inventing a personal baseline that doesn't exist yet."""
 
-Write like a coach who is invested in this specific player, not a lab report
+_SYS_VOICE = """Write like a coach who is invested in this specific player, not a lab report
 or a performance review — and NOT a compliment sandwich that pads or dilutes
 the critique. Every "improve" tip follows the same three-beat shape:
   1. Acknowledge what's happening for the player right now, so the critique
@@ -1048,22 +1329,30 @@ and encouraging in tone rather than content. For each selected shot with
 deviation_score == 0, write one "praise" tip: what they're doing well and
 why it works, so they know what to keep doing. Return exactly one tip per
 SELECTED shot, each referencing that shot's contact_id so it can be matched
-back up; shots you don't select simply get no entry.
+back up; shots you don't select simply get no entry."""
 
-Also return player_themes: exactly one entry per distinct player_label
-present in the shots, and none for any label not present. Each theme is 1-2
-sentences in the same coach voice — the through-line of that player's
-session (what kept showing up per session_context, and the single most
-valuable thing to work on), or genuine reinforcement if their session was
-solid. Write each tip so it reads as part of that player's theme when the
-shot fits the pattern, but every tip must still stand alone. All the rules
-above — no raw numbers, no anatomical terms, null and no-comparison
-discipline — apply to themes exactly as they do to tips.
+_SYS_GENERAL = """Also return general_feedback: exactly one entry per distinct player_label
+present in the shots, and none for any label not present. Each entry is two
+short pieces in the same coach voice, 1-2 sentences each: "praise" — the
+ONE thing genuinely working for this player this session — and "improve" —
+the single most valuable thing to fix. Ground both in the general_context
+object when present: for each player it aggregates EVERY analyzed moment by
+category (how many, how many flagged) and names strongest_positive_category
+/ strongest_negative_category — the session-wide patterns the aggregates
+actually support. Prefer those categories; a null pick means the data does
+not support a call there, so stay modest and base that piece only on what
+you can see — never invent a session-wide pattern from a single moment.
+Praise is real reinforcement of something observed, never filler; improve
+is one pointed fix, not a list. Write each tip so it reads as part of that
+player's general feedback when the moment fits the pattern, but every tip
+must still stand alone. All the rules above — no raw numbers, no anatomical
+terms, null and no-comparison discipline — apply to general_feedback
+exactly as they do to tips."""
 
-Do not overstate certainty — this is
-computer-vision-derived pose data, not a substitute for in-person coaching.
+_SYS_DISCLAIMER = """Do not overstate certainty — this is
+computer-vision-derived pose data, not a substitute for in-person coaching."""
 
-""" + f"""THE FINAL CUT IS YOURS. You may be given more shots than you
+_SYS_SELECTION = f"""THE FINAL CUT IS YOURS. You may be given more shots than you
 should write about — up to {MAX_LLM_CANDIDATES} candidates, pre-ranked by a
 statistical salience score (larger deviations, rally-ending shots, and
 multi-metric breakdowns rank higher). The numbers cannot see the video; you
@@ -1085,20 +1374,142 @@ A shot with exemplar_of_category set is a PRAISE candidate: that player's
 cleanest example of the category their flagged shots struggle with. If you
 select it, tone is "praise" and the tip should point at what doing that
 category well looks like for them, so it reinforces the improve tips
-rather than being generic encouragement."""
+rather than being generic encouragement.
+
+Some shots may carry below_threshold: true — they did NOT cross the
+statistical flag bar and were only included to fill out your shortlist.
+Treat them as borderline: pick one only when its frames clearly show
+something coachable, word it lightly, and skip them freely — an
+unremarkable below_threshold shot is exactly the one to leave out."""
+
+# --------------------------- positioning focus -----------------------------
+
+_SYS_INTRO_POSITIONING = """You are a pickleball coach giving quick, spoken-style tips on court
+positioning and movement from one session — plus, for each player, one
+thing that's genuinely working and one thing to fix — based on where a
+computer-vision pipeline measured each player standing and moving on the
+court — and, when available, actual still frames of the moments in
+question."""
+
+_SYS_INPUT_POSITIONING = """You receive a list of moments, each with a category (net_position,
+transition, court_coverage, or team_spacing), a deviation_score, a
+feature_vector of raw positioning measurements (metres and seconds), and a
+low_confidence_metrics list naming every field with no reading for that
+moment.
+
+Two kinds of moment appear. Most are tied to a specific shot the player
+hit. Others carry "kind": "span" — those are STRETCHES OF MOVEMENT between
+shots (their span object gives the metric and its time range), not swings:
+dwelling in no-man's-land, being slow to come in behind a return, drifting
+apart from a partner. Never describe a span moment as a shot or a swing —
+talk about where the player is standing and how they're moving around that
+moment.
+
+The metric names say exactly what they measure: kitchen_distance_at_contact_m
+(metres behind their own non-volley-zone line when they hit — negative means
+inside the kitchen), return_depth_m (metres inside their own baseline when
+returning serve), transition_dwell_s (longest continuous stay in the
+midcourt band), kitchen_approach_after_return_s (seconds from their return
+of serve until they were established at their own kitchen line),
+recovery_offset_m (lateral metres off the center line when the opponent next
+struck, after this player was pulled wide — singles only), and
+partner_depth_stagger_m (depth split between partners held for a second or
+more — doubles only)."""
+
+_SYS_DEVIATION_POSITIONING = """IMPORTANT — deviation_score here is measured against the COURT ITSELF,
+not against this player's own habits: the court is a fixed size, and each
+metric's acceptable band comes from its real geometry (where the
+non-volley-zone line actually is, how long a body takes to cross the
+midcourt band). 0 = within what good positioning allows; positive/negative
+= outside it. Because the standard is external and real, you MAY frame
+positioning feedback as what good positioning looks like in general ("you
+want to be at the kitchen line by now", "that's no-man's-land — don't set
+up camp there"). Do not dress it up as a comparison to this player's own
+usual game — the data says where they were on the court, not what their
+habits are."""
+
+_SYS_SEVERITY_POSITIONING = """Calibrate how strongly you word a critique to |deviation_score|, translated
+qualitatively and never recited as a number: magnitude around 1-2 means they
+drifted a bit outside good positioning — note it lightly; 2-4 means they
+were clearly out of position — be direct about it; above 4 means they were
+badly out of position for a sustained stretch — treat it as the thing to
+talk about. Matching your intensity to the evidence is what keeps the
+feedback credible."""
+
+_SYS_CONTEXT_POSITIONING = """Positioning moments carry no shot_type and no mixed_baseline_metrics —
+every comparison here is against the court's own geometry, never across
+shot types. rally_shot_index still places a shot-anchored moment inside its
+rally; the early-rally shots where deep positioning is CORRECT (serve,
+return, third shot) are already excluded from the depth metrics, so never
+scold a player for standing deep early in a rally."""
+
+# Focus-specific prompt blocks, keyed by focus then slot; the shared blocks
+# above apply to every focus. The deviation blocks are mutually exclusive on
+# purpose: form deviations are per-player-relative (Tukey fences), positioning
+# deviations are absolute court geometry — composing both framings into one
+# prompt would make each one a lie half the time.
+_FOCUS_BLOCKS = {
+    FOCUS_FORM: {
+        "intro": _SYS_INTRO_FORM,
+        "input": _SYS_INPUT_FORM,
+        "deviation": _SYS_DEVIATION_FORM,
+        "severity": _SYS_SEVERITY,
+        "context": _SYS_SHOT_TYPE_FORM,
+    },
+    FOCUS_POSITIONING: {
+        "intro": _SYS_INTRO_POSITIONING,
+        "input": _SYS_INPUT_POSITIONING,
+        "deviation": _SYS_DEVIATION_POSITIONING,
+        "severity": _SYS_SEVERITY_POSITIONING,
+        "context": _SYS_CONTEXT_POSITIONING,
+    },
+}
+
+
+def system_prompt(focus: str = FOCUS_FORM) -> str:
+    """The coaching SYSTEM prompt for one focus: the shared blocks with the
+    focus-specific intro / input description / deviation semantics / extra
+    context interleaved in reading order. The form composition reproduces the
+    pre-split prompt verbatim (module-level SYSTEM below)."""
+    if focus not in _FOCUS_BLOCKS:
+        raise ValueError(f"unknown coaching focus: {focus!r}")
+    b = _FOCUS_BLOCKS[focus]
+    return "\n\n".join([
+        b["intro"], b["input"], _SYS_FRAMES, b["deviation"], b["severity"],
+        b["context"], _SYS_RALLY, _SYS_BALL, _SYS_NO_NUMBERS, _SYS_TENDENCIES,
+        _SYS_SESSION_CTX, _SYS_FEEDBACK, _SYS_NULLS, _SYS_VOICE, _SYS_GENERAL,
+        _SYS_DISCLAIMER, _SYS_SELECTION,
+    ])
+
+
+SYSTEM = system_prompt(FOCUS_FORM)
+
+
+def resolve_focus(stored: str | None, override: str | None = None) -> str:
+    """The focus a report should be generated under: explicit per-call
+    override first (API query param), then the video's stored coaching_focus
+    column, then form — a NULL/unset clip behaves exactly as it did before
+    selectable focus existed."""
+    focus = override or stored or FOCUS_FORM
+    if focus not in (FOCUS_FORM, FOCUS_POSITIONING):
+        raise ValueError(f"unknown coaching focus: {focus!r}")
+    return focus
 
 
 def generate_llm_tips(shots: list[dict], stats_summary: dict | None = None,
                        session_context: dict | None = None,
                        frames_by_contact: dict[str, list[dict]] | None = None,
+                       system: str | None = None,
+                       general_context: dict | None = None,
+                       feedback_history: dict | None = None,
                        ) -> tuple[dict[str, dict], list[dict]]:
-    """Returns ({contact_id: {tip, tone}}, [{player_label, theme}, ...]), or
-    ({}, []) (with a logged reason) when the API key is missing, the call
-    fails, or the response can't be parsed — degrades gracefully, same as
-    analysis/reporter.py. Never trusted for frame/timestamp/player
+    """Returns ({contact_id: {tip, tone}}, [{player_label, praise, improve},
+    ...]), or ({}, []) (with a logged reason) when the API key is missing,
+    the call fails, or the response can't be parsed — degrades gracefully,
+    same as analysis/reporter.py. Never trusted for frame/timestamp/player
     attribution — those are attached from our own contact_events data
-    (build_report validates each theme's player_label against the players we
-    actually sent, and drops anything unrecognized).
+    (build_report validates each general_feedback entry's player_label
+    against the players we actually sent, and drops anything unrecognized).
 
     stats_summary (see _summarize_stats), session_context (see
     _session_context) and frames_by_contact (see keyframes.
@@ -1127,6 +1538,10 @@ def generate_llm_tips(shots: list[dict], stats_summary: dict | None = None,
         payload["player_tendencies"] = stats_summary
     if session_context:
         payload["session_context"] = session_context
+    if general_context:
+        payload["general_context"] = general_context
+    if feedback_history:
+        payload["tip_feedback_history"] = feedback_history
 
     content: str | list = db.dumps(payload)
     if frames_by_contact:
@@ -1148,21 +1563,24 @@ def generate_llm_tips(shots: list[dict], stats_summary: dict | None = None,
         # shape is removed and returns a 400 (it still works on the Haiku 4.5
         # discrepancy-report path in analysis/reporter.py — do not "align" the
         # two calls). Depth is steered by output_config.effort instead.
-        # max_tokens caps thinking + response TOGETHER on this model family —
-        # 8000 truncated the tips JSON mid-array on a real 15-candidate run
-        # (adaptive thinking spent most of the budget), which parsed as
-        # garbage and degraded the whole report to zero tips. 16000 leaves
-        # thinking room while staying within non-streaming HTTP-timeout
-        # guidance; if reports ever grow past that, switch to .stream().
-        response = client.messages.create(
+        # max_tokens caps thinking + response TOGETHER on this model family.
+        # 8000 truncated the tips JSON mid-array on a real 15-candidate run,
+        # then 16000 truncated again on a real 16-candidate positioning run
+        # (adaptive thinking at effort=high ate the budget both times) — each
+        # time degrading the whole report to zero tips. Streaming removes the
+        # non-streaming HTTP-timeout ceiling, so give it real headroom.
+        with client.messages.stream(
             model=ANTHROPIC_COACHING_MODEL,
-            max_tokens=16000,
+            max_tokens=64000,
             thinking={"type": "adaptive"},
-            system=SYSTEM,
+            # system defaults to the form prompt; build_report passes the
+            # focus-composed one (system_prompt(focus)) for positioning runs.
+            system=system or SYSTEM,
             output_config={"format": {"type": "json_schema", "schema": TIPS_SCHEMA},
                             "effort": "high"},
             messages=[{"role": "user", "content": content}],
-        )
+        ) as llm_stream:
+            response = llm_stream.get_final_message()
     except anthropic.RateLimitError:
         log.error("Anthropic rate limit — try generating the coaching report again shortly")
         return {}, []
@@ -1197,10 +1615,11 @@ def generate_llm_tips(shots: list[dict], stats_summary: dict | None = None,
         cid, tip, tone = t.get("contact_id"), t.get("tip"), t.get("tone")
         if cid and tip and tone in ("improve", "praise"):
             out[cid] = {"tip": tip, "tone": tone}
-    themes = [{"player_label": t.get("player_label"), "theme": t.get("theme")}
-              for t in data.get("player_themes") or []
-              if t.get("player_label") and t.get("theme")]
-    return out, themes
+    general = [{"player_label": g.get("player_label"), "praise": g.get("praise"),
+                "improve": g.get("improve")}
+               for g in data.get("general_feedback") or []
+               if g.get("player_label") and g.get("praise") and g.get("improve")]
+    return out, general
 
 
 def _summarize_stats(stats: dict | None) -> dict | None:
@@ -1251,14 +1670,38 @@ def _summarize_stats(stats: dict | None) -> dict | None:
 
 def build_report(video_id: str, vectors_meta: list[tuple[ShotFeatureVector, dict]],
                   llm_fn=None, stats_summary: dict | None = None,
-                  frames_fn=None) -> CoachingReport:
-    llm_fn = llm_fn or generate_llm_tips
+                  frames_fn=None, focus: str = FOCUS_FORM,
+                  feedback_history: dict | None = None) -> CoachingReport:
+    category_metrics = (positioning.CATEGORY_METRICS if focus == FOCUS_POSITIONING
+                        else CATEGORY_METRICS)
     # Hand the LLM a WIDER statistical shortlist than the tip budget — it can
     # see the frames, so it makes the final cut down to MAX_TIPS (see the
     # SYSTEM selection rules), dropping pose-noise false positives that the
-    # statistics alone can't distinguish from real mistakes.
-    candidates = select_tip_candidates(vectors_meta, limit=MAX_LLM_CANDIDATES)
+    # statistics alone can't distinguish from real mistakes. The category cap
+    # keeps one dominant failure mode from monopolizing the shortlist.
+    candidates = select_tip_candidates(vectors_meta, limit=MAX_LLM_CANDIDATES,
+                                        category_metrics=category_metrics,
+                                        fill_to_limit=FILL_TO_LIMIT,
+                                        category_cap=max(2, MAX_LLM_CANDIDATES // 2))
     session_context = _session_context(vectors_meta)
+    general_context = _general_context(vectors_meta)
+    log.info("coaching: %d/%d scored moments selected as LLM candidates (focus=%s, fill_to_limit=%s)",
+              len(candidates), len(vectors_meta), focus, FILL_TO_LIMIT)
+    if llm_fn is None:
+        # The real LLM call gets the focus-composed prompt, the general-
+        # feedback aggregates and the tip-rating history; injected test
+        # doubles keep their existing signatures and simply never see them
+        # (including doubles monkeypatched over generate_llm_tips itself —
+        # hence the same TypeError fallback the argument ladder below uses).
+        sys_text = system_prompt(focus)
+
+        def llm_fn(*args):
+            try:
+                return generate_llm_tips(*args, system=sys_text,
+                                          general_context=general_context,
+                                          feedback_history=feedback_history)
+            except TypeError:
+                return generate_llm_tips(*args)
     # frames_fn (candidates -> {contact_id: [{label, jpeg_b64}, ...]} | None)
     # is called AFTER selection so keyframes are only ever extracted for the
     # <=MAX_TIPS shots that actually reach the LLM, never every contact in
@@ -1285,12 +1728,13 @@ def build_report(video_id: str, vectors_meta: list[tuple[ShotFeatureVector, dict
                 result = llm_fn(candidates, stats_summary)
             except TypeError:
                 result = llm_fn(candidates)
-    # generate_llm_tips returns (tips, themes); older-style injected doubles
-    # return just the tips dict -- treat that as "no themes", not an error.
+    # generate_llm_tips returns (tips, general_feedback); older-style
+    # injected doubles return just the tips dict -- treat that as "no
+    # general feedback", not an error.
     if isinstance(result, tuple):
-        tip_text, themes_raw = result
+        tip_text, general_raw = result
     else:
-        tip_text, themes_raw = result, []
+        tip_text, general_raw = result, []
     # Player attribution is our own data (contact_events.player_id), not
     # trusted from the model's echoed output — attach it here regardless of
     # what the LLM response contains.
@@ -1305,19 +1749,21 @@ def build_report(video_id: str, vectors_meta: list[tuple[ShotFeatureVector, dict
                     player_id=c["player_id"], player_label=c["player_label"])
         for c in candidates if c["contact_id"] in tip_text
     ][:MAX_TIPS]
-    # Themes: the model's echoed player_label is only a JOIN KEY back to the
-    # players we actually sent — an unrecognized/duplicated label is dropped
-    # (first occurrence wins), and player_id always comes from our own
-    # contact_events data, mirroring the tip-attribution rule above.
+    # General feedback: the model's echoed player_label is only a JOIN KEY
+    # back to the players we actually sent — an unrecognized/duplicated label
+    # is dropped (first occurrence wins), and player_id always comes from our
+    # own contact_events data, mirroring the tip-attribution rule above.
+    # player_themes stays empty on new reports (replaced by general_feedback;
+    # legacy rows still rehydrate their themes via get_report).
     label_to_pid = {c["player_label"]: c["player_id"] for c in candidates}
-    player_themes, seen_labels = [], set()
-    for t in themes_raw:
-        lbl = t.get("player_label")
-        if lbl in label_to_pid and lbl not in seen_labels and t.get("theme"):
-            player_themes.append(PlayerTheme(player_id=label_to_pid[lbl],
-                                              player_label=lbl, theme=t["theme"]))
+    general, seen_labels = [], set()
+    for g in general_raw:
+        lbl = g.get("player_label")
+        if lbl in label_to_pid and lbl not in seen_labels and g.get("praise") and g.get("improve"):
+            general.append(GeneralFeedback(player_id=label_to_pid[lbl], player_label=lbl,
+                                            praise=g["praise"], improve=g["improve"]))
             seen_labels.add(lbl)
-    return CoachingReport(video_id=video_id, tips=tips, player_themes=player_themes)
+    return CoachingReport(video_id=video_id, tips=tips, general=general, focus=focus)
 
 
 def exclude_serves(contacts: list[dict]) -> list[dict]:
@@ -1329,6 +1775,36 @@ def exclude_serves(contacts: list[dict]) -> list[dict]:
     of the pipeline already degrades an empty contact/vector list to an empty
     tip list (see select_tip_candidates), never an error or serve fallback."""
     return [c for c in contacts if not c.get("is_serve")]
+
+
+def singles_pid_map(contacts: list[dict], match_type: str | None) -> dict:
+    """{phantom_pid: top2_pid} — the aggregate form of merge_singles_players'
+    per-contact fold, for data keyed by overlay player id rather than contact
+    rows (positioning's per-frame span samples). Each phantom id maps to
+    whichever top-2 player any of its contacts sits nearest in time, so the
+    two folds agree on which real player absorbs a phantom. Empty dict when
+    no folding applies (not singles, or ≤2 identities) — and a phantom id
+    that appears ONLY in overlays (zero contacts) has no evidence to map it
+    with, so it stays unmapped and is filtered by positioning's
+    MIN_SPAN_SAMPLES floor instead."""
+    if match_type != "singles":
+        return {}
+    player_ids = sorted({c["player_id"] for c in contacts})
+    if len(player_ids) <= 2:
+        return {}
+    counts: dict = {}
+    for c in contacts:
+        counts[c["player_id"]] = counts.get(c["player_id"], 0) + 1
+    top2 = sorted(counts, key=lambda pid: -counts[pid])[:2]
+    top2_frames = {pid: [c["frame_idx"] for c in contacts if c["player_id"] == pid] for pid in top2}
+    mapping: dict = {}
+    for pid in player_ids:
+        if pid in top2:
+            continue
+        frames = [c["frame_idx"] for c in contacts if c["player_id"] == pid]
+        mapping[pid] = min(top2, key=lambda t: min(
+            (abs(f - tf) for f in frames for tf in top2_frames[t]), default=float("inf")))
+    return mapping
 
 
 def merge_singles_players(contacts: list[dict], match_type: str | None) -> list[dict]:
@@ -1363,12 +1839,36 @@ def merge_singles_players(contacts: list[dict], match_type: str | None) -> list[
     return merged
 
 
+def _tip_feedback_history() -> dict | None:
+    """{category: {"helpful": n, "not_helpful": n}} across ALL videos — the
+    read-back half of the tip_feedback loop (ratings snapshot their category
+    at rating time, so this survives report regeneration and contact
+    re-detection). Global rather than per-video on purpose: a per-video
+    history would usually be the very report being replaced. Folded into the
+    LLM payload as a LIGHT selection tiebreaker (see the SYSTEM feedback
+    block) — never a deterministic suppression, so a severe flag can't be
+    silenced by its category having polled badly."""
+    with db.connect() as con:
+        rows = con.execute(
+            "SELECT category, rating, COUNT(*) AS n FROM tip_feedback"
+            " WHERE category IS NOT NULL GROUP BY category, rating").fetchall()
+    hist: dict = {}
+    for r in rows:
+        entry = hist.setdefault(r["category"], {"helpful": 0, "not_helpful": 0})
+        entry["helpful" if r["rating"] == 1 else "not_helpful"] += r["n"]
+    return hist or None
+
+
 def generate_coaching_report(video_id: str, rally_source: str | None = None,
-                              overlay_source: str | None = None) -> CoachingReport:
+                              overlay_source: str | None = None,
+                              focus: str | None = None) -> CoachingReport:
     """Only builds feature vectors for contacts belonging to a rally
     readiness.get_analyzable_rallies() currently clears (Pass 2 done, overlay
     coverage still matches the rally's current frame range) — a stale/partial
-    rally's contacts are excluded from compute_feature_vector."""
+    rally's contacts are excluded from compute_feature_vector.
+
+    focus: 'form' | 'positioning' | None — None resolves through the video's
+    stored coaching_focus column, then defaults to form (see resolve_focus)."""
     # rally_source can be None by default (see contact_detect.py's matching
     # fix) — resolve overlay_source the same way here so the read_range calls
     # below aren't left with an unresolved None.
@@ -1376,10 +1876,13 @@ def generate_coaching_report(video_id: str, rally_source: str | None = None,
     rallies = get_analyzable_rallies(video_id, rally_source=rally_source, overlay_source=overlay_source)
     ready_rally_ids = {r["id"] for r in rallies}
     with db.connect() as con:
-        vrow = con.execute("SELECT fps, match_type, path FROM videos WHERE id=?", (video_id,)).fetchone()
+        vrow = con.execute("SELECT fps, match_type, coaching_focus, path FROM videos WHERE id=?",
+                            (video_id,)).fetchone()
         contacts = db.rows_to_dicts(con.execute(
             "SELECT * FROM contact_events WHERE video_id=? ORDER BY frame_idx",
             (video_id,)).fetchall())
+    focus = resolve_focus(vrow["coaching_focus"] if vrow else None, focus)
+    match_type = vrow["match_type"] if vrow else None
     fps = float(vrow["fps"]) if vrow and vrow["fps"] else 30.0
     contacts = [c for c in contacts if c["rally_id"] in ready_rally_ids]
     # Rally context BEFORE serve exclusion so rally_shot_index/count describe
@@ -1387,32 +1890,89 @@ def generate_coaching_report(video_id: str, rally_source: str | None = None,
     # phantom-identity contacts feed the right player's tempo median.
     contacts = annotate_rally_context(contacts, rallies, fps)
     contacts = exclude_serves(contacts)
-    contacts = merge_singles_players(contacts, vrow["match_type"] if vrow else None)
-    shot_types = classify_shot_types(contacts)
-    contacts = [{**c, "shot_type": shot_types.get(c["contact_id"])} for c in contacts]
+    # pid_map from the PRE-merge contacts (it needs the phantom ids) — used
+    # below to fold positioning's overlay-keyed span samples the same way
+    # merge_singles_players folds the contacts themselves.
+    pid_map = singles_pid_map(contacts, match_type)
+    contacts = merge_singles_players(contacts, match_type)
 
-    pre_frames, post_frames = int(PRE_WINDOW_S * fps), int(POST_WINDOW_S * fps)
-    # Two passes: first pull every shot's raw (un-scored) metrics, then derive
-    # each player's own per-metric fence across their whole video, and only
-    # then classify/score each shot relative to THEIR fence — a shot can't be
-    # scored against a distribution that isn't fully built yet.
-    raw_by_contact: list[tuple[dict, dict]] = []
+    # One rally-span overlay read, shared by ball context (both focuses) and
+    # positioning's per-frame samples.
+    entries_by_rally = {r["id"]: overlays.read_range(video_id, overlay_source,
+                                                      r["start_frame"], r["end_frame"])
+                        for r in rallies}
+
+    # Ball-derived enrichment (see ball_context.py) — measured swing tempo
+    # (beats the wrist-speed inference in classify_shot_types) and the
+    # measured rally-ending outcome, attached to the rally's final contact.
+    # A clip with no ball data yields nothing here and everything downstream
+    # behaves exactly as before.
+    from . import ball_context
+    tempo_override: dict = {}
+    contacts_by_rally: dict = {}
     for c in contacts:
-        entries = overlays.read_range(video_id, overlay_source,
-                                       max(0, c["frame_idx"] - pre_frames),
-                                       c["frame_idx"] + post_frames)
-        raw = _extract_raw_metrics(c, entries, fps)
-        if raw is not None:
-            raw_by_contact.append((c, raw))
+        contacts_by_rally.setdefault(c["rally_id"], []).append(c)
+    ball_by_contact: dict = {}
+    rally_end_ball: dict = {}
+    for rally_id, rc in contacts_by_rally.items():
+        by_c, end_ball = ball_context.annotate_contacts(
+            entries_by_rally.get(rally_id) or [], rc, fps)
+        ball_by_contact.update(by_c)
+        if end_ball:
+            rally_end_ball[rally_id] = end_ball
+    for cid, ctx in ball_by_contact.items():
+        if ctx.get("tempo_verified"):
+            tempo_override[cid] = ctx["tempo_verified"]
+    if ball_by_contact or rally_end_ball:
+        log.info("coaching: ball context on %d contacts (%d tempo-verified), "
+                  "%d rally outcomes", len(ball_by_contact), len(tempo_override),
+                  len(rally_end_ball))
 
-    player_fences = _player_fences_by_metric(raw_by_contact)
-    stratum_fences = _stratum_fences_by_metric(raw_by_contact)
-    vectors_meta: list[tuple[ShotFeatureVector, dict]] = []
-    for c, raw in raw_by_contact:
-        vec = _finalize_vector(c, raw, player_fences.get(c["player_id"], {}),
-                                stratum_fences.get((c["player_id"], c.get("shot_type"))))
-        if vec is not None:
-            vectors_meta.append((vec, c))
+    shot_types = classify_shot_types(contacts, tempo_override=tempo_override)
+    contacts = [{**c, "shot_type": shot_types.get(c["contact_id"]),
+                 **ball_by_contact.get(c["contact_id"], {})} for c in contacts]
+    contacts = [{**c, "rally_end_ball": rally_end_ball[c["rally_id"]]}
+                if c.get("is_rally_ending") and c["rally_id"] in rally_end_ball else c
+                for c in contacts]
+
+    if focus == FOCUS_POSITIONING:
+        # Positioning: absolute court-geometry scoring over per-frame court
+        # positions (whole rallies, not contact windows) + the contact events
+        # themselves — see positioning.py. No pose-fence passes needed.
+        samples_by_rally: dict = {}
+        for r in rallies:
+            samples = position_samples(entries_by_rally.get(r["id"]) or [])
+            if pid_map:
+                folded: dict = {}
+                for pid, s in samples.items():
+                    folded.setdefault(pid_map.get(pid, pid), []).extend(s)
+                samples = {pid: sorted(s) for pid, s in folded.items()}
+            samples_by_rally[r["id"]] = samples
+        vectors_meta = positioning.build_vectors(
+            contacts, rallies, samples_by_rally, fps, match_type, video_id)
+    else:
+        pre_frames, post_frames = int(PRE_WINDOW_S * fps), int(POST_WINDOW_S * fps)
+        # Two passes: first pull every shot's raw (un-scored) metrics, then derive
+        # each player's own per-metric fence across their whole video, and only
+        # then classify/score each shot relative to THEIR fence — a shot can't be
+        # scored against a distribution that isn't fully built yet.
+        raw_by_contact: list[tuple[dict, dict]] = []
+        for c in contacts:
+            entries = overlays.read_range(video_id, overlay_source,
+                                           max(0, c["frame_idx"] - pre_frames),
+                                           c["frame_idx"] + post_frames)
+            raw = _extract_raw_metrics(c, entries, fps)
+            if raw is not None:
+                raw_by_contact.append((c, raw))
+
+        player_fences = _player_fences_by_metric(raw_by_contact)
+        stratum_fences = _stratum_fences_by_metric(raw_by_contact)
+        vectors_meta = []
+        for c, raw in raw_by_contact:
+            vec = _finalize_vector(c, raw, player_fences.get(c["player_id"], {}),
+                                    stratum_fences.get((c["player_id"], c.get("shot_type"))))
+            if vec is not None:
+                vectors_meta.append((vec, c))
 
     stats_summary = None
     try:
@@ -1437,7 +1997,9 @@ def generate_coaching_report(video_id: str, rally_source: str | None = None,
                 video_path, candidates, video_id, overlay_source, fps,
                 PRE_WINDOW_S, POST_WINDOW_S)
 
-    report = build_report(video_id, vectors_meta, stats_summary=stats_summary, frames_fn=frames_fn)
+    report = build_report(video_id, vectors_meta, stats_summary=stats_summary,
+                           frames_fn=frames_fn, focus=focus,
+                           feedback_history=_tip_feedback_history())
     save_report(report)
     return report
 
@@ -1448,10 +2010,13 @@ def save_report(report: CoachingReport) -> None:
     # definition — never inherit staleness from whatever row it replaces.
     with db.connect() as con:
         con.execute(
-            "INSERT OR REPLACE INTO coaching_reports (video_id, tips_json, themes_json, created_at, stale_reason)"
-            " VALUES (?,?,?,?,NULL)",
+            "INSERT OR REPLACE INTO coaching_reports"
+            " (video_id, tips_json, themes_json, general_json, focus, created_at, stale_reason)"
+            " VALUES (?,?,?,?,?,?,NULL)",
             (report.video_id, db.dumps([asdict(t) for t in report.tips]),
-             db.dumps([asdict(t) for t in report.player_themes]), db.now()))
+             db.dumps([asdict(t) for t in report.player_themes]),
+             db.dumps([asdict(g) for g in report.general]),
+             report.focus, db.now()))
 
 
 def get_report(video_id: str) -> CoachingReport | None:
@@ -1459,13 +2024,16 @@ def get_report(video_id: str) -> CoachingReport | None:
         row = con.execute("SELECT * FROM coaching_reports WHERE video_id=?", (video_id,)).fetchone()
     if row is None:
         return None
-    # themes_json is NULL on pre-themes rows (migration adds the column
-    # without a backfill) — an empty theme list, not an error.
+    # themes_json / general_json / focus are NULL on rows predating their
+    # migrations (columns added without a backfill) — empty lists / None,
+    # not an error.
     return CoachingReport(
         video_id=row["video_id"],
         tips=[CoachingTip(**t) for t in db.loads(row["tips_json"], [])],
         player_themes=[PlayerTheme(**t) for t in db.loads(row["themes_json"] or "[]", [])],
-        stale_reason=row["stale_reason"])
+        stale_reason=row["stale_reason"],
+        focus=row["focus"],
+        general=[GeneralFeedback(**g) for g in db.loads(row["general_json"] or "[]", [])])
 
 
 if __name__ == "__main__":

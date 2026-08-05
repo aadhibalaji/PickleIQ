@@ -87,6 +87,59 @@ class ShotFeatureVector:
     # than one noisy keypoint reading; coaching._salience uses the count to
     # rank tip candidates.
     deviating_metrics: list = field(default_factory=list)
+    # Continuous distance from the middle of this player's typical range, in
+    # the same units as deviation_score — unlike deviation_score it does NOT
+    # clamp to 0 inside the fence, so in-range shots can still be ranked
+    # ("which of these is closest to drifting"). Ranking signal for the
+    # fill-to-limit candidate top-up ONLY (see coaching.select_tip_candidates)
+    # — never a flag, never shown as evidence of a problem. None when no
+    # metric had both a reading and a baseline.
+    soft_deviation: float | None = None
+    # Metrics whose deviation on THIS shot came from a conservative UNIVERSAL
+    # reference check (coaching.REFERENCE_BANDS — gross fundamentals only:
+    # straight legs, jammed contact, arm-only swing / cut-off follow-through
+    # on hard swings) rather than the player's own Tukey fence. This is what
+    # lets a CONSISTENT flaw flag at all: a habit repeated on every shot is,
+    # by definition, typical for that player and invisible to per-player
+    # fences. Also the only metrics the LLM may coach as correct-form claims.
+    reference_flagged_metrics: list = field(default_factory=list)
+
+
+@dataclass
+class PositioningFeatureVector:
+    """One per evaluated positioning moment — either a real contact event
+    (contact-anchored metrics) or a synthetic span moment (contact_id
+    "pos_<rally>_<pid>_<metric>_<frame>", kind 'span' on its meta dict; see
+    positioning.span_moments). Field-compatible with ShotFeatureVector
+    everywhere the selection/LLM path reads it (category, deviation_score,
+    the four metric-name lists, shot_type, soft_deviation) so the two flow
+    through the same select/salience/LLM pipeline.
+
+    deviation_score here is judged against ABSOLUTE court-geometry bands
+    (positioning.BANDS) — the court is a fixed size, unlike body mechanics —
+    NOT against the player's own session spread. no_comparison_metrics /
+    mixed_baseline_metrics are therefore always empty; low_confidence_metrics
+    lists every metric field that is None on this moment (not applicable to
+    this moment, or no position data to compute it from)."""
+    contact_id: str
+    category: str  # 'net_position' | 'transition' | 'court_coverage' | 'team_spacing'
+    kitchen_distance_at_contact_m: float | None
+    return_depth_m: float | None
+    transition_dwell_s: float | None
+    kitchen_approach_after_return_s: float | None
+    recovery_offset_m: float | None
+    partner_depth_stagger_m: float | None
+    deviation_score: float
+    low_confidence_metrics: list = field(default_factory=list)
+    no_comparison_metrics: list = field(default_factory=list)
+    shot_type: str | None = None
+    mixed_baseline_metrics: list = field(default_factory=list)
+    deviating_metrics: list = field(default_factory=list)
+    soft_deviation: float | None = None
+    # Always empty for positioning (EVERY positioning deviation is already
+    # judged against absolute court geometry) — present only so the two
+    # vector types stay field-compatible through _shot_summary.
+    reference_flagged_metrics: list = field(default_factory=list)
 
 
 @dataclass
@@ -117,6 +170,20 @@ class PlayerTheme:
 
 
 @dataclass
+class GeneralFeedback:
+    """One per player per report: exactly one positive and one negative piece
+    of session-wide feedback, grounded in deterministic per-player metric
+    aggregates (coaching._general_context) and written by the same single LLM
+    call as the tips. Replaces PlayerTheme on new reports. Attribution rules
+    match PlayerTheme: player_id/player_label come from our own contact data,
+    the model's echoed label is only a join key."""
+    player_id: int
+    player_label: str
+    praise: str   # what's working — the strongest positive session pattern
+    improve: str  # the one thing to fix — the strongest negative pattern
+
+
+@dataclass
 class CoachingReport:
     """One per video, generated once (explicit user action — LLM call)."""
     video_id: str
@@ -126,3 +193,10 @@ class CoachingReport:
     # short machine-readable reason this report predates a data-accuracy fix
     # and may contain fabricated feature values — see db.STALE_BEFORE_CONFIDENCE_FIX.
     stale_reason: str | None = None
+    # Which metric family this report evaluated — 'form' | 'positioning'.
+    # None on reports generated before selectable focus existed (= form).
+    focus: str | None = None
+    # list[GeneralFeedback] — per-player praise+improve pairs. Empty on
+    # legacy reports (which carry player_themes instead) and on reports
+    # whose LLM call degraded.
+    general: list = field(default_factory=list)

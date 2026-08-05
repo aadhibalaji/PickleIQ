@@ -238,9 +238,12 @@ def upload_progress(video_id: str, data: dict) -> str:
     natural "window" checkpoints, so instead of many small objects like Pass
     2, it's a single object OVERWRITTEN in place each time — see
     cv/pass1.py's periodic call, and api/media.py's poll-cloud-windows,
-    which downloads and mirrors it. Deleted via delete_progress once Pass 1
-    finishes, so a later poll can never re-apply a stale 'running' snapshot
-    after the video has moved on (see delete_progress's docstring)."""
+    which downloads and mirrors it. Overwritten with a terminal status
+    ('done'/'error'/'cancelled') once Pass 1 finishes — see
+    pipeline._upload_pass1_terminal_progress — rather than deleted, so a
+    UI-only container's next poll still learns the outcome even though Pass
+    2 no longer auto-runs right after (there's no other completion signal
+    for Pass 1 alone until then)."""
     key = progress_key(video_id)
     _put_json(key, data)
     return key
@@ -248,23 +251,6 @@ def upload_progress(video_id: str, data: dict) -> str:
 
 def download_progress(video_id: str) -> dict | None:
     return _get_json(progress_key(video_id))
-
-
-def delete_progress(video_id: str) -> None:
-    """Removes the live progress snapshot once Pass 1 finishes. Without
-    this, a poll tick arriving after Pass 1 (and possibly the whole chain)
-    is already done could still find the last 'running' snapshot written
-    before completion and re-mirror it — flipping an already-'done' local
-    job status on a UI-only container back to 'running'. Best-effort: a
-    failure here must not fail Pass 1 itself, it just risks that one stale
-    object lingering (harmless — it'll be overwritten by the next run, or
-    ignored once the chain-end result.json supersedes it via sync)."""
-    _require_bucket()
-    key = progress_key(video_id)
-    try:
-        _client().delete_object(Bucket=S3_VIDEO_BUCKET, Key=key)
-    except Exception as exc:
-        log.warning("could not delete progress snapshot for %s (%s)", video_id, exc)
 
 
 def list_window_objects(video_id: str) -> list[dict]:
@@ -411,7 +397,7 @@ def download_pass2_request(video_id: str) -> dict | None:
 def list_pass2_request_video_ids() -> list[str]:
     """video_ids with an *unclaimed* pass2_request.json in S3. Claimed
     requests stay as overwrite markers (this role often lacks
-    s3:DeleteObject — see delete_progress) so we must open each object."""
+    s3:DeleteObject) so we must open each object."""
     _require_bucket()
     try:
         resp = _client().list_objects_v2(Bucket=S3_VIDEO_BUCKET, Prefix="jobs/")

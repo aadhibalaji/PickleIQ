@@ -1,12 +1,14 @@
 """Covers the hybrid (S3 worker -> local UI-only container) progress-sync
 fixes: Pass 1 rally windows merging in progressively via the same live
-progress snapshot (not just at chain end), and Pass 2's mirrored job
-actually getting a numeric progress fraction instead of just a message."""
+progress snapshot (not just at chain end), Pass 2's mirrored job actually
+getting a numeric progress fraction instead of just a message, and Pass 1
+alone (no auto-chained Pass 2) still reaching a terminal mirrored status
+instead of getting stuck on the last live 'running' snapshot forever."""
 from __future__ import annotations
 
 import pytest
 
-from .. import db, pipeline, results_export
+from .. import db, pipeline, results_export, storage_s3
 
 VIDEO = "vid1"
 
@@ -70,6 +72,47 @@ def test_mark_cloud_pass2_active_sets_real_progress_fraction():
     # window_index is 0-based; the 3rd of 8 windows synced -> 3/8.
     assert job["progress"] == pytest.approx(3 / 8)
     assert "window 3 synced" in job["message"]
+
+
+def test_mirror_cloud_progress_done_status_flips_local_job_to_done():
+    # Simulates poll-cloud-windows picking up the terminal snapshot
+    # _upload_pass1_terminal_progress writes when Pass 1 finishes on its
+    # own (no auto-chained Pass 2 to produce a chain-end result.json) — a
+    # UI-only container's only other way to learn Pass 1 is actually done.
+    pipeline.mirror_cloud_progress(VIDEO, {
+        "stage": "pass1", "status": "running", "progress": 0.98, "message": "almost there",
+    })
+    pipeline.mirror_cloud_progress(VIDEO, {
+        "stage": "pass1", "status": "done", "progress": 1.0, "message": "",
+    })
+    with db.connect() as con:
+        job = con.execute(
+            "SELECT status, progress FROM jobs WHERE video_id=? AND kind='pass1'",
+            (VIDEO,)).fetchone()
+    assert job["status"] == "done" and job["progress"] == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("status,message,expected_progress", [
+    ("done", "", 1.0),
+    ("error", "boom", 0.0),
+    ("cancelled", "", 0.0),
+])
+def test_upload_pass1_terminal_progress_payload_shape(monkeypatch, status, message, expected_progress):
+    calls = []
+    monkeypatch.setattr(storage_s3, "upload_progress", lambda vid, data: calls.append((vid, data)))
+    pipeline._upload_pass1_terminal_progress(VIDEO, status, message)
+    assert calls == [(VIDEO, {
+        "stage": "pass1", "status": status, "progress": expected_progress, "message": message,
+    })]
+
+
+def test_upload_pass1_terminal_progress_never_raises_on_s3_failure(monkeypatch):
+    # Best-effort: a mirroring nicety for a UI-only container that may not
+    # even exist must never take down the real Pass 1 job over it.
+    def _boom(vid, data):
+        raise RuntimeError("s3 unavailable")
+    monkeypatch.setattr(storage_s3, "upload_progress", _boom)
+    pipeline._upload_pass1_terminal_progress(VIDEO, "done", "")  # must not raise
 
 
 def test_mark_cloud_pass2_active_without_total_leaves_progress_untouched():

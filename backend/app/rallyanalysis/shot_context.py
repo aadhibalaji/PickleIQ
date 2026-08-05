@@ -56,6 +56,27 @@ def zone_for_court_y(court_y: float) -> str:
     return ZONE_BACKCOURT
 
 
+def position_samples(entries: list[dict]) -> dict[int, list[tuple[int, float, float, str | None]]]:
+    """player_id -> sorted [(frame, court_x, court_y, team), ...] for every
+    overlay frame carrying a real cxy for that player. Players with zero
+    samples in this range are simply absent from the returned dict — never
+    zero-filled. (Moved from report_stats.py — shared with positioning.py,
+    which must not import report_stats: report_stats imports coaching, which
+    imports positioning.)"""
+    by_pid: dict[int, list] = {}
+    for e in entries:
+        for p in e.get("players", []):
+            cxy = p.get("cxy")
+            if not cxy:
+                continue
+            pid = p.get("id")
+            by_pid.setdefault(pid, []).append(
+                (e["f"], float(cxy[0]), float(cxy[1]), p.get("team")))
+    for pid in by_pid:
+        by_pid[pid].sort(key=lambda t: t[0])
+    return by_pid
+
+
 def _median(values: list[float]) -> float:
     ordered = sorted(values)
     n = len(ordered)
@@ -63,7 +84,8 @@ def _median(values: list[float]) -> float:
     return ordered[mid] if n % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0
 
 
-def classify_shot_types(contacts: list[dict]) -> dict[str, str]:
+def classify_shot_types(contacts: list[dict],
+                         tempo_override: dict[str, str] | None = None) -> dict[str, str]:
     """{contact_id: shot_type} for every contact that can be typed at all.
     shot_type = "<zone>_<tempo>" ("kitchen_soft", "backcourt_fast", ...) when
     this player has enough speed readings for a tempo split, else just
@@ -74,7 +96,14 @@ def classify_shot_types(contacts: list[dict]) -> dict[str, str]:
     Tempo is per-player-relative by construction: fast = at/above THIS
     PLAYER's own median hand_speed_peak this session. Run AFTER
     merge_singles_players so phantom-identity contacts contribute to the
-    right player's median."""
+    right player's median.
+
+    tempo_override ({contact_id: 'soft'|'fast'}, see ball_context.py):
+    MEASURED tempo from actual ball speed — always beats the wrist-speed
+    inference for that contact, and types a contact even when the player
+    lacks MIN_TEMPO_SAMPLES wrist readings. Absent/None entries change
+    nothing."""
+    tempo_override = tempo_override or {}
     speeds_by_pid: dict = {}
     for c in contacts:
         sp = c.get("hand_speed_peak")
@@ -88,13 +117,13 @@ def classify_shot_types(contacts: list[dict]) -> dict[str, str]:
         if c.get("court_y") is None:
             continue
         zone = zone_for_court_y(c["court_y"])
-        med = median_by_pid.get(c["player_id"])
-        sp = c.get("hand_speed_peak")
-        if med is None or sp is None:
-            out[c["contact_id"]] = zone
-        else:
-            tempo = TEMPO_FAST if float(sp) >= med else TEMPO_SOFT
-            out[c["contact_id"]] = f"{zone}_{tempo}"
+        tempo = tempo_override.get(c["contact_id"])
+        if tempo not in (TEMPO_SOFT, TEMPO_FAST):
+            med = median_by_pid.get(c["player_id"])
+            sp = c.get("hand_speed_peak")
+            tempo = (TEMPO_FAST if float(sp) >= med else TEMPO_SOFT) \
+                if med is not None and sp is not None else None
+        out[c["contact_id"]] = f"{zone}_{tempo}" if tempo else zone
     return out
 
 
