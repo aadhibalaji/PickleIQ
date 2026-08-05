@@ -231,6 +231,37 @@ def test_build_report_degrades_gracefully_when_llm_fn_returns_empty():
     assert report.player_themes == []  # dict-only (old-style) double -> no themes, no error
 
 
+def test_build_report_warns_when_llm_drops_all_real_flagged_candidates(caplog):
+    # The LLM is allowed to skip shots, but zero tips out of a candidate list
+    # that includes a REAL flagged shot (not just below_threshold filler) is
+    # worth a log line -- it's the model's own discretion landing on
+    # discard-everything, not a session with nothing to say.
+    def fake_llm(shots, stats=None, ctx=None):
+        return ({}, [{"player_label": "Player 1", "summary": "quiet session",
+                      "takeaways": ["nothing stood out"]}])
+
+    with caplog.at_level("WARNING"):
+        report = build_report("vid1", [(_vec("bad", "footwork", -3.0), _contact("bad"))],
+                               llm_fn=fake_llm)
+    assert report.tips == []
+    assert len(report.general) == 1  # general feedback still comes through
+    assert any("zero tips" in r.message for r in caplog.records)
+
+
+def test_build_report_no_warning_when_no_real_flagged_candidates(caplog):
+    # A genuinely clean session (no shot clears WORST_DEVIATION_THRESHOLD, so
+    # there are no real flagged candidates at all -- see select_worst_best)
+    # returning zero tips is the expected, unremarkable path -- no warning.
+    def fake_llm(shots, stats=None, ctx=None):
+        return ({}, [])
+
+    with caplog.at_level("WARNING"):
+        report = build_report("vid1", [(_vec("mild", "footwork", 0.1), _contact("mild"))],
+                               llm_fn=fake_llm)
+    assert report.tips == []
+    assert not any("zero tips" in r.message for r in caplog.records)
+
+
 def test_build_report_attaches_validated_general_feedback():
     # The model's echoed player_label is only a join key: unknown labels are
     # dropped (hallucinated player), duplicates collapse to the first,

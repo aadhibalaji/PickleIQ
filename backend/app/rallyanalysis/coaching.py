@@ -1759,6 +1759,18 @@ def build_report(video_id: str, vectors_meta: list[tuple[ShotFeatureVector, dict
                     player_id=c["player_id"], player_label=c["player_label"])
         for c in candidates if c["contact_id"] in tip_text
     ][:MAX_TIPS]
+    # The LLM has full discretion to skip a shot (see SYSTEM selection
+    # rules), so an empty tip list is a legitimate response — but if it
+    # skipped every REAL flagged candidate (not just below_threshold filler),
+    # that's the model's sampling landing on the discard-everything end of
+    # its own range, not a session with nothing to say. Not worth failing or
+    # retrying the report over (see generate_llm_tips' docstring on
+    # degrading gracefully), but worth a log line to catch if this turns out
+    # to happen often rather than being invisible.
+    if not tips and any(not c.get("below_threshold") for c in candidates):
+        log.warning("coaching: LLM returned zero tips despite %d real flagged candidate(s) "
+                    "for video %s — general feedback still generated from aggregates",
+                    sum(1 for c in candidates if not c.get("below_threshold")), video_id)
     # General feedback: the model's echoed player_label is only a JOIN KEY
     # back to the players we actually sent — an unrecognized/duplicated label
     # is dropped (first occurrence wins), and player_id always comes from our
