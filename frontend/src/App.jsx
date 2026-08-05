@@ -1,11 +1,9 @@
 import React, { useEffect, useState } from 'react'
 import { api } from './api.js'
 import Workspace from './Workspace.jsx'
-import Home from './Home.jsx'
 import CoachingSetupSelector from './RallyAnalysis/CoachingSetupSelector.jsx'
 
 export default function App() {
-  const [view, setView] = useState('app') // 'app' | 'testing'
   const [videos, setVideos] = useState([])
   const [current, setCurrent] = useState(null)
   const [uploading, setUploading] = useState(null) // progress 0..1
@@ -66,31 +64,8 @@ export default function App() {
   const nav = (
     <div className="row spread" style={{ padding: '8px 16px', borderBottom: '1px solid #ccc' }}>
       <b>Pickleball Rally Detection</b>
-      <div className="row">
-        <button
-          onClick={() => setView('app')}
-          style={{ fontWeight: view === 'app' ? 'bold' : 'normal', textDecoration: view === 'app' ? 'underline' : 'none' }}
-        >
-          App
-        </button>
-        <button
-          onClick={() => setView('testing')}
-          style={{ fontWeight: view === 'testing' ? 'bold' : 'normal', textDecoration: view === 'testing' ? 'underline' : 'none' }}
-        >
-          Testing
-        </button>
-      </div>
     </div>
   )
-
-  if (view === 'app') {
-    return (
-      <div>
-        {nav}
-        <Home videos={videos} current={current} onOpenTesting={() => setView('testing')} />
-      </div>
-    )
-  }
 
   if (current) {
     return (
