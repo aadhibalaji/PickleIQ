@@ -20,6 +20,14 @@ router = APIRouter()
 
 class VideoUpdateIn(BaseModel):
     match_type: str | None = None
+    coaching_focus: str | None = None
+
+
+# Allowed values per PATCHable videos column. None is always allowed (unset).
+_VIDEO_FIELD_VALUES = {
+    "match_type": ("singles", "doubles"),
+    "coaching_focus": ("form", "positioning"),
+}
 
 
 @router.post("/videos")
@@ -114,16 +122,25 @@ def get_video(video_id: str):
 
 @router.patch("/videos/{video_id}")
 def update_video(video_id: str, body: VideoUpdateIn):
-    """Per-clip metadata that isn't produced by a pass — currently just
-    match_type, used by the coaching layer to defend against player-identity
-    mis-tracking on singles clips (see rallyanalysis/coaching.py)."""
-    if body.match_type not in (None, "singles", "doubles"):
-        raise HTTPException(400, "match_type must be 'singles' or 'doubles'")
+    """Per-clip metadata that isn't produced by a pass — match_type (used by
+    the coaching layer to defend against player-identity mis-tracking on
+    singles clips) and coaching_focus (which metric family coaching reports
+    evaluate — see rallyanalysis/coaching.py). Partial update: only fields
+    present in the request body are written, so PATCHing one field never
+    clears another."""
+    fields = body.model_dump(exclude_unset=True)
+    if not fields:
+        raise HTTPException(400, "no fields to update")
+    for name, value in fields.items():
+        allowed = _VIDEO_FIELD_VALUES[name]
+        if value is not None and value not in allowed:
+            raise HTTPException(400, f"{name} must be one of {' | '.join(allowed)}")
     with db.connect() as con:
         if con.execute("SELECT 1 FROM videos WHERE id=?", (video_id,)).fetchone() is None:
             raise HTTPException(404, "video not found")
-        con.execute("UPDATE videos SET match_type=? WHERE id=?", (body.match_type, video_id))
-    return {"id": video_id, "match_type": body.match_type}
+        sets = ", ".join(f"{name}=?" for name in fields)
+        con.execute(f"UPDATE videos SET {sets} WHERE id=?", (*fields.values(), video_id))
+    return {"id": video_id, **fields}
 
 
 @router.delete("/videos/{video_id}")

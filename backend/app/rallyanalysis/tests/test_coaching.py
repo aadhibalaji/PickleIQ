@@ -231,23 +231,64 @@ def test_build_report_degrades_gracefully_when_llm_fn_returns_empty():
     assert report.player_themes == []  # dict-only (old-style) double -> no themes, no error
 
 
-def test_build_report_attaches_validated_player_themes():
+def test_build_report_attaches_validated_general_feedback():
     # The model's echoed player_label is only a join key: unknown labels are
-    # dropped (hallucinated player), duplicates collapse to the first, and
-    # player_id always comes from our own contact data.
+    # dropped (hallucinated player), duplicates collapse to the first,
+    # entries missing either piece are dropped, and player_id always comes
+    # from our own contact data.
     def fake_llm(shots, stats=None, ctx=None):
         return ({s["contact_id"]: {"tip": "t", "tone": "improve"} for s in shots},
-                [{"player_label": "Player 1", "theme": "keep working the feet"},
-                 {"player_label": "Player 99", "theme": "hallucinated player"},
-                 {"player_label": "Player 1", "theme": "duplicate, dropped"}])
+                [{"player_label": "Player 1", "praise": "solid at the line",
+                  "improve": "keep working the feet"},
+                 {"player_label": "Player 99", "praise": "hallucinated", "improve": "player"},
+                 {"player_label": "Player 1", "praise": "duplicate", "improve": "dropped"}])
 
     vectors_meta = [(_vec("bad", "footwork", -3.0), _contact("bad"))]
     report = build_report("vid1", vectors_meta, llm_fn=fake_llm)
-    assert len(report.player_themes) == 1
-    theme = report.player_themes[0]
-    assert theme.player_label == "Player 1"
-    assert theme.player_id == 1
-    assert theme.theme == "keep working the feet"
+    assert len(report.general) == 1
+    fb = report.general[0]
+    assert fb.player_label == "Player 1"
+    assert fb.player_id == 1
+    assert fb.praise == "solid at the line"
+    assert fb.improve == "keep working the feet"
+    assert report.player_themes == []  # replaced by general_feedback on new reports
+
+
+def test_build_report_drops_general_entries_missing_either_piece():
+    def fake_llm(shots, stats=None, ctx=None):
+        return ({}, [{"player_label": "Player 1", "praise": "only praise, no improve"}])
+
+    report = build_report("vid1", [(_vec("bad", "footwork", -3.0), _contact("bad"))],
+                           llm_fn=fake_llm)
+    assert report.general == []
+
+
+def test_general_context_aggregates_by_category_and_picks_deterministically():
+    vectors_meta = (
+        # Player 1: footwork flagged 2/3, contact_point clean 3/3.
+        [(_vec(f"fw{i}", "footwork", -2.0 if i < 2 else 0.0), _contact(f"fw{i}"))
+         for i in range(3)]
+        + [(_vec(f"cp{i}", "contact_point", 0.0), _contact(f"cp{i}")) for i in range(3)]
+    )
+    ctx = coaching._general_context(vectors_meta)
+    p1 = ctx["Player 1"]
+    assert p1["by_category"]["footwork"] == {"n": 3, "flagged": 2}
+    assert p1["by_category"]["contact_point"] == {"n": 3, "flagged": 0}
+    assert p1["strongest_negative_category"] == "footwork"
+    assert p1["strongest_positive_category"] == "contact_point"
+
+
+def test_general_context_never_praises_the_flagged_category_or_thin_samples():
+    # Only one category, and it's flagged: negative pick only, no praise pick.
+    flagged_only = [(_vec(f"fw{i}", "footwork", -2.0), _contact(f"fw{i}")) for i in range(4)]
+    p1 = coaching._general_context(flagged_only)["Player 1"]
+    assert p1["strongest_negative_category"] == "footwork"
+    assert p1["strongest_positive_category"] is None
+    # Clean but under-sampled category: no praise pick either.
+    thin = [(_vec("cp0", "contact_point", 0.0), _contact("cp0"))]
+    p1 = coaching._general_context(thin)["Player 1"]
+    assert p1["strongest_positive_category"] is None
+    assert coaching._general_context([]) is None
 
 
 def test_build_report_frames_fn_runs_on_candidates_only_and_feeds_llm_fn():
@@ -868,11 +909,16 @@ def test_system_prompt_keeps_null_safety_and_no_raw_numbers_rules():
     assert "no known reading for it — never fabricate a claim about it" in SYSTEM
 
 
-def test_system_prompt_frames_deviation_as_relative_to_the_player_not_universal():
-    # Must never imply a fixed/universal biomechanical standard -- only
-    # comparison to this player's own session.
+def test_system_prompt_frames_deviation_as_relative_with_reference_exception():
+    # Deviations stay per-player-relative BY DEFAULT; the one sanctioned
+    # exception is the conservative universal reference check (gross
+    # fundamentals only — REFERENCE_BANDS), which is what lets a habitual
+    # flaw a player repeats on every shot get coached at all. Correct-form
+    # claims are allowed for reference_flagged_metrics and nothing else.
     assert "relative to THIS PLAYER" in SYSTEM
-    assert "no validated \"correct\" biomechanical range" in SYSTEM
+    assert "reference_flagged_metrics" in SYSTEM
+    assert "deliberately conservative universal check" in SYSTEM
+    assert "no validated universal range" in SYSTEM
 
 
 def test_system_prompt_bans_comparison_claims_without_enough_of_players_own_shots():
@@ -896,9 +942,13 @@ def test_system_prompt_describes_distance_from_net_never_height():
     assert "contact_height_m" not in SYSTEM
 
 
-def test_system_prompt_covers_session_context_themes_and_severity_bands():
+def test_system_prompt_covers_session_context_general_feedback_and_severity_bands():
     assert "session_context" in SYSTEM
-    assert "player_themes" in SYSTEM
+    # One praise + one improve per player, grounded in the deterministic
+    # general_context aggregates — replaced the old player_themes.
+    assert "general_feedback" in SYSTEM
+    assert "general_context" in SYSTEM
+    assert "player_themes" not in SYSTEM
     # Critique intensity must be calibrated to |deviation_score| bands,
     # qualitatively — never recited as a number.
     assert "Calibrate how strongly you word a critique" in SYSTEM
@@ -922,6 +972,325 @@ def test_system_prompt_makes_frames_primary_evidence_without_breaking_voice():
     assert "not describing what is visibly in front of you" in SYSTEM
     # ...and the coach voice never breaks the fourth wall about images/AI.
     assert "never mention frames, images, crops, cameras" in SYSTEM
+
+
+# ------------------------------------------------- focus-composed prompts
+
+
+def test_module_level_system_is_the_form_composition():
+    # The pinned-substring tests above all target SYSTEM; this guarantees
+    # they keep covering what the form path actually sends.
+    assert SYSTEM == coaching.system_prompt(coaching.FOCUS_FORM)
+
+
+def test_system_prompt_positioning_frames_deviation_as_court_geometry():
+    sp = coaching.system_prompt(coaching.FOCUS_POSITIONING)
+    assert "measured against the COURT ITSELF" in sp
+    # The form framing is FALSE for absolute bands and must not leak in.
+    assert "relative to THIS PLAYER" not in sp
+    assert 'no validated "correct" biomechanical range' not in sp
+    assert "contact_height_m" not in sp
+
+
+def test_system_prompt_positioning_explains_span_moments_and_metrics():
+    sp = coaching.system_prompt(coaching.FOCUS_POSITIONING)
+    assert '"kind": "span"' in sp
+    assert "Never describe a span moment as a shot" in sp
+    for metric in ("kitchen_distance_at_contact_m", "return_depth_m", "transition_dwell_s",
+                    "kitchen_approach_after_return_s", "recovery_offset_m",
+                    "partner_depth_stagger_m"):
+        assert metric in sp, metric
+
+
+def test_both_focus_prompts_keep_null_discipline_no_raw_numbers_and_final_cut():
+    for focus in (coaching.FOCUS_FORM, coaching.FOCUS_POSITIONING):
+        sp = coaching.system_prompt(focus)
+        assert "NEVER mention degrees, angles, confidence/certainty scores" in sp
+        assert "must NEVER state or\nimply a specific claim about a joint/measurement" in sp
+        assert "THE FINAL CUT IS YOURS" in sp
+        assert "below_threshold" in sp
+
+
+def test_system_prompt_rejects_unknown_focus():
+    try:
+        coaching.system_prompt("strategy")
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+
+
+# --------------------------------------------------------- fill to limit
+
+
+def _soft_vec(contact_id, deviation_score, soft_deviation):
+    vec = _vec(contact_id, "footwork", deviation_score)
+    vec.soft_deviation = soft_deviation
+    return vec
+
+
+def test_fill_to_limit_tops_up_with_highest_soft_deviation_marked_below_threshold():
+    # 3 flagged + 10 in-band shots, all timestamps well beyond MIN_TIP_GAP_S
+    # apart. fill_to_limit must top the list up to `limit`, ranking filler by
+    # |soft_deviation| and marking every filler summary below_threshold.
+    flagged = [(_soft_vec(f"bad{i}", -2.0, -2.0), _contact(f"bad{i}", timestamp_s=i * 10.0))
+               for i in range(3)]
+    inband = [(_soft_vec(f"ok{i}", 0.0, 0.9 - i * 0.05), _contact(f"ok{i}", timestamp_s=100.0 + i * 10.0))
+              for i in range(10)]
+    candidates = select_tip_candidates(flagged + inband, limit=8, fill_to_limit=True)
+    assert len(candidates) == 8
+    flagged_out = [c for c in candidates if not c.get("below_threshold")
+                   and c["deviation_score"] != 0.0]
+    filler = [c for c in candidates if c.get("below_threshold")]
+    assert {c["contact_id"] for c in flagged_out} == {"bad0", "bad1", "bad2"}
+    assert len(filler) >= 4
+    # Filler ranked by |soft_deviation| desc: ok0 (0.9) before ok1 (0.85), ...
+    filler_ids = [c["contact_id"] for c in filler]
+    assert filler_ids == sorted(filler_ids, key=lambda cid: int(cid[2:]))
+    # Ordering contract build_report's hard cap relies on: flagged first,
+    # filler after, praise (if any) at the very end.
+    first_filler = candidates.index(filler[0])
+    assert all(candidates.index(c) < first_filler for c in flagged_out)
+
+
+def test_fill_to_limit_off_keeps_adaptive_count():
+    flagged = [(_soft_vec(f"bad{i}", -2.0, -2.0), _contact(f"bad{i}", timestamp_s=i * 10.0))
+               for i in range(3)]
+    inband = [(_soft_vec(f"ok{i}", 0.0, 0.5), _contact(f"ok{i}", timestamp_s=100.0 + i * 10.0))
+              for i in range(10)]
+    candidates = select_tip_candidates(flagged + inband, limit=8)
+    # 3 flagged + at most MAX_PRAISE_TIPS praise exemplars — never padded.
+    assert len(candidates) <= 3 + MAX_PRAISE_TIPS
+    assert not any(c.get("below_threshold") for c in candidates)
+    # And the adaptive flagged/not bar itself is untouched by fill plumbing.
+    worst, _best = select_worst_best(flagged + inband)
+    assert {s["contact_id"] for s in worst} == {"bad0", "bad1", "bad2"}
+
+
+def test_fill_never_reintroduces_a_too_close_moment():
+    flagged = [(_soft_vec("bad0", -2.0, -2.0), _contact("bad0", timestamp_s=10.0))]
+    # In-band moment 1s from the flagged one (same player): must never fill.
+    close = (_soft_vec("close", 0.0, 0.9), _contact("close", timestamp_s=11.0, confidence=0.1))
+    far = (_soft_vec("far", 0.0, 0.5), _contact("far", timestamp_s=50.0, confidence=0.1))
+    candidates = select_tip_candidates(flagged + [close, far], limit=8, fill_to_limit=True)
+    ids = {c["contact_id"] for c in candidates}
+    assert "close" not in ids
+    assert "far" in ids
+
+
+# ------------------------------------------------------- singles pid map
+
+
+def test_singles_pid_map_matches_merge_fold_aggregate():
+    contacts = (
+        [{"player_id": 1, "frame_idx": f} for f in (0, 10, 20, 30)]
+        + [{"player_id": 2, "frame_idx": f} for f in (5, 15, 25, 35)]
+        + [{"player_id": 3, "frame_idx": 6}]
+        + [{"player_id": 4, "frame_idx": 31}]
+    )
+    assert coaching.singles_pid_map(contacts, "singles") == {3: 2, 4: 1}
+    assert coaching.singles_pid_map(contacts, "doubles") == {}
+    assert coaching.singles_pid_map(contacts, None) == {}
+    assert coaching.singles_pid_map(contacts[:8], "singles") == {}  # already 2 ids
+
+
+# ---------------------------------------------- universal reference bands
+
+
+def _raw_metrics(**overrides):
+    raw = {f: None for f in METRIC_FIELDS}
+    raw["low_confidence_metrics"] = [f for f in METRIC_FIELDS if f not in overrides]
+    raw.update(overrides)
+    return raw
+
+
+def test_consistent_gross_flaw_flags_via_reference_despite_perfect_consistency():
+    # THE Tukey-fence blind spot: a player who stands straight-legged (178°)
+    # on EVERY shot is perfectly consistent — their own fence sees dev 0.0 on
+    # every shot — but the universal reference check must still flag it.
+    fences = {"knee_bend_deg": coaching._robust_fence([178.0] * 6)}
+    vec = _finalize_vector({"contact_id": "c1", "player_id": 1},
+                            _raw_metrics(knee_bend_deg=178.0), fences)
+    assert vec is not None
+    assert vec.deviation_score > 1.0                       # flagged
+    assert vec.category == "footwork"
+    assert vec.reference_flagged_metrics == ["knee_bend_deg"]
+    assert "knee_bend_deg" in vec.deviating_metrics
+
+
+def test_reference_flags_with_no_personal_fence_at_all():
+    # A beginner's very first shots (< MIN_SAMPLES_FOR_DISTRIBUTION) used to
+    # be unscoreable; the reference check works from shot one.
+    vec = _finalize_vector({"contact_id": "c1", "player_id": 1},
+                            _raw_metrics(knee_bend_deg=180.0), fences={})
+    assert vec is not None
+    assert vec.deviation_score == 2.0                      # (180-168)/6
+    assert vec.reference_flagged_metrics == ["knee_bend_deg"]
+    assert "knee_bend_deg" in vec.no_comparison_metrics    # still honest: no personal baseline
+
+
+def test_reference_never_certifies_in_range_readings():
+    # A knee angle inside the reference band with no personal fence stays
+    # unscoreable — the reference detects gross errors, it never fabricates
+    # "solid shot" praise from the mere absence of one.
+    vec = _finalize_vector({"contact_id": "c1", "player_id": 1},
+                            _raw_metrics(knee_bend_deg=130.0), fences={})
+    assert vec is None
+
+
+def test_personal_deviation_wins_when_larger_and_keeps_personal_framing():
+    # Value 170 is barely over the reference bar (dev 0.33) but way outside
+    # this player's own tight 100-110 spread — the personal comparison is the
+    # bigger story and reference framing must NOT be claimed.
+    fences = {"knee_bend_deg": coaching._robust_fence([100.0, 102.0, 105.0, 108.0, 110.0])}
+    vec = _finalize_vector({"contact_id": "c1", "player_id": 1},
+                            _raw_metrics(knee_bend_deg=170.0), fences)
+    assert vec.reference_flagged_metrics == []
+    assert vec.deviation_score > 1.0
+
+
+def test_fast_only_reference_bands_gated_on_verified_fast_shot_type():
+    # Zero weight transfer is a flaggable flaw on a drive, legitimate on a
+    # dink, and unjudgeable when tempo is unknown.
+    raw = _raw_metrics(weight_transfer_score=0.0)
+    fast = _finalize_vector({"contact_id": "c1", "player_id": 1, "shot_type": "backcourt_fast"},
+                             raw, fences={})
+    assert fast is not None and fast.deviation_score == -2.0
+    assert fast.reference_flagged_metrics == ["weight_transfer_score"]
+    for shot_type in ("kitchen_soft", "midcourt", None):
+        assert _finalize_vector({"contact_id": "c1", "player_id": 1, "shot_type": shot_type},
+                                 raw, fences={}) is None
+
+
+# ------------------------------------------------- ball-context plumbing
+
+
+def test_shot_summary_carries_ball_context_only_when_present():
+    vec = _vec("c1", "footwork", -2.0)
+    plain = coaching._shot_summary(vec, _contact("c1"))
+    assert "tempo_verified" not in plain and "rally_end_ball" not in plain
+    enriched = coaching._shot_summary(vec, {**_contact("c1"), "tempo_verified": "fast",
+                                             "rally_end_ball": "landed_out"})
+    assert enriched["tempo_verified"] == "fast"
+    assert enriched["rally_end_ball"] == "landed_out"
+
+
+def test_classify_shot_types_ball_tempo_override_beats_wrist_inference():
+    from ..shot_context import classify_shot_types
+    contacts = [{"contact_id": f"c{i}", "player_id": 1, "court_y": 0.5,
+                 "hand_speed_peak": 100.0 + i} for i in range(4)]
+    # Wrist inference calls c3 fast (above own median); the measured ball
+    # speed says soft — ball wins. And an untyped-tempo player (too few wrist
+    # samples) still gets a tempo from the ball.
+    types = classify_shot_types(contacts, tempo_override={"c3": "soft"})
+    assert types["c3"] == "backcourt_soft"
+    lone = [{"contact_id": "only", "player_id": 2, "court_y": 0.5, "hand_speed_peak": 50.0}]
+    assert classify_shot_types(lone) == {"only": "backcourt"}
+    assert classify_shot_types(lone, tempo_override={"only": "fast"}) == {"only": "backcourt_fast"}
+
+
+# ------------------------------------------------------ category cap
+
+
+def test_category_cap_stops_one_failure_mode_monopolizing_the_shortlist():
+    dominant = [(_soft_vec(f"d{i}", -3.0, -3.0), _contact(f"d{i}", timestamp_s=i * 10.0))
+                for i in range(12)]
+    other = [(_vec(f"o{i}", "paddle_prep", -1.5), _contact(f"o{i}", timestamp_s=200.0 + i * 10.0))
+             for i in range(2)]
+    candidates = select_tip_candidates(dominant + other, limit=8, category_cap=4)
+    cats = [c["category"] for c in candidates if c["deviation_score"] != 0.0]
+    assert cats.count("footwork") <= 4
+    assert "paddle_prep" in cats
+    # Single-category sessions are never truncated by the cap.
+    solo = select_tip_candidates(dominant, limit=8, category_cap=4)
+    assert len([c for c in solo if c["deviation_score"] != 0.0]) >= 7
+
+
+def test_capped_out_flags_never_reappear_as_below_threshold_filler():
+    dominant = [(_soft_vec(f"d{i}", -3.0, -3.0), _contact(f"d{i}", timestamp_s=i * 10.0))
+                for i in range(12)]
+    other = [(_vec("o0", "paddle_prep", -1.5), _contact("o0", timestamp_s=200.0))]
+    candidates = select_tip_candidates(dominant + other, limit=16,
+                                        category_cap=4, fill_to_limit=True)
+    for c in candidates:
+        if c.get("below_threshold"):
+            raise AssertionError(f"flagged shot mislabeled as filler: {c['contact_id']}")
+
+
+# --------------------------------------------- ball / feedback prompt pins
+
+
+def test_both_focus_prompts_cover_ball_evidence_and_feedback_history():
+    for focus in (coaching.FOCUS_FORM, coaching.FOCUS_POSITIONING):
+        sp = coaching.system_prompt(focus)
+        assert "tempo_verified" in sp
+        assert "rally_end_ball" in sp
+        # Measured ball outcome is the ONE exception to the winner/error ban,
+        # which itself must stay in force for ball-less shots.
+        assert "ONE exception to the winner/error rule" in sp
+        assert "does NOT say whether that shot" in sp
+        assert "tip_feedback_history" in sp
+        assert "NEVER\nsuppress a clearly severe moment" in sp
+
+
+def test_generate_llm_tips_folds_feedback_history_into_payload(monkeypatch):
+    captured = {}
+
+    class FakeMessages:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+
+            class R:
+                stop_reason = "end_turn"
+                content = [type("B", (), {"type": "text",
+                                           "text": '{"tips": [], "general_feedback": []}'})()]
+            return R()
+
+    class FakeClient:
+        def __init__(self, api_key):
+            self.messages = FakeMessages()
+
+    import anthropic
+    monkeypatch.setattr(anthropic, "Anthropic", FakeClient)
+    monkeypatch.setattr(coaching, "ANTHROPIC_API_KEY", "k")
+    hist = {"footwork": {"helpful": 3, "not_helpful": 1}}
+    generate_llm_tips([{"contact_id": "c1"}], feedback_history=hist)
+    import json
+    payload = json.loads(captured["messages"][0]["content"])
+    assert payload["tip_feedback_history"] == hist
+    # And absent history adds no key at all.
+    generate_llm_tips([{"contact_id": "c1"}])
+    payload = json.loads(captured["messages"][0]["content"])
+    assert "tip_feedback_history" not in payload
+
+
+# --------------------------------- positioning vectors through selection
+
+
+def test_positioning_vectors_flow_through_selection_with_their_categories():
+    from .. import positioning
+    from ..contracts import PositioningFeatureVector
+
+    def pvec(contact_id, deviation_score, stagger):
+        return PositioningFeatureVector(
+            contact_id=contact_id, category="team_spacing",
+            kitchen_distance_at_contact_m=None, return_depth_m=None,
+            transition_dwell_s=None, kitchen_approach_after_return_s=None,
+            recovery_offset_m=None, partner_depth_stagger_m=stagger,
+            deviation_score=deviation_score,
+            deviating_metrics=["partner_depth_stagger_m"] if deviation_score else [],
+            soft_deviation=deviation_score or 0.2)
+
+    vectors_meta = [
+        (pvec("flag1", 2.0, 4.5), _contact("flag1", timestamp_s=10.0)),
+        (pvec("okay1", 0.0, 1.0), _contact("okay1", timestamp_s=50.0)),
+    ]
+    candidates = select_tip_candidates(vectors_meta, limit=8,
+                                        category_metrics=positioning.CATEGORY_METRICS)
+    by_id = {c["contact_id"]: c for c in candidates}
+    assert by_id["flag1"]["category"] == "team_spacing"
+    # Praise exemplar picked via the POSITIONING category map: the in-band
+    # moment has a real partner_depth_stagger_m reading, so it qualifies.
+    assert by_id["okay1"]["exemplar_of_category"] == "team_spacing"
 
 
 if __name__ == "__main__":

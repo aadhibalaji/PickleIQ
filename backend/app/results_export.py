@@ -197,10 +197,18 @@ def merge_video_results(video_id: str, payload: dict[str, Any]) -> dict[str, Any
                 [tuple(e[c] for c in cols) for e in contact_events])
 
         if coaching_report:
+            # .get(): old cloud exports predate themes_json/stale_reason/
+            # focus/general_json — import them as NULL rather than dropping
+            # the whole row (or, as before this fix, silently dropping the
+            # columns even when the export DID carry them).
             con.execute(
-                "INSERT OR REPLACE INTO coaching_reports (video_id, tips_json, created_at)"
-                " VALUES (?,?,?)",
-                (video_id, coaching_report["tips_json"], coaching_report["created_at"]))
+                "INSERT OR REPLACE INTO coaching_reports"
+                " (video_id, tips_json, themes_json, general_json, focus, created_at, stale_reason)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (video_id, coaching_report["tips_json"],
+                 coaching_report.get("themes_json"), coaching_report.get("general_json"),
+                 coaching_report.get("focus"), coaching_report["created_at"],
+                 coaching_report.get("stale_reason")))
 
         if calibration:
             sync_cal_id = f"sync-{video_id}"

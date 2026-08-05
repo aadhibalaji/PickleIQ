@@ -35,6 +35,21 @@ FRAME_OFFSETS_S = (
     ("follow_through", 0.35),
 )
 
+# Span moments (positioning focus, candidate dicts carrying kind == "span" —
+# see positioning.span_moments) are stretches of movement, not swings: wider
+# offsets to show the movement (or lack of it) around the anchor, and NO crop
+# — a box-tight crop would hide exactly the evidence (where on the court the
+# player is standing). The full frame is downscaled instead, with the
+# player's box outlined so the LLM knows who the moment is about.
+SPAN_FRAME_OFFSETS_S = (
+    ("before", -1.0),
+    ("moment", 0.0),
+    ("after", 1.0),
+)
+SPAN_WINDOW_S = 1.0  # overlay read window (must cover the span offsets above)
+SPAN_MARK_COLOR = (0, 200, 255)  # BGR outline for the flagged player
+SPAN_MARK_THICKNESS = 3
+
 # Crop = player box expanded by this factor on every side — enough court
 # context to read the stance/court position, not so much that a far-side
 # player shrinks back into a full-frame speck (the whole reason we crop).
@@ -102,6 +117,23 @@ def _encode_jpeg_b64(img) -> str | None:
     return base64.b64encode(buf.tobytes()).decode("ascii")
 
 
+def _plan_candidate_jobs(c: dict, entries: list[dict], fps: float) -> list[tuple]:
+    """(target_frame, contact_id, label, crop_box|None, mark_box|None) for one
+    candidate — pure, so the offset/crop policy is testable on synthetic
+    entries. Contact-anchored candidates get swing offsets + a crop box; span
+    candidates get the wider span offsets, no crop, and a mark box (outline)
+    when the overlays have one near the target."""
+    is_span = c.get("kind") == "span"
+    offsets = SPAN_FRAME_OFFSETS_S if is_span else FRAME_OFFSETS_S
+    jobs = []
+    for label, off_s in offsets:
+        target = max(0, c["frame_idx"] + int(round(off_s * fps)))
+        box = _nearest_box(entries, c["player_id"], target)
+        crop_box, mark_box = (None, box) if is_span else (box, None)
+        jobs.append((target, c["contact_id"], label, crop_box, mark_box))
+    return jobs
+
+
 def extract_for_candidates(video_path: str, candidates: list[dict], video_id: str,
                             overlay_source: str, fps: float,
                             pre_window_s: float, post_window_s: float) -> dict[str, list[dict]] | None:
@@ -126,29 +158,34 @@ def extract_for_candidates(video_path: str, candidates: list[dict], video_id: st
         frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        # (target_frame, contact_id, label, box|None) sorted by frame so the
-        # capture only ever seeks forward.
+        # (target_frame, contact_id, label, crop_box, mark_box) sorted by
+        # frame so the capture only ever seeks forward. Span candidates need
+        # a wider overlay window than contact ones (their offsets reach ±1s).
         pre_f, post_f = int(pre_window_s * fps), int(post_window_s * fps)
+        span_f = int(SPAN_WINDOW_S * fps)
         jobs = []
         for c in candidates:
             contact_frame = c["frame_idx"]
+            lo, hi = ((span_f, span_f) if c.get("kind") == "span" else (pre_f, post_f))
             entries = overlays.read_range(video_id, overlay_source,
-                                           max(0, contact_frame - pre_f), contact_frame + post_f)
-            for label, off_s in FRAME_OFFSETS_S:
-                target = max(0, contact_frame + int(round(off_s * fps)))
-                box = _nearest_box(entries, c["player_id"], target)
-                jobs.append((target, c["contact_id"], label, box))
+                                           max(0, contact_frame - lo), contact_frame + hi)
+            jobs.extend(_plan_candidate_jobs(c, entries, fps))
         jobs.sort(key=lambda j: j[0])
 
         out: dict[str, list[dict]] = {}
-        for target, cid, label, box in jobs:
+        for target, cid, label, crop_box, mark_box in jobs:
             cap.set(cv2.CAP_PROP_POS_FRAMES, target)
             ok, frame = cap.read()
             if not ok or frame is None:
                 continue
-            if box is not None:
-                x0, y0, x1, y1 = _crop_rect(box, frame_w, frame_h)
+            if crop_box is not None:
+                x0, y0, x1, y1 = _crop_rect(crop_box, frame_w, frame_h)
                 frame = frame[y0:y1, x0:x1]
+            elif mark_box is not None:
+                frame = frame.copy()
+                x0, y0, x1, y1 = (int(v) for v in mark_box)
+                cv2.rectangle(frame, (x0, y0), (x1, y1),
+                               SPAN_MARK_COLOR, SPAN_MARK_THICKNESS)
             b64 = _encode_jpeg_b64(frame)
             if b64 is None:
                 continue
@@ -173,4 +210,15 @@ if __name__ == "__main__":
     assert _nearest_box(entries, 1, 92) == (1, 2, 3, 4)
     assert _nearest_box(entries, 1, 150) is None      # nearest is 50 frames off -> too far
     assert _nearest_box(entries, 2, 92) is None       # player never seen
+
+    # Contact candidates get swing offsets + crop box; span candidates get
+    # span offsets, no crop, and a mark box instead.
+    contact_jobs = _plan_candidate_jobs({"contact_id": "c1", "frame_idx": 90, "player_id": 1},
+                                         entries, fps=30.0)
+    assert [j[2] for j in contact_jobs] == ["prep", "contact", "follow_through"]
+    assert contact_jobs[1][3] == (1, 2, 3, 4) and contact_jobs[1][4] is None
+    span_jobs = _plan_candidate_jobs({"contact_id": "pos_r_1_m_90", "frame_idx": 90,
+                                       "player_id": 1, "kind": "span"}, entries, fps=30.0)
+    assert [j[2] for j in span_jobs] == ["before", "moment", "after"]
+    assert span_jobs[1][3] is None and span_jobs[1][4] == (1, 2, 3, 4)
     print("keyframes self-check OK")

@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { api } from '../api.js'
 import ShotHeatmap from './ShotHeatmap.jsx'
+import CoachingSetupSelector from './CoachingSetupSelector.jsx'
 import { buildPlayerColorMap, playerColor, labelToPlayerId } from './playerColors.js'
 
 const ALL_PLAYERS = 'all'
@@ -108,7 +109,14 @@ export default function RallyAnalysisPanel({ videoId, video, onUpdateVideo }) {
 
   const tips = report?.tips || []
   const players = report?.players || []
+  // New reports carry per-player general feedback (one praise + one improve,
+  // replacing themes); legacy reports still carry themes — render whichever
+  // this report has, preferring general feedback.
+  const general = report?.general_feedback || []
   const themes = report?.player_themes || []
+  const visibleGeneral = selectedPlayer === ALL_PLAYERS
+    ? general
+    : general.filter((g) => g.player_label === selectedPlayer)
   const visibleThemes = selectedPlayer === ALL_PLAYERS
     ? themes
     : themes.filter((t) => t.player_label === selectedPlayer)
@@ -132,20 +140,14 @@ export default function RallyAnalysisPanel({ videoId, video, onUpdateVideo }) {
     <div className="rally-analysis-panel">
       <div className="row spread">
         <h3 style={{ margin: 0 }}>Rally Analysis</h3>
-        <div className="row">
-          <span className="muted">Match type</span>
-          <button className={video?.match_type === 'singles' ? 'active' : ''}
-                  style={video?.match_type === 'singles' ? { borderColor: '#58a6ff', color: '#58a6ff' } : undefined}
-                  onClick={() => onUpdateVideo?.({ match_type: 'singles' })}>
-            Singles
-          </button>
-          <button className={video?.match_type === 'doubles' ? 'active' : ''}
-                  style={video?.match_type === 'doubles' ? { borderColor: '#58a6ff', color: '#58a6ff' } : undefined}
-                  onClick={() => onUpdateVideo?.({ match_type: 'doubles' })}>
-            Doubles
-          </button>
-        </div>
+        <CoachingSetupSelector video={video} onUpdateVideo={onUpdateVideo} />
       </div>
+      {video?.coaching_focus === 'positioning' && !video?.match_type && (
+        <div className="muted" style={{ margin: '4px 0 8px' }}>
+          Tip: set Singles or Doubles above — positioning feedback uses it to enable the
+          recovery (singles) and partner-spacing (doubles) checks.
+        </div>
+      )}
 
       <div className="panel">
         <div className="row spread">
@@ -171,6 +173,12 @@ export default function RallyAnalysisPanel({ videoId, video, onUpdateVideo }) {
                 unreliable feedback — regenerate for accurate results.
               </div>
             )}
+            {(report.focus || 'form') !== (video?.coaching_focus || 'form') && (
+              <div className="stale-report-banner">
+                ⚠️ This report gives {report.focus || 'form'} feedback, but this clip is now
+                set to {video?.coaching_focus || 'form'} — regenerate to match.
+              </div>
+            )}
             {players.length > 1 && (
               <div className="tabs" style={{ margin: '4px 0 8px' }}>
                 <button className={selectedPlayer === ALL_PLAYERS ? 'active' : ''}
@@ -189,7 +197,20 @@ export default function RallyAnalysisPanel({ videoId, video, onUpdateVideo }) {
                 })}
               </div>
             )}
-            {visibleThemes.length > 0 && (
+            {visibleGeneral.length > 0 ? (
+              <div className="theme-cards">
+                {visibleGeneral.map((g) => (
+                  <div key={g.player_label} className="theme-card">
+                    <span className="theme-card-player"
+                          style={{ color: playerColor(colorMap, g.player_id) }}>
+                      {g.player_label}
+                    </span>
+                    <p className="theme-card-text">👍 <strong>What's working:</strong> {g.praise}</p>
+                    <p className="theme-card-text">🎯 <strong>Focus on:</strong> {g.improve}</p>
+                  </div>
+                ))}
+              </div>
+            ) : visibleThemes.length > 0 && (
               <div className="theme-cards">
                 {visibleThemes.map((t) => (
                   <div key={t.player_label} className="theme-card">
