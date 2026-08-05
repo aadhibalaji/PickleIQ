@@ -6,11 +6,11 @@ import { api } from '../api.js'
 // missed), then process the selection into overlays coaching-report/
 // report-stats/trajectories read from. Lives at the top of
 // RallyAnalysisPanel since it's the step that makes those useful.
-export default function CoachingSelections({ videoId, fps = 30, onSeek, frame = 0 }) {
+export default function CoachingSelections({ videoId, fps = 30, onSeek }) {
   const [candidates, setCandidates] = useState([])
   const [choice, setChoice] = useState({}) // rally_label_id -> 'include' | 'skip'
   const [drawn, setDrawn] = useState([]) // [{start_frame, end_frame}]
-  const [pendingStart, setPendingStart] = useState(null) // mark-start/end draw state
+  const [newRange, setNewRange] = useState({ start_frame: '', end_frame: '' })
   const [selections, setSelections] = useState([])
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
@@ -49,20 +49,17 @@ export default function CoachingSelections({ videoId, fps = 30, onSeek, frame = 
     })
   }
 
-  // Mark start/end at the current playback frame — same pattern as
-  // LabelingPanel's ground-truth marking, reused here instead of typing raw
-  // frame numbers into two inputs.
-  const markStart = () => setPendingStart(frame)
-  const markEnd = () => {
-    if (pendingStart === null || frame <= pendingStart) {
-      setError('end must be after start')
+  const addDrawnRange = () => {
+    const start = parseInt(newRange.start_frame, 10)
+    const end = parseInt(newRange.end_frame, 10)
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) {
+      setError('enter a valid start/end frame (end must be after start)')
       return
     }
     setError('')
-    setDrawn((d) => [...d, { start_frame: pendingStart, end_frame: frame }])
-    setPendingStart(null)
+    setDrawn((d) => [...d, { start_frame: start, end_frame: end }])
+    setNewRange({ start_frame: '', end_frame: '' })
   }
-  const cancelPending = () => setPendingStart(null)
 
   const removeDrawnRange = (idx) => setDrawn((d) => d.filter((_, i) => i !== idx))
 
@@ -78,10 +75,10 @@ export default function CoachingSelections({ videoId, fps = 30, onSeek, frame = 
         ...includedCandidates.map((c) => ({ source: 'pass1_accepted', rally_label_id: c.id })),
         ...drawn.map((r) => ({ source: 'user_drawn', start_frame: r.start_frame, end_frame: r.end_frame })),
       ]
-      await api.createSelections(videoId, items)
-      // ONE Pass 2 job covering every included/drawn range, instead of one
-      // job per selection.
-      await api.processSelections(videoId)
+      const { created } = await api.createSelections(videoId, items)
+      for (const selectionId of created) {
+        await api.processSelection(videoId, selectionId)
+      }
       setDrawn([])
       loadSelections()
     } catch (e) {
@@ -140,19 +137,12 @@ export default function CoachingSelections({ videoId, fps = 30, onSeek, frame = 
 
       <div className="row spread" style={{ marginTop: 10, alignItems: 'flex-end' }}>
         <div className="row">
-          <span className="muted">Add a missed range — play/scrub to the spot, then mark it:</span>
-          <button className="primary" onClick={markStart} disabled={pendingStart !== null}>
-            ▶ Start @ f{frame}
-          </button>
-          <button className="danger" onClick={markEnd} disabled={pendingStart === null}>
-            ■ End @ f{frame}
-          </button>
-          {pendingStart !== null && (
-            <span className="muted">
-              range open since f{pendingStart} ({(pendingStart / fps).toFixed(1)}s)
-              {' '}<button onClick={cancelPending}>cancel</button>
-            </span>
-          )}
+          <span className="muted">Add a missed range:</span>
+          <input type="number" placeholder="start frame" style={{ width: 110 }} value={newRange.start_frame}
+                 onChange={(e) => setNewRange((r) => ({ ...r, start_frame: e.target.value }))} />
+          <input type="number" placeholder="end frame" style={{ width: 110 }} value={newRange.end_frame}
+                 onChange={(e) => setNewRange((r) => ({ ...r, end_frame: e.target.value }))} />
+          <button onClick={addDrawnRange}>Add range</button>
         </div>
       </div>
       {drawn.map((r, i) => (

@@ -126,8 +126,6 @@ export const api = {
     }).then(j),
   processSelection: (id, selectionId) =>
     fetch(`/api/rally-analysis/${id}/selections/${selectionId}/process`, { method: 'POST' }).then(j),
-  processSelections: (id) =>
-    fetch(`/api/rally-analysis/${id}/process-selections`, { method: 'POST' }).then(j),
 
   getCoachingReport: (id, options) => fetch(`/api/rally-analysis/${id}/coaching-report`, options).then(j),
   getContactEvents: (id) => fetch(`/api/rally-analysis/${id}/contact-events`).then(j),
