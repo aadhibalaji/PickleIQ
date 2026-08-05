@@ -1563,15 +1563,15 @@ def generate_llm_tips(shots: list[dict], stats_summary: dict | None = None,
         # shape is removed and returns a 400 (it still works on the Haiku 4.5
         # discrepancy-report path in analysis/reporter.py — do not "align" the
         # two calls). Depth is steered by output_config.effort instead.
-        # max_tokens caps thinking + response TOGETHER on this model family —
-        # 8000 truncated the tips JSON mid-array on a real 15-candidate run
-        # (adaptive thinking spent most of the budget), which parsed as
-        # garbage and degraded the whole report to zero tips. 16000 leaves
-        # thinking room while staying within non-streaming HTTP-timeout
-        # guidance; if reports ever grow past that, switch to .stream().
-        response = client.messages.create(
+        # max_tokens caps thinking + response TOGETHER on this model family.
+        # 8000 truncated the tips JSON mid-array on a real 15-candidate run,
+        # then 16000 truncated again on a real 16-candidate positioning run
+        # (adaptive thinking at effort=high ate the budget both times) — each
+        # time degrading the whole report to zero tips. Streaming removes the
+        # non-streaming HTTP-timeout ceiling, so give it real headroom.
+        with client.messages.stream(
             model=ANTHROPIC_COACHING_MODEL,
-            max_tokens=16000,
+            max_tokens=64000,
             thinking={"type": "adaptive"},
             # system defaults to the form prompt; build_report passes the
             # focus-composed one (system_prompt(focus)) for positioning runs.
@@ -1579,7 +1579,8 @@ def generate_llm_tips(shots: list[dict], stats_summary: dict | None = None,
             output_config={"format": {"type": "json_schema", "schema": TIPS_SCHEMA},
                             "effort": "high"},
             messages=[{"role": "user", "content": content}],
-        )
+        ) as llm_stream:
+            response = llm_stream.get_final_message()
     except anthropic.RateLimitError:
         log.error("Anthropic rate limit — try generating the coaching report again shortly")
         return {}, []

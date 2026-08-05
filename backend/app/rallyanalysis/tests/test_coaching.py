@@ -664,10 +664,20 @@ def test_generate_llm_tips_includes_stats_in_prompt_when_present(monkeypatch):
         stop_reason = "end_turn"
         content = [FakeTextBlock()]
 
-    class FakeMessages:
-        def create(self, **kwargs):
-            captured.update(kwargs)
+    class FakeStream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get_final_message(self):
             return FakeResponse()
+
+    class FakeMessages:
+        def stream(self, **kwargs):
+            captured.update(kwargs)
+            return FakeStream()
 
     class FakeClient:
         def __init__(self, api_key=None):
@@ -702,10 +712,20 @@ def test_generate_llm_tips_sends_honest_names_session_context_and_coaching_model
         stop_reason = "end_turn"
         content = [FakeTextBlock()]
 
-    class FakeMessages:
-        def create(self, **kwargs):
-            captured.update(kwargs)
+    class FakeStream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get_final_message(self):
             return FakeResponse()
+
+    class FakeMessages:
+        def stream(self, **kwargs):
+            captured.update(kwargs)
+            return FakeStream()
 
     class FakeClient:
         def __init__(self, api_key=None):
@@ -752,10 +772,20 @@ def test_generate_llm_tips_folds_frames_into_the_same_single_call(monkeypatch):
         stop_reason = "end_turn"
         content = [FakeTextBlock()]
 
-    class FakeMessages:
-        def create(self, **kwargs):
-            captured.update(kwargs)
+    class FakeStream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get_final_message(self):
             return FakeResponse()
+
+    class FakeMessages:
+        def stream(self, **kwargs):
+            captured.update(kwargs)
+            return FakeStream()
 
     class FakeClient:
         def __init__(self, api_key=None):
@@ -1236,14 +1266,24 @@ def test_generate_llm_tips_folds_feedback_history_into_payload(monkeypatch):
     captured = {}
 
     class FakeMessages:
-        def create(self, **kwargs):
+        def stream(self, **kwargs):
             captured.update(kwargs)
 
             class R:
                 stop_reason = "end_turn"
                 content = [type("B", (), {"type": "text",
                                            "text": '{"tips": [], "general_feedback": []}'})()]
-            return R()
+
+            class S:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+                def get_final_message(self):
+                    return R()
+            return S()
 
     class FakeClient:
         def __init__(self, api_key):
