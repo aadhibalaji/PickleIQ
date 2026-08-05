@@ -235,13 +235,22 @@ def run_pass2(video_id: str, params: dict, H, cam: CameraModel | None,
     total_frames = sum(we - ws + 1 for ws, we, _, _ in windows) or 1
     done_frames = 0
 
+    # Identity capacity per side: 1 for singles (one player per side — see
+    # players.py's serve-numbering docstring), 2 for doubles. match_type is
+    # required at upload (see api/media.py) but older rows predating that
+    # requirement can still have NULL here; those default to doubles (2) —
+    # the pre-existing behaviour — rather than guessing singles, since
+    # under-capping would silently drop a real second player's detections.
+    max_per_team = 1 if vrow["match_type"] == "singles" else 2
+
     # One PoseTracker for the whole run: track_sequence=True (consecutive frames),
     # higher imgsz for far-side players, OpenVINO on the Arc GPU. new_sequence()
     # resets ByteTrack per window WITHOUT recompiling the model (~5 s each on GPU);
     # a fresh instance per window would isolate the same way but pay that recompile.
     pose = PoseTracker(H, track_sequence=True,
                        conf=float(params.get("pose_conf", 0.25)),
-                       imgsz=int(params.get("pose_imgsz", 1920)))
+                       imgsz=int(params.get("pose_imgsz", 1920)),
+                       max_per_team=max_per_team)
     implied_heights: list[float] = []  # calibration cross-check samples
     for wi, (ws, we, _raw_ws, _raw_we) in enumerate(windows):
         pose.new_sequence()

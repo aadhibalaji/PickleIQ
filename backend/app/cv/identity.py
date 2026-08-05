@@ -109,14 +109,21 @@ class PlayerIdentityTracker:
     # lives once per run_pass2() call — see PoseTracker.__init__ / run_pass2,
     # it is never re-created per window). Once both slots for a team exist,
     # _assign_team's cost-rejection branch is unreachable (only fires while
-    # len(idents) < MAX_PER_TEAM) so every later detection force-binds to the
+    # len(idents) < max_per_team) so every later detection force-binds to the
     # nearer slot regardless of cost. A 3rd+ same-team detection in one frame
     # is therefore provably noise, not a real player re-ID failure, and is
     # left with slot=None (see _assign_team's "over capacity" branch) — the
     # caller (pass2.py) must not paper over that with a fabricated id.
-    MAX_PER_TEAM = 2
-
-    def __init__(self) -> None:
+    #
+    # Was a hardcoded class constant (always 2 = doubles capacity), which is
+    # why a singles clip could accumulate up to 4 persistent identities (2
+    # per side) from any bystander/spectator/shadow that got a stable court
+    # projection near the boundary — see docs audit, cv/pass2.py wiring.
+    # Now an instance parameter driven by videos.match_type: 1 (singles —
+    # one player per side, matching players.py's serve numbering docstring)
+    # or 2 (doubles / legacy unset rows, unchanged default).
+    def __init__(self, max_per_team: int = 2) -> None:
+        self.MAX_PER_TEAM = max_per_team
         self._identities: list[_Identity] = []
         self._next_id = 1
 

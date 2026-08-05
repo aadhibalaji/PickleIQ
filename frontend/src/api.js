@@ -4,11 +4,12 @@ const j = async (r) => {
 }
 
 export const api = {
-  uploadVideo: (file, onProgress) =>
+  uploadVideo: (file, matchType, onProgress) =>
     new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest()
       const form = new FormData()
       form.append('file', file)
+      form.append('match_type', matchType)
       xhr.open('POST', '/api/videos')
       xhr.upload.onprogress = (e) => onProgress?.(e.loaded / e.total)
       xhr.onload = () =>

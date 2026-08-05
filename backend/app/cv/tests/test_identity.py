@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
+
 from ..identity import PlayerIdentityTracker, _Identity
 
 
@@ -57,7 +59,45 @@ def test_sticky_bonus_decays_so_real_occlusion_recovery_still_works():
     assert t._cost(det, None, a, frame_idx) > t._cost(det, None, b, frame_idx)
 
 
+@dataclass
+class _FullObs:
+    court_xy: tuple[float, float]
+    team: str
+    box: tuple[float, float, float, float] = (0.0, 0.0, 10.0, 10.0)
+    keypoints: list = None
+    slot: int | None = None
+    number: int | None = None
+
+
+def test_max_per_team_caps_singles_at_one_identity_per_side():
+    """Root-cause regression for the 'singles clip tracks 4 players' bug:
+    max_per_team=1 (singles) must never create a 2nd persistent identity on
+    the same side, even when a 2nd detection is real and well-separated —
+    it force-binds to the existing slot (or is dropped as noise) instead,
+    exactly as MAX_PER_TEAM=2 already did for a 3rd doubles detection."""
+    t = PlayerIdentityTracker(max_per_team=1)
+    frame = np.zeros((20, 20, 3), dtype=np.uint8)
+
+    o1 = _FullObs(court_xy=(0.0, 0.0), team="near")
+    t.assign(frame, [o1], frame_idx=0)
+    assert o1.slot is not None
+
+    # A second, clearly distinct near-side detection one frame later — in
+    # doubles (max_per_team=2) this would get its own slot; in singles it
+    # must not.
+    o2 = _FullObs(court_xy=(8.0, 8.0), team="near")
+    t.assign(frame, [o2], frame_idx=1)
+    assert len(t._team_ids("near")) == 1, "singles must never grow past 1 identity per side"
+
+
+def test_max_per_team_two_is_unchanged_default():
+    t = PlayerIdentityTracker()  # default, same as before this change
+    assert t.MAX_PER_TEAM == 2
+
+
 if __name__ == "__main__":
     test_sticky_bonus_keeps_continuously_tracked_identity()
     test_sticky_bonus_decays_so_real_occlusion_recovery_still_works()
+    test_max_per_team_caps_singles_at_one_identity_per_side()
+    test_max_per_team_two_is_unchanged_default()
     print("identity self-check OK")

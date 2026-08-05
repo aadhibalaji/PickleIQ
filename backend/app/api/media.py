@@ -7,7 +7,7 @@ import re
 import shutil
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Form, HTTPException, Request, UploadFile
 from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel
 
@@ -26,7 +26,15 @@ class VideoUpdateIn(BaseModel):
 
 
 @router.post("/videos")
-async def upload_video(file: UploadFile):
+async def upload_video(file: UploadFile, match_type: str = Form(...)):
+    # Required at upload, enforced server-side (not just in the frontend
+    # selector) — this is what cv/pass2.py reads to cap player-identity
+    # capacity per side (1 for singles, 2 for doubles); a missing/wrong value
+    # here is how a singles clip used to end up tracking 4 "players" (see
+    # docs audit). No default: an upload without it is rejected outright
+    # rather than silently guessing a match type.
+    if match_type not in ("singles", "doubles"):
+        raise HTTPException(400, "match_type is required and must be 'singles' or 'doubles'")
     video_id = db.new_id()
     safe_name = os.path.basename(file.filename or "video.mp4")
     s3_key = None
@@ -63,10 +71,11 @@ async def upload_video(file: UploadFile):
 
     with db.connect() as con:
         con.execute(
-            "INSERT INTO videos (id, filename, path, s3_key, fps, width, height, frame_count, uploaded_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO videos (id, filename, path, s3_key, fps, width, height, frame_count,"
+            " uploaded_at, match_type)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
             (video_id, safe_name, str(dest), s3_key, meta.fps, meta.width, meta.height,
-             meta.frame_count, db.now()),
+             meta.frame_count, db.now(), match_type),
         )
     if RUN_PROCESSING:
         # Immediately kick off Pass 1 in the background — the user goes
@@ -118,9 +127,13 @@ def get_video(video_id: str):
 @router.patch("/videos/{video_id}")
 def update_video(video_id: str, body: VideoUpdateIn):
     """Per-clip metadata that isn't produced by a pass — currently just
-    match_type, used by the coaching layer to defend against player-identity
-    mis-tracking on singles clips (see rallyanalysis/coaching.py)."""
-    if body.match_type not in (None, "singles", "doubles"):
+    match_type, which drives identity-tracking capacity per side in
+    cv/pass2.py (1/side singles, 2/side doubles) as well as the coaching-
+    report singles merge stopgap (rallyanalysis/coaching.py). match_type is
+    required at upload now, so this is a correction path, not the primary
+    way of setting it — None is rejected here too (once a clip has a real
+    value, this endpoint can't blank it back to the legacy-default state)."""
+    if body.match_type not in ("singles", "doubles"):
         raise HTTPException(400, "match_type must be 'singles' or 'doubles'")
     with db.connect() as con:
         if con.execute("SELECT 1 FROM videos WHERE id=?", (video_id,)).fetchone() is None:

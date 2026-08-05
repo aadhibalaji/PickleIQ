@@ -128,13 +128,17 @@ class PoseTracker:
 
     def __init__(self, H: np.ndarray | None, track_sequence: bool = True,
                  conf: float = 0.25, imgsz: int = 640,
-                 model_name: str | None = None):
+                 model_name: str | None = None, max_per_team: int = 2):
         self.H = H
         self._device_ok = True
         # Official numbers now ride on match-stable identity slots (see identity.py),
         # not on the fragile ByteTrack track_id — that is what stopped the numbers
         # switching whenever a track_id churned on a crossing/occlusion/dropout.
-        self.identity = PlayerIdentityTracker()
+        # max_per_team: 1 for singles (one player per side), 2 for doubles/unset
+        # — see run_pass2, which resolves this from videos.match_type. Caps the
+        # number of persistent identities identity.py will ever create per side,
+        # so a singles clip can no longer accumulate phantom 3rd/4th players.
+        self.identity = PlayerIdentityTracker(max_per_team=max_per_team)
         self._track_sequence = track_sequence
         self._conf = float(conf)
         self._imgsz = int(imgsz)
