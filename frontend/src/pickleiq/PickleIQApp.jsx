@@ -7,8 +7,9 @@ import RallyReviewScreen from './RallyReviewScreen.jsx'
 import Pass2Screen from './Pass2Screen.jsx'
 import AnalysisScreen from './AnalysisScreen.jsx'
 import ResultsScreen from './ResultsScreen.jsx'
+import PastClipsList from './PastClipsList.jsx'
 import SelfStopToggle from './components/SelfStopToggle.jsx'
-import { startPickleIQAnalysis } from './processingAdapter.js'
+import { loadClipResults, startPickleIQAnalysis } from './processingAdapter.js'
 
 const GAME_OPTIONS = [
   { value: 'singles', label: 'Singles' },
@@ -29,6 +30,8 @@ export default function PickleIQApp() {
   const [pass1Output, setPass1Output] = useState(null)
   const [pass2Output, setPass2Output] = useState(null)
   const [analysisOutput, setAnalysisOutput] = useState(null)
+  const [historyResult, setHistoryResult] = useState(null)
+  const [historyError, setHistoryError] = useState('')
   const [error, setError] = useState('')
   const sessionRef = useRef(0)
   const uploadControllerRef = useRef(null)
@@ -71,10 +74,29 @@ export default function PickleIQApp() {
     setPass1Output(null)
     setPass2Output(null)
     setAnalysisOutput(null)
+    setHistoryResult(null)
+    setHistoryError('')
     setGameType('singles')
     setAnalysisType('positioning')
     setUploading(false)
     setError('')
+  }
+
+  const openHistory = () => setStage('past-clips')
+
+  const selectPastClip = async (videoId) => {
+    setHistoryError('')
+    try {
+      const result = await loadClipResults(videoId)
+      if (!result) {
+        setHistoryError('That clip has not finished generating feedback yet.')
+        return
+      }
+      setHistoryResult(result)
+      setStage('history-results')
+    } catch (loadError) {
+      setHistoryError(loadError.message || 'Could not load that clip.')
+    }
   }
 
   const finishPass1 = useCallback((output) => {
@@ -131,9 +153,23 @@ export default function PickleIQApp() {
       localFile={video} onHome={returnHome} />
   }
 
+  if (stage === 'past-clips') {
+    return <PastClipsList onSelect={selectPastClip} onHome={returnHome} selectError={historyError} />
+  }
+
+  if (stage === 'history-results') {
+    // ResultsScreen's button reads "Back to Home" — send it to the actual
+    // home screen, not back into the list, so the label stays honest.
+    return <ResultsScreen analysisResult={historyResult?.analysisResult} pass2Result={historyResult?.pass2Result}
+      localFile={null} onHome={returnHome} />
+  }
+
   return (
     <main className="pickleiq-page" aria-labelledby="pickleiq-title">
       <SelfStopToggle />
+      <button type="button" className="pickleiq-secondary-button pickleiq-history-link" onClick={openHistory}>
+        Past Clips
+      </button>
       <h1 className="pickleiq-wordmark" id="pickleiq-title">PickleIQ</h1>
       <section className="pickleiq-control-stack" aria-label="Analysis setup">
         <VideoUploadControl file={video} disabled={uploading}

@@ -45,6 +45,7 @@ def _report_payload(report: CoachingReport) -> dict:
     return {"video_id": report.video_id, "tips": tips, "players": players,
             "player_themes": [asdict(t) for t in report.player_themes],
             "general_feedback": general,
+            "player_photos": report.player_photos or {},
             "focus": report.focus,
             "stale_reason": report.stale_reason}
 

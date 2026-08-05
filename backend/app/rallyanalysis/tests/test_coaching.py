@@ -238,10 +238,10 @@ def test_build_report_attaches_validated_general_feedback():
     # from our own contact data.
     def fake_llm(shots, stats=None, ctx=None):
         return ({s["contact_id"]: {"tip": "t", "tone": "improve"} for s in shots},
-                [{"player_label": "Player 1", "praise": "solid at the line",
-                  "improve": "keep working the feet"},
-                 {"player_label": "Player 99", "praise": "hallucinated", "improve": "player"},
-                 {"player_label": "Player 1", "praise": "duplicate", "improve": "dropped"}])
+                [{"player_label": "Player 1", "summary": "solid at the line",
+                  "takeaways": ["keep working the feet", "good paddle prep"]},
+                 {"player_label": "Player 99", "summary": "hallucinated", "takeaways": ["player"]},
+                 {"player_label": "Player 1", "summary": "duplicate", "takeaways": ["dropped"]}])
 
     vectors_meta = [(_vec("bad", "footwork", -3.0), _contact("bad"))]
     report = build_report("vid1", vectors_meta, llm_fn=fake_llm)
@@ -249,14 +249,14 @@ def test_build_report_attaches_validated_general_feedback():
     fb = report.general[0]
     assert fb.player_label == "Player 1"
     assert fb.player_id == 1
-    assert fb.praise == "solid at the line"
-    assert fb.improve == "keep working the feet"
+    assert fb.summary == "solid at the line"
+    assert fb.takeaways == ["keep working the feet", "good paddle prep"]
     assert report.player_themes == []  # replaced by general_feedback on new reports
 
 
 def test_build_report_drops_general_entries_missing_either_piece():
     def fake_llm(shots, stats=None, ctx=None):
-        return ({}, [{"player_label": "Player 1", "praise": "only praise, no improve"}])
+        return ({}, [{"player_label": "Player 1", "summary": "only a summary, no takeaways"}])
 
     report = build_report("vid1", [(_vec("bad", "footwork", -3.0), _contact("bad"))],
                            llm_fn=fake_llm)
@@ -289,6 +289,45 @@ def test_general_context_never_praises_the_flagged_category_or_thin_samples():
     p1 = coaching._general_context(thin)["Player 1"]
     assert p1["strongest_positive_category"] is None
     assert coaching._general_context([]) is None
+
+
+def test_general_context_ranks_up_to_two_categories_each_side():
+    # 3 flagged categories (footwork worst, then paddle_prep, then
+    # follow_through unflagged-enough to not qualify) + 2 clean/sampled
+    # categories -> negative_categories/positive_categories cap at 2, most
+    # extreme first, and never overlap with each other.
+    vectors_meta = (
+        [(_vec(f"fw{i}", "footwork", -2.0), _contact(f"fw{i}")) for i in range(4)]
+        + [(_vec(f"pp{i}", "paddle_prep", -2.0 if i < 2 else 0.0), _contact(f"pp{i}"))
+           for i in range(4)]
+        + [(_vec(f"cp{i}", "contact_point", 0.0), _contact(f"cp{i}")) for i in range(3)]
+        + [(_vec(f"ft{i}", "follow_through", 0.0), _contact(f"ft{i}")) for i in range(3)]
+    )
+    p1 = coaching._general_context(vectors_meta)["Player 1"]
+    assert p1["negative_categories"] == ["footwork", "paddle_prep"]
+    assert p1["strongest_negative_category"] == "footwork"
+    assert set(p1["positive_categories"]) == {"contact_point", "follow_through"}
+    assert not set(p1["negative_categories"]) & set(p1["positive_categories"])
+
+
+def test_general_feedback_from_row_reads_current_shape():
+    row = coaching._general_feedback_from_row(
+        {"player_id": 1, "player_label": "Player 1", "summary": "solid session",
+         "takeaways": ["a", "b", "c"]})
+    assert row.summary == "solid session"
+    assert row.takeaways == ["a", "b", "c"]
+
+
+def test_general_feedback_from_row_degrades_legacy_praise_improve_shape():
+    # Rows saved before this feature existed carry {praise, improve} instead
+    # of {summary, takeaways} — must not crash on load, and must not lose
+    # the two pieces of feedback that row actually has.
+    row = coaching._general_feedback_from_row(
+        {"player_id": 2, "player_label": "Player 2",
+         "praise": "great footwork", "improve": "watch your paddle prep"})
+    assert row.summary == ""
+    assert row.takeaways == ["great footwork", "watch your paddle prep"]
+    assert row.player_id == 2 and row.player_label == "Player 2"
 
 
 def test_build_report_frames_fn_runs_on_candidates_only_and_feeds_llm_fn():

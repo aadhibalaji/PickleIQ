@@ -1,7 +1,8 @@
-import React, { useRef, useState } from 'react'
+import React, { useEffect, useRef, useState } from 'react'
 import PrimaryButton from './components/PrimaryButton.jsx'
 import ProcessingError from './components/ProcessingError.jsx'
 import ProcessingProgress from './components/ProcessingProgress.jsx'
+import RallyTimeline from './components/RallyTimeline.jsx'
 import VideoPreview from './components/VideoPreview.jsx'
 import { submitRallySelections } from './processingAdapter.js'
 
@@ -24,6 +25,7 @@ export default function RallyReviewScreen({ videoId, localFile, pass1Result, onC
   const [stage, setStage] = useState(candidates.length ? 'review' : 'draw') // 'review' | 'draw' | 'submitting'
   const [reviewIndex, setReviewIndex] = useState(0)
   const [keptIds, setKeptIds] = useState([])
+  const [skippedIds, setSkippedIds] = useState([])
   const [drawnRanges, setDrawnRanges] = useState([])
   const [pendingStart, setPendingStart] = useState(null)
   const [drawError, setDrawError] = useState('')
@@ -32,6 +34,7 @@ export default function RallyReviewScreen({ videoId, localFile, pass1Result, onC
   const decide = (keep) => {
     const candidate = candidates[reviewIndex]
     if (keep) setKeptIds((ids) => [...ids, candidate.id])
+    else setSkippedIds((ids) => [...ids, candidate.id])
     const next = reviewIndex + 1
     if (next >= candidates.length) setStage('draw')
     else setReviewIndex(next)
@@ -42,8 +45,28 @@ export default function RallyReviewScreen({ videoId, localFile, pass1Result, onC
     const prevIndex = reviewIndex - 1
     const prevId = candidates[prevIndex].id
     setKeptIds((ids) => ids.filter((id) => id !== prevId))
+    setSkippedIds((ids) => ids.filter((id) => id !== prevId))
     setReviewIndex(prevIndex)
   }
+
+  // Auto-seek the video to each candidate's start as you advance/go back —
+  // if the <video> hasn't loaded its metadata yet (currentTime writes are
+  // ignored until then), retry once metadata arrives.
+  useEffect(() => {
+    if (stage !== 'review') return
+    const candidate = candidates[reviewIndex]
+    const video = playerRef.current
+    if (!candidate || !video) return
+    const seek = () => { video.currentTime = candidate.start_frame / fps }
+    if (video.readyState >= 1) {
+      seek()
+      return undefined
+    }
+    video.addEventListener('loadedmetadata', seek, { once: true })
+    return () => video.removeEventListener('loadedmetadata', seek)
+  }, [stage, reviewIndex, candidates, fps])
+
+  const seekTo = (seconds) => { if (playerRef.current) playerRef.current.currentTime = seconds }
 
   const currentFrame = () => Math.round((playerRef.current?.currentTime || 0) * fps)
   const markStart = () => { setDrawError(''); setPendingStart(currentFrame()) }
@@ -93,27 +116,38 @@ export default function RallyReviewScreen({ videoId, localFile, pass1Result, onC
 
   if (stage === 'review') {
     const candidate = candidates[reviewIndex]
+    const timelineSections = candidates.map((c, i) => ({
+      id: c.id, startFrame: c.start_frame, endFrame: c.end_frame,
+      decision: i === reviewIndex ? 'current'
+        : keptIds.includes(c.id) ? 'kept'
+        : skippedIds.includes(c.id) ? 'rejected' : 'unknown',
+    }))
     return (
-      <main className="pickleiq-page pickleiq-review-page" aria-labelledby="pickleiq-review-title">
+      <main className="pickleiq-page pickleiq-processing-page" aria-labelledby="pickleiq-review-title">
         <h1 id="pickleiq-review-title">Review Rallies</h1>
-        <p className="pickleiq-review-count">Rally {reviewIndex + 1} of {candidates.length}</p>
-        <section className="pickleiq-review-card" aria-label={`Rally ${reviewIndex + 1}`}>
-          <p className="pickleiq-review-time">
-            {formatTime(candidate.start_frame, fps)} – {formatTime(candidate.end_frame, fps)}
-          </p>
-          <p className="pickleiq-review-duration">
-            {formatTime(candidate.end_frame - candidate.start_frame, fps)} long
-          </p>
+        <section className="pickleiq-processing-content" aria-label={`Rally ${reviewIndex + 1} of ${candidates.length}`}>
+          <p className="pickleiq-review-count">Rally {reviewIndex + 1} of {candidates.length}</p>
+          <div className="pickleiq-review-card">
+            <p className="pickleiq-review-time">
+              {formatTime(candidate.start_frame, fps)} – {formatTime(candidate.end_frame, fps)}
+            </p>
+            <p className="pickleiq-review-duration">
+              {formatTime(candidate.end_frame - candidate.start_frame, fps)} long
+            </p>
+          </div>
+          <VideoPreview localFile={localFile} previewKind="original-local" playerRef={playerRef} />
+          <RallyTimeline sections={timelineSections} fps={fps} durationSeconds={pass1Result?.durationSeconds}
+            onSeek={seekTo} emptyLabel="No rallies detected" />
+          <div className="pickleiq-review-actions">
+            <button type="button" className="pickleiq-secondary-button" onClick={() => decide(false)}>
+              Skip
+            </button>
+            <PrimaryButton onClick={() => decide(true)}>Keep</PrimaryButton>
+          </div>
+          {reviewIndex > 0 && (
+            <button type="button" className="pickleiq-review-back" onClick={goBack}>← back</button>
+          )}
         </section>
-        <div className="pickleiq-review-actions">
-          <button type="button" className="pickleiq-secondary-button" onClick={() => decide(false)}>
-            Skip
-          </button>
-          <PrimaryButton onClick={() => decide(true)}>Keep</PrimaryButton>
-        </div>
-        {reviewIndex > 0 && (
-          <button type="button" className="pickleiq-review-back" onClick={goBack}>← back</button>
-        )}
       </main>
     )
   }

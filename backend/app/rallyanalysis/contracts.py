@@ -171,16 +171,17 @@ class PlayerTheme:
 
 @dataclass
 class GeneralFeedback:
-    """One per player per report: exactly one positive and one negative piece
-    of session-wide feedback, grounded in deterministic per-player metric
-    aggregates (coaching._general_context) and written by the same single LLM
-    call as the tips. Replaces PlayerTheme on new reports. Attribution rules
-    match PlayerTheme: player_id/player_label come from our own contact data,
-    the model's echoed label is only a join key."""
+    """One per player per report: a one-sentence session summary plus 3-4
+    distinct takeaway bullets (mix of what's working and what to fix),
+    grounded in deterministic per-player metric aggregates
+    (coaching._general_context) and written by the same single LLM call as
+    the tips. Replaces PlayerTheme on new reports. Attribution rules match
+    PlayerTheme: player_id/player_label come from our own contact data, the
+    model's echoed label is only a join key."""
     player_id: int
     player_label: str
-    praise: str   # what's working — the strongest positive session pattern
-    improve: str  # the one thing to fix — the strongest negative pattern
+    summary: str = ""             # one sentence: the session in a nutshell
+    takeaways: list = field(default_factory=list)  # list[str], 3-4 short bullets
 
 
 @dataclass
@@ -196,7 +197,12 @@ class CoachingReport:
     # Which metric family this report evaluated — 'form' | 'positioning'.
     # None on reports generated before selectable focus existed (= form).
     focus: str | None = None
-    # list[GeneralFeedback] — per-player praise+improve pairs. Empty on
-    # legacy reports (which carry player_themes instead) and on reports
-    # whose LLM call degraded.
+    # list[GeneralFeedback] — per-player summary+takeaways. Empty on legacy
+    # reports (which carry player_themes instead) and on reports whose LLM
+    # call degraded.
     general: list = field(default_factory=list)
+    # {player_label: jpeg_b64} — one representative photo per player (see
+    # keyframes.extract_identity_photos), so the UI can show who's who
+    # instead of an unlabeled seat number. None when extraction wasn't
+    # possible (no video path, unreadable file, no player boxes yet).
+    player_photos: dict | None = None

@@ -247,10 +247,18 @@ _ADDED_COLUMNS = [
     # Which metric family this report was generated under ('form' |
     # 'positioning'); NULL on reports that predate selectable focus (= form).
     ("coaching_reports", "focus", "TEXT"),
-    # JSON [{player_id, player_label, praise, improve}] — per-player general
-    # feedback (one positive + one negative) from the same single LLM call.
-    # Replaces themes_json on new reports; NULL on older ones.
+    # JSON [{player_id, player_label, summary, takeaways}] — per-player
+    # general feedback (one-sentence summary + 3-4 takeaway bullets) from
+    # the same single LLM call. Replaces themes_json on new reports; NULL on
+    # older ones. Rows predating this shape carry {praise, improve} instead
+    # (see coaching.get_report's legacy-shape handling) — never re-migrated
+    # in place, regenerating the report is the upgrade path.
     ("coaching_reports", "general_json", "TEXT"),
+    # JSON {player_id: jpeg_b64} — one representative photo per player (see
+    # keyframes.extract_identity_photos), so the UI can show who's who
+    # instead of an unlabeled seat number. NULL on reports generated before
+    # this existed, or when extraction wasn't possible for that video.
+    ("coaching_reports", "player_photos_json", "TEXT"),
 ]
 
 STALE_BEFORE_CONFIDENCE_FIX = "generated_before_confidence_fix"

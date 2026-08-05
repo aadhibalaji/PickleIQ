@@ -16,7 +16,8 @@ export default function TimestampFeedback({ entries, selectedId, onSelect }) {
             <button key={entry.id} type="button" aria-pressed={active}
               disabled={!available} className={active ? 'is-selected' : ''}
               onClick={() => onSelect(entry.id)}
-              aria-label={`${entry.displayLabel}. ${available ? 'Show coaching feedback' : 'Feedback unavailable'}`}>
+              aria-label={`${entry.displayLabel}${entry.playerLabel ? `, ${entry.playerLabel}` : ''}. ${available ? 'Show coaching feedback' : 'Feedback unavailable'}`}>
+              {entry.playerPhoto && <img className="pickleiq-player-photo pickleiq-player-photo--tiny" src={entry.playerPhoto} alt="" />}
               {entry.displayLabel}
             </button>
           )
@@ -24,7 +25,10 @@ export default function TimestampFeedback({ entries, selectedId, onSelect }) {
       </div>
       {selected?.feedback && (
         <section className="pickleiq-selected-feedback" aria-live="polite" aria-atomic="true">
-          <p>{selected.displayLabel}</p>
+          <div className="pickleiq-player-heading">
+            {selected.playerPhoto && <img className="pickleiq-player-photo" src={selected.playerPhoto} alt="" />}
+            <p>{selected.displayLabel}{selected.playerLabel ? ` — ${selected.playerLabel}` : ''}</p>
+          </div>
           <div>{selected.feedback}</div>
         </section>
       )}

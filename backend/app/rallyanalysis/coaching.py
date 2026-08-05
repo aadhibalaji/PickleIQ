@@ -997,14 +997,16 @@ MIN_GENERAL_CATEGORY_SAMPLES = 3
 
 def _general_context(vectors_meta: list[tuple[ShotFeatureVector, dict]]) -> dict | None:
     """Deterministic per-player session aggregates behind general_feedback
-    (one praise + one improve per player) — the coarse pass: pure
+    (one summary + 3-4 takeaways per player) — the coarse pass: pure
     category-level math over EVERY scored moment, no LLM. Besides the raw
-    counts, two deterministic picks per player: strongest_negative_category
-    (most flagged — what the improve piece should be about) and
-    strongest_positive_category (their best-sampled cleanest category — what
-    the praise piece should be about). A None pick is an honest gap ("the
-    data doesn't support a call"), never backfilled; the same category is
-    never both picks."""
+    counts, ranked category picks per player: negative_categories (most
+    flagged first) and positive_categories (best-sampled cleanest first) —
+    up to 2 each, so there's enough grounded, distinct material for several
+    takeaways without ever inventing a session-wide pattern from one moment.
+    strongest_negative_category/strongest_positive_category (singular) stay
+    as the first element of each list, for whatever still reads just those.
+    An empty list is an honest gap ("the data doesn't support a call"),
+    never backfilled; a category is never in both lists."""
     per_player: dict = {}
     for vec, contact in vectors_meta:
         cats = per_player.setdefault(contact.get("player_id"), {})
@@ -1016,18 +1018,19 @@ def _general_context(vectors_meta: list[tuple[ShotFeatureVector, dict]]) -> dict
     out: dict = {}
     for pid, cats in per_player.items():
         flagged = {c: e for c, e in cats.items() if e["flagged"] > 0}
-        negative = (max(flagged, key=lambda c: (flagged[c]["flagged"],
-                                                 flagged[c]["flagged"] / flagged[c]["n"]))
-                    if flagged else None)
+        negatives = sorted(flagged, key=lambda c: (flagged[c]["flagged"],
+                                                     flagged[c]["flagged"] / flagged[c]["n"]),
+                            reverse=True)[:2]
         sampled = {c: e for c, e in cats.items()
-                   if e["n"] >= MIN_GENERAL_CATEGORY_SAMPLES and c != negative}
-        positive = (min(sampled, key=lambda c: (sampled[c]["flagged"] / sampled[c]["n"],
-                                                 -sampled[c]["n"]))
-                    if sampled else None)
+                   if e["n"] >= MIN_GENERAL_CATEGORY_SAMPLES and c not in negatives}
+        positives = sorted(sampled, key=lambda c: (sampled[c]["flagged"] / sampled[c]["n"],
+                                                     -sampled[c]["n"]))[:2]
         out[player_label(pid)] = {
             "by_category": cats,
-            "strongest_negative_category": negative,
-            "strongest_positive_category": positive,
+            "negative_categories": negatives,
+            "positive_categories": positives,
+            "strongest_negative_category": negatives[0] if negatives else None,
+            "strongest_positive_category": positives[0] if positives else None,
         }
     return out or None
 
@@ -1064,17 +1067,21 @@ TIPS_SCHEMA = {
                 "properties": {
                     "player_label": {"type": "string", "description": "Exactly one of the "
                                      "player_label values present in the shots you were given."},
-                    "praise": {"type": "string", "description": "1-2 sentences, coach voice: the "
-                               "ONE thing genuinely working for this player this session — real "
-                               "reinforcement of something observed, never filler. Grounded in "
-                               "general_context/session_context and the shots. Same "
-                               "no-raw-numbers/no-anatomy rules as tips."},
-                    "improve": {"type": "string", "description": "1-2 sentences, coach voice: the "
-                                "single most valuable thing for this player to fix — the dominant "
-                                "negative session pattern, one pointed fix, not a list. Same "
-                                "rules as tips."},
+                    "summary": {"type": "string", "description": "ONE sentence, coach voice: "
+                                "the session for this player in a nutshell. Grounded in "
+                                "general_context/session_context and the shots. Same "
+                                "no-raw-numbers/no-anatomy rules as tips."},
+                    "takeaways": {"type": "array", "minItems": 1, "maxItems": 4,
+                                  "items": {"type": "string"},
+                                  "description": "3-4 short, distinct bullet points (fewer only "
+                                  "if the data genuinely doesn't support more — never pad with "
+                                  "an invented pattern), each ONE sentence, coach voice, covering "
+                                  "a mix of what's working and what to fix this session. Same "
+                                  "no-raw-numbers/no-anatomy/null-discipline rules as tips — "
+                                  "grounded in general_context's category aggregates, never a "
+                                  "single moment blown up into a 'pattern'."},
                 },
-                "required": ["player_label", "praise", "improve"],
+                "required": ["player_label", "summary", "takeaways"],
                 "additionalProperties": False,
             },
         },
@@ -1332,20 +1339,22 @@ SELECTED shot, each referencing that shot's contact_id so it can be matched
 back up; shots you don't select simply get no entry."""
 
 _SYS_GENERAL = """Also return general_feedback: exactly one entry per distinct player_label
-present in the shots, and none for any label not present. Each entry is two
-short pieces in the same coach voice, 1-2 sentences each: "praise" — the
-ONE thing genuinely working for this player this session — and "improve" —
-the single most valuable thing to fix. Ground both in the general_context
-object when present: for each player it aggregates EVERY analyzed moment by
-category (how many, how many flagged) and names strongest_positive_category
-/ strongest_negative_category — the session-wide patterns the aggregates
-actually support. Prefer those categories; a null pick means the data does
-not support a call there, so stay modest and base that piece only on what
-you can see — never invent a session-wide pattern from a single moment.
-Praise is real reinforcement of something observed, never filler; improve
-is one pointed fix, not a list. Write each tip so it reads as part of that
-player's general feedback when the moment fits the pattern, but every tip
-must still stand alone. All the rules above — no raw numbers, no anatomical
+present in the shots, and none for any label not present. Each entry has:
+"summary" — ONE sentence, the session for this player in a nutshell — and
+"takeaways" — 3-4 short, distinct bullets (one sentence each), a mix of
+what's working and what to fix, never all-positive or all-negative unless
+the data genuinely only supports one side. Ground everything in the
+general_context object when present: for each player it aggregates EVERY
+analyzed moment by category (how many, how many flagged) and ranks
+negative_categories / positive_categories — the session-wide patterns the
+aggregates actually support, strongest first. Draw takeaways from those
+ranked categories (one bullet per category picked is the natural shape for
+3-4 categories across both lists); an empty list means the data does not
+support a call there, so stay modest — never invent a session-wide pattern
+from a single moment, and never pad to 4 bullets with a repeat or a filler
+observation. Write each tip so it reads as part of that player's general
+feedback when the moment fits one of the takeaways, but every tip must
+still stand alone. All the rules above — no raw numbers, no anatomical
 terms, null and no-comparison discipline — apply to general_feedback
 exactly as they do to tips."""
 
@@ -1615,10 +1624,10 @@ def generate_llm_tips(shots: list[dict], stats_summary: dict | None = None,
         cid, tip, tone = t.get("contact_id"), t.get("tip"), t.get("tone")
         if cid and tip and tone in ("improve", "praise"):
             out[cid] = {"tip": tip, "tone": tone}
-    general = [{"player_label": g.get("player_label"), "praise": g.get("praise"),
-                "improve": g.get("improve")}
+    general = [{"player_label": g.get("player_label"), "summary": g.get("summary"),
+                "takeaways": [t for t in (g.get("takeaways") or []) if t]}
                for g in data.get("general_feedback") or []
-               if g.get("player_label") and g.get("praise") and g.get("improve")]
+               if g.get("player_label") and g.get("summary") and g.get("takeaways")]
     return out, general
 
 
@@ -1671,7 +1680,8 @@ def _summarize_stats(stats: dict | None) -> dict | None:
 def build_report(video_id: str, vectors_meta: list[tuple[ShotFeatureVector, dict]],
                   llm_fn=None, stats_summary: dict | None = None,
                   frames_fn=None, focus: str = FOCUS_FORM,
-                  feedback_history: dict | None = None) -> CoachingReport:
+                  feedback_history: dict | None = None,
+                  player_photos: dict | None = None) -> CoachingReport:
     category_metrics = (positioning.CATEGORY_METRICS if focus == FOCUS_POSITIONING
                         else CATEGORY_METRICS)
     # Hand the LLM a WIDER statistical shortlist than the tip budget — it can
@@ -1759,11 +1769,12 @@ def build_report(video_id: str, vectors_meta: list[tuple[ShotFeatureVector, dict
     general, seen_labels = [], set()
     for g in general_raw:
         lbl = g.get("player_label")
-        if lbl in label_to_pid and lbl not in seen_labels and g.get("praise") and g.get("improve"):
+        if lbl in label_to_pid and lbl not in seen_labels and g.get("summary") and g.get("takeaways"):
             general.append(GeneralFeedback(player_id=label_to_pid[lbl], player_label=lbl,
-                                            praise=g["praise"], improve=g["improve"]))
+                                            summary=g["summary"], takeaways=g["takeaways"]))
             seen_labels.add(lbl)
-    return CoachingReport(video_id=video_id, tips=tips, general=general, focus=focus)
+    return CoachingReport(video_id=video_id, tips=tips, general=general, focus=focus,
+                           player_photos=player_photos)
 
 
 def exclude_serves(contacts: list[dict]) -> list[dict]:
@@ -1876,8 +1887,9 @@ def generate_coaching_report(video_id: str, rally_source: str | None = None,
     rallies = get_analyzable_rallies(video_id, rally_source=rally_source, overlay_source=overlay_source)
     ready_rally_ids = {r["id"] for r in rallies}
     with db.connect() as con:
-        vrow = con.execute("SELECT fps, match_type, coaching_focus, path FROM videos WHERE id=?",
-                            (video_id,)).fetchone()
+        vrow = con.execute(
+            "SELECT fps, match_type, coaching_focus, path, frame_count FROM videos WHERE id=?",
+            (video_id,)).fetchone()
         contacts = db.rows_to_dicts(con.execute(
             "SELECT * FROM contact_events WHERE video_id=? ORDER BY frame_idx",
             (video_id,)).fetchall())
@@ -1989,6 +2001,7 @@ def generate_coaching_report(video_id: str, rally_source: str | None = None,
     # keyframes/build_report — never blocks the report.
     video_path = vrow["path"] if vrow and vrow["path"] else None
     frames_fn = None
+    player_photos = None
     if video_path:
         from . import keyframes  # lazy: keeps cv2 out of coaching's import graph
 
@@ -1997,9 +2010,25 @@ def generate_coaching_report(video_id: str, rally_source: str | None = None,
                 video_path, candidates, video_id, overlay_source, fps,
                 PRE_WINDOW_S, POST_WINDOW_S)
 
+        # One representative photo per player ("who's who") — independent of
+        # tip selection, so computed once up front rather than lazily like
+        # frames_fn. Best-effort: never blocks the report.
+        try:
+            photos_by_pid = keyframes.extract_identity_photos(
+                video_path, video_id, overlay_source, vrow["frame_count"] or 0)
+            # Keyed by player_label (not the raw player_id) to match every
+            # other player-attribution field in this module — the frontend
+            # never needs an id-to-label lookup step just for photos.
+            if photos_by_pid:
+                player_photos = {player_label(pid): b64 for pid, b64 in photos_by_pid.items()}
+        except Exception:  # noqa: BLE001
+            log.warning("identity photo extraction failed for %s — proceeding without them",
+                        video_id, exc_info=True)
+
     report = build_report(video_id, vectors_meta, stats_summary=stats_summary,
                            frames_fn=frames_fn, focus=focus,
-                           feedback_history=_tip_feedback_history())
+                           feedback_history=_tip_feedback_history(),
+                           player_photos=player_photos)
     save_report(report)
     return report
 
@@ -2011,12 +2040,28 @@ def save_report(report: CoachingReport) -> None:
     with db.connect() as con:
         con.execute(
             "INSERT OR REPLACE INTO coaching_reports"
-            " (video_id, tips_json, themes_json, general_json, focus, created_at, stale_reason)"
-            " VALUES (?,?,?,?,?,?,NULL)",
+            " (video_id, tips_json, themes_json, general_json, player_photos_json,"
+            " focus, created_at, stale_reason)"
+            " VALUES (?,?,?,?,?,?,?,NULL)",
             (report.video_id, db.dumps([asdict(t) for t in report.tips]),
              db.dumps([asdict(t) for t in report.player_themes]),
              db.dumps([asdict(g) for g in report.general]),
+             db.dumps(report.player_photos),
              report.focus, db.now()))
+
+
+def _general_feedback_from_row(g: dict) -> GeneralFeedback:
+    """GeneralFeedback used to carry {praise, improve} instead of {summary,
+    takeaways} — rows saved under that older shape would otherwise blow up
+    GeneralFeedback(**g) with an unexpected-kwarg TypeError on every future
+    fetch. Degrades a legacy row to a 2-item takeaways list rather than
+    losing it; never re-migrated in place, regenerating is the upgrade
+    path."""
+    if "summary" in g or "takeaways" in g:
+        return GeneralFeedback(player_id=g["player_id"], player_label=g["player_label"],
+                                summary=g.get("summary") or "", takeaways=g.get("takeaways") or [])
+    return GeneralFeedback(player_id=g["player_id"], player_label=g["player_label"],
+                            summary="", takeaways=[t for t in (g.get("praise"), g.get("improve")) if t])
 
 
 def get_report(video_id: str) -> CoachingReport | None:
@@ -2024,16 +2069,17 @@ def get_report(video_id: str) -> CoachingReport | None:
         row = con.execute("SELECT * FROM coaching_reports WHERE video_id=?", (video_id,)).fetchone()
     if row is None:
         return None
-    # themes_json / general_json / focus are NULL on rows predating their
-    # migrations (columns added without a backfill) — empty lists / None,
-    # not an error.
+    # themes_json / general_json / player_photos_json / focus are NULL on
+    # rows predating their migrations (columns added without a backfill) —
+    # empty lists / None, not an error.
     return CoachingReport(
         video_id=row["video_id"],
         tips=[CoachingTip(**t) for t in db.loads(row["tips_json"], [])],
         player_themes=[PlayerTheme(**t) for t in db.loads(row["themes_json"] or "[]", [])],
         stale_reason=row["stale_reason"],
         focus=row["focus"],
-        general=[GeneralFeedback(**g) for g in db.loads(row["general_json"] or "[]", [])])
+        general=[_general_feedback_from_row(g) for g in db.loads(row["general_json"] or "[]", [])],
+        player_photos=db.loads(row["player_photos_json"], None))
 
 
 if __name__ == "__main__":
