@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react'
-import HomeLink from './components/HomeLink.jsx'
+import Header from './components/Header.jsx'
+import Footer from './components/Footer.jsx'
 import PrimaryButton from './components/PrimaryButton.jsx'
 import ProcessingError from './components/ProcessingError.jsx'
 import ProcessingProgress from './components/ProcessingProgress.jsx'
@@ -18,7 +19,8 @@ function formatTime(frame, fps) {
 // one rally at a time, one button press per decision, then an optional step
 // to mark any rally Pass 1 missed. Ends by submitting the selections (see
 // submitRallySelections) and queuing Pass 2.
-export default function RallyReviewScreen({ videoId, localFile, pass1Result, onComplete, onHome }) {
+export default function RallyReviewScreen({ videoId, localFile, pass1Result, onComplete, onHome,
+  onPastClips, onTesting }) {
   const candidates = pass1Result?.retainedRallies || []
   const fps = pass1Result?.fps || 30
   // Same fallback Pass1Screen/Pass2Screen/AnalysisScreen already use: null
@@ -109,17 +111,24 @@ export default function RallyReviewScreen({ videoId, localFile, pass1Result, onC
 
   if (stage === 'submitting') {
     return (
-      <main className="pickleiq-page pickleiq-processing-page" aria-labelledby="pickleiq-review-title">
-        <HomeLink onHome={onHome} />
-        <h1 id="pickleiq-review-title">Starting Pass 2...</h1>
-        {submitError ? (
-          <ProcessingError message={submitError} onRetry={submit} onHome={onHome} retryLabel="Retry" />
-        ) : (
-          <section className="pickleiq-processing-content" aria-label="Starting Pass 2">
-            <ProcessingProgress label="Pass 2" progress={null} message="Queuing your selected rallies…" />
-          </section>
-        )}
-      </main>
+      <div className="pickleiq-page">
+        <Header onHome={onHome} onPastClips={onPastClips} onTesting={onTesting} />
+        <main className="pickleiq-processing-main" aria-labelledby="pickleiq-review-title">
+          <div className="pickleiq-processing-header">
+            <button type="button" className="pickleiq-processing-back" onClick={onHome}>&larr; Home</button>
+            <h1 id="pickleiq-review-title">Starting Pass 2...</h1>
+          </div>
+          <div className="pickleiq-processing-divider" />
+          {submitError ? (
+            <ProcessingError message={submitError} onRetry={submit} onHome={onHome} retryLabel="Retry" />
+          ) : (
+            <section aria-label="Starting Pass 2">
+              <ProcessingProgress label="Pass 2 of 3" progress={null} message="Queuing your selected rallies…" />
+            </section>
+          )}
+        </main>
+        <Footer left="PROCESSING" right="PASS 2 OF 3" />
+      </div>
     )
   }
 
@@ -132,11 +141,15 @@ export default function RallyReviewScreen({ videoId, localFile, pass1Result, onC
         : skippedIds.includes(c.id) ? 'rejected' : 'unknown',
     }))
     return (
-      <main className="pickleiq-page pickleiq-processing-page" aria-labelledby="pickleiq-review-title">
-        <HomeLink onHome={onHome} />
-        <h1 id="pickleiq-review-title">Review Rallies</h1>
-        <section className="pickleiq-review-shell" aria-label={`Rally ${reviewIndex + 1} of ${candidates.length}`}>
-          <div className="pickleiq-review-scroll">
+      <div className="pickleiq-page">
+        <Header onHome={onHome} onPastClips={onPastClips} onTesting={onTesting} />
+        <main className="pickleiq-processing-main" aria-labelledby="pickleiq-review-title">
+          <div className="pickleiq-processing-header">
+            <button type="button" className="pickleiq-processing-back" onClick={onHome}>&larr; Home</button>
+            <h1 id="pickleiq-review-title">Review Rallies</h1>
+          </div>
+          <div className="pickleiq-processing-divider" />
+          <section className="pickleiq-review-shell" aria-label={`Rally ${reviewIndex + 1} of ${candidates.length}`}>
             <p className="pickleiq-review-count">Rally {reviewIndex + 1} of {candidates.length}</p>
             <div className="pickleiq-review-card">
               <p className="pickleiq-review-time">
@@ -149,31 +162,33 @@ export default function RallyReviewScreen({ videoId, localFile, pass1Result, onC
             <VideoPreview previewUrl={previewUrl} localFile={localFile} previewKind="original-local" playerRef={playerRef} />
             <RallyTimeline sections={timelineSections} fps={fps} durationSeconds={pass1Result?.durationSeconds}
               onSeek={seekTo} emptyLabel="No rallies detected" />
-          </div>
-          {/* Pinned below the scrollable video/timeline area (not inside it)
-              so Keep/Skip stay reachable no matter how tall that content is —
-              see .pickleiq-review-shell. */}
-          <div className="pickleiq-review-actions">
-            <button type="button" className="pickleiq-secondary-button" onClick={() => decide(false)}>
-              Skip
-            </button>
-            <PrimaryButton onClick={() => decide(true)}>Keep</PrimaryButton>
-          </div>
-          {reviewIndex > 0 && (
-            <button type="button" className="pickleiq-review-back" onClick={goBack}>← back</button>
-          )}
-        </section>
-      </main>
+            <div className="pickleiq-review-actions">
+              <button type="button" className="pickleiq-secondary-button" onClick={() => decide(false)}>
+                Skip
+              </button>
+              <PrimaryButton onClick={() => decide(true)}>Keep</PrimaryButton>
+            </div>
+            {reviewIndex > 0 && (
+              <button type="button" className="pickleiq-review-back" onClick={goBack}>← back</button>
+            )}
+          </section>
+        </main>
+        <Footer left="REVIEWING" right="SELECT RALLIES" />
+      </div>
     )
   }
 
   // stage === 'draw'
   return (
-    <main className="pickleiq-page pickleiq-processing-page" aria-labelledby="pickleiq-review-title">
-      <HomeLink onHome={onHome} />
-      <h1 id="pickleiq-review-title">Add a Missed Rally?</h1>
-      <section className="pickleiq-review-shell" aria-label="Mark a missed rally">
-        <div className="pickleiq-review-scroll">
+    <div className="pickleiq-page">
+      <Header onHome={onHome} onPastClips={onPastClips} onTesting={onTesting} />
+      <main className="pickleiq-processing-main" aria-labelledby="pickleiq-review-title">
+        <div className="pickleiq-processing-header">
+          <button type="button" className="pickleiq-processing-back" onClick={onHome}>&larr; Home</button>
+          <h1 id="pickleiq-review-title">Add a Missed Rally?</h1>
+        </div>
+        <div className="pickleiq-processing-divider" />
+        <section className="pickleiq-review-shell" aria-label="Mark a missed rally">
           <p className="pickleiq-review-summary">{keptIds.length} kept so far.</p>
           <VideoPreview previewUrl={previewUrl} localFile={localFile} previewKind="original-local" playerRef={playerRef} />
           <div className="pickleiq-review-draw-actions">
@@ -193,13 +208,13 @@ export default function RallyReviewScreen({ videoId, localFile, pass1Result, onC
               <button type="button" className="pickleiq-secondary-button" onClick={() => removeDrawn(i)}>Remove</button>
             </div>
           ))}
-        </div>
-        {/* Pinned below the scrollable area — see .pickleiq-review-shell. */}
-        {drawError && <p className="pickleiq-error" style={{ position: 'static' }}>{drawError}</p>}
-        <PrimaryButton className="pickleiq-start-button-inline" onClick={submit} disabled={totalSelected === 0}>
-          Start Pass 2
-        </PrimaryButton>
-      </section>
-    </main>
+          {drawError && <p className="pickleiq-error">{drawError}</p>}
+          <PrimaryButton onClick={submit} disabled={totalSelected === 0}>
+            Start Pass 2
+          </PrimaryButton>
+        </section>
+      </main>
+      <Footer left="REVIEWING" right="ADD MISSED RALLY" />
+    </div>
   )
 }

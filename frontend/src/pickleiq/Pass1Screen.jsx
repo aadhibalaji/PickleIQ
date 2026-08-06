@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
-import HomeLink from './components/HomeLink.jsx'
+import Header from './components/Header.jsx'
+import Footer from './components/Footer.jsx'
 import ProcessingError from './components/ProcessingError.jsx'
 import ProcessingProgress from './components/ProcessingProgress.jsx'
 import RallyTimeline from './components/RallyTimeline.jsx'
@@ -15,7 +16,7 @@ const INITIAL_STATE = {
 // Hands off to RallyReviewScreen once done — Pass 2 is never auto-queued
 // here (see submitRallySelections in processingAdapter.js): the user decides
 // what to keep first.
-export default function Pass1Screen({ videoId, localFile, onComplete, onHome }) {
+export default function Pass1Screen({ videoId, localFile, onComplete, onHome, onPastClips, onTesting }) {
   const headingRef = useRef(null)
   const playerRef = useRef(null)
   const [retrying, setRetrying] = useState(false)
@@ -53,29 +54,37 @@ export default function Pass1Screen({ videoId, localFile, onComplete, onHome }) 
   const zeroRallies = processing.status === 'done' && processing.retainedRallies.length === 0
 
   return (
-    <main className="pickleiq-page pickleiq-processing-page" aria-labelledby="pickleiq-pass1-title">
-      <HomeLink onHome={onHome} />
-      <h1 ref={headingRef} tabIndex="-1" id="pickleiq-pass1-title">Clipping Video...</h1>
-      {error ? (
-        <ProcessingError message={error} onRetry={retry} onHome={onHome} retrying={retrying} />
-      ) : zeroRallies ? (
-        <ProcessingError title="No rallies were found"
-          message="Pass 1 completed, but no rally sections were retained for further analysis."
-          onRetry={retry} onHome={onHome} retrying={retrying} />
-      ) : (
-        <section className="pickleiq-processing-content" aria-label="Pass 1 clipping progress">
-          <ProcessingProgress label="Pass 1" progress={processing.progress} message={processing.message} />
-          <VideoPreview previewUrl={processing.previewUrl} localFile={localFile}
-            previewKind={processing.previewKind} playerRef={playerRef} />
-          <RallyTimeline
-            sections={processing.retainedRallies.map((rally) => ({
-              id: rally.id, startFrame: rally.start_frame,
-              endFrame: rally.end_frame, decision: 'kept',
-            }))}
-            fps={processing.fps} durationSeconds={processing.durationSeconds}
-            onSeek={seek} emptyLabel="Scanning for rallies…" />
-        </section>
-      )}
-    </main>
+    <div className="pickleiq-page">
+      <Header onHome={onHome} onPastClips={onPastClips} onTesting={onTesting} />
+      <main className="pickleiq-processing-main" aria-labelledby="pickleiq-pass1-title">
+        <div className="pickleiq-processing-header">
+          <button type="button" className="pickleiq-processing-back" onClick={onHome}>&larr; Home</button>
+          <h1 ref={headingRef} tabIndex="-1" id="pickleiq-pass1-title">Clipping Video...</h1>
+        </div>
+        <div className="pickleiq-processing-divider" />
+        {error ? (
+          <ProcessingError message={error} onRetry={retry} onHome={onHome} retrying={retrying} />
+        ) : zeroRallies ? (
+          <ProcessingError title="No rallies were found"
+            message="Pass 1 completed, but no rally sections were retained for further analysis."
+            onRetry={retry} onHome={onHome} retrying={retrying} />
+        ) : (
+          <section aria-label="Pass 1 clipping progress">
+            <ProcessingProgress label="Pass 1 of 3 · detecting rallies" progress={processing.progress}
+              message={processing.message} />
+            <VideoPreview previewUrl={processing.previewUrl} localFile={localFile}
+              previewKind={processing.previewKind} playerRef={playerRef} />
+            <RallyTimeline
+              sections={processing.retainedRallies.map((rally) => ({
+                id: rally.id, startFrame: rally.start_frame,
+                endFrame: rally.end_frame, decision: 'kept',
+              }))}
+              fps={processing.fps} durationSeconds={processing.durationSeconds}
+              onSeek={seek} emptyLabel="Scanning for rallies…" />
+          </section>
+        )}
+      </main>
+      <Footer left="PROCESSING" right="PASS 1 OF 3" />
+    </div>
   )
 }

@@ -16,15 +16,20 @@ export default function VideoUploadControl({ file, onChange, onError, disabled =
           else onError?.('Choose a supported video file (MP4, MOV, WebM, AVI, or MKV).')
           event.target.value = ''
         }} />
-      <label className="pickleiq-upload-control" htmlFor={inputId} aria-label="Choose a video file"
-        aria-disabled={disabled || undefined}>
-        <svg aria-hidden="true" viewBox="0 0 24 24" fill="none">
-          <path d="M12 16V4m0 0L7.5 8.5M12 4l4.5 4.5M5 14v4.5A1.5 1.5 0 006.5 20h11a1.5 1.5 0 001.5-1.5V14" />
-        </svg>
+      <label className="pickleiq-upload-control" htmlFor={inputId} aria-disabled={disabled || undefined}>
+        <span className="pickleiq-upload-icon" aria-hidden="true">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+            strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M12 3v12" /><path d="M7 8l5-5 5 5" /><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2" />
+          </svg>
+        </span>
+        <span className="pickleiq-upload-title" title={file?.name}>
+          {file ? file.name : 'Drop your rally video'}
+        </span>
+        <span className="pickleiq-upload-subtitle">
+          {file ? 'Selected — click to choose a different file' : 'or click to choose a file'}
+        </span>
       </label>
-      <p className={`pickleiq-file-name${file ? ' has-file' : ''}`} aria-live="polite" title={file?.name}>
-        {file?.name || 'Choose video'}
-      </p>
     </div>
   )
 }

@@ -16,6 +16,12 @@ const btnStyle = (active) => ({
   fontWeight: active ? 'bold' : 'normal', textDecoration: active ? 'underline' : 'none',
 })
 
+// The consumer redesign folds its own "Testing" tab into PickleIQApp's
+// header (see Header.jsx) instead of the floating corner bar below — this
+// is that same button's exact style, exported so both call sites render an
+// identical, unstyled-by-the-redesign tab.
+export const TESTING_TAB_STYLE = btnStyle(false)
+
 export default function AppRoot() {
   const [mode, setMode] = useState(isTestingRoute ? 'testing' : 'consumer')
 
@@ -25,12 +31,16 @@ export default function AppRoot() {
   // torn down and reset on every switch.
   return (
     <>
-      <div style={barStyle}>
-        <button style={btnStyle(mode === 'consumer')} onClick={() => setMode('consumer')}>PickleIQ</button>
-        <button style={btnStyle(mode === 'testing')} onClick={() => setMode('testing')}>Testing</button>
-      </div>
+      {/* Only needed as a way back to PickleIQ while inside Testing — the
+          consumer flow's own header carries the Testing tab now. */}
+      {mode === 'testing' && (
+        <div style={barStyle}>
+          <button style={btnStyle(false)} onClick={() => setMode('consumer')}>PickleIQ</button>
+          <button style={btnStyle(true)} onClick={() => setMode('testing')}>Testing</button>
+        </div>
+      )}
       <div style={{ display: mode === 'consumer' ? 'block' : 'none' }}>
-        <PickleIQApp />
+        <PickleIQApp onSwitchToTesting={() => setMode('testing')} />
       </div>
       <div style={{ display: mode === 'testing' ? 'block' : 'none' }}>
         <App />

@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
+import Header from './components/Header.jsx'
 import PrimaryButton from './components/PrimaryButton.jsx'
 import SegmentedControl from './components/SegmentedControl.jsx'
 import VideoUploadControl from './components/VideoUploadControl.jsx'
@@ -20,7 +21,7 @@ const ANALYSIS_OPTIONS = [
   { value: 'form', label: 'Form' },
 ]
 
-export default function PickleIQApp() {
+export default function PickleIQApp({ onSwitchToTesting }) {
   const [stage, setStage] = useState('upload')
   const [video, setVideo] = useState(null)
   const [videoRecord, setVideoRecord] = useState(null)
@@ -148,66 +149,73 @@ export default function PickleIQApp() {
 
   if (stage === 'pass1') {
     return <Pass1Screen videoId={videoRecord.id} localFile={video}
-      onComplete={finishPass1} onHome={returnHome} />
+      onComplete={finishPass1} onHome={returnHome} onPastClips={openHistory} onTesting={onSwitchToTesting} />
   }
 
   if (stage === 'review') {
     return <RallyReviewScreen videoId={videoRecord.id} localFile={video} pass1Result={pass1Output}
-      onComplete={finishReview} onHome={returnHome} />
+      onComplete={finishReview} onHome={returnHome} onPastClips={openHistory} onTesting={onSwitchToTesting} />
   }
 
   if (stage === 'pass2') {
     return <Pass2Screen videoId={videoRecord.id} localFile={video} pass1Result={pass1Output}
-      onComplete={finishPass2} onHome={returnHome} />
+      onComplete={finishPass2} onHome={returnHome} onPastClips={openHistory} onTesting={onSwitchToTesting} />
   }
 
   if (stage === 'analysis') {
     return <AnalysisScreen videoId={videoRecord.id} localFile={video}
       pass2Result={pass2Output}
       finalVideoUrl={pass2Output?.finalVideoUrl || pass2Output?.previewUrl || null}
-      onComplete={finishAnalysis} onHome={returnHome} />
+      onComplete={finishAnalysis} onHome={returnHome} onPastClips={openHistory} onTesting={onSwitchToTesting} />
   }
 
   if (stage === 'results') {
     return <ResultsScreen analysisResult={analysisOutput} pass2Result={pass2Output}
-      localFile={video} onHome={returnHome} />
+      localFile={video} onHome={returnHome} onPastClips={openHistory} onTesting={onSwitchToTesting} />
   }
 
   if (stage === 'past-clips') {
-    return <PastClipsList onSelect={selectPastClip} onHome={returnHome} selectError={historyError} />
+    return <PastClipsList onSelect={selectPastClip} onHome={returnHome} selectError={historyError}
+      onTesting={onSwitchToTesting} />
   }
 
   if (stage === 'history-results') {
     // ResultsScreen's button reads "Back to Home" — send it to the actual
     // home screen, not back into the list, so the label stays honest.
     return <ResultsScreen analysisResult={historyResult?.analysisResult} pass2Result={historyResult?.pass2Result}
-      localFile={null} onHome={returnHome} />
+      localFile={null} onHome={returnHome} onPastClips={openHistory} onTesting={onSwitchToTesting} />
   }
 
   return (
-    <main className="pickleiq-page" aria-labelledby="pickleiq-title">
-      <SelfStopToggle />
-      <button type="button" className="pickleiq-secondary-button pickleiq-history-link" onClick={openHistory}>
-        Past Clips
-      </button>
-      <h1 className="pickleiq-wordmark" id="pickleiq-title">PickleIQ</h1>
-      <section className="pickleiq-control-stack" aria-label="Analysis setup">
+    <div className="pickleiq-page">
+      <Header active="home" onHome={returnHome} onPastClips={openHistory} onTesting={onSwitchToTesting} />
+      <main className="pickleiq-home-main" aria-labelledby="pickleiq-title">
+        <SelfStopToggle />
+        <p className="pickleiq-eyebrow">MATCH ANALYSIS</p>
+        <h1 className="pickleiq-hero-wordmark" id="pickleiq-title">
+          <span className="pickleiq-brand-pickle">PICKLE</span><span className="pickleiq-brand-iq">IQ</span>
+        </h1>
+        <div className="pickleiq-hero-divider" aria-hidden="true"><span /></div>
         <VideoUploadControl file={video} disabled={uploading}
           onChange={(nextVideo) => { setVideo(nextVideo); setError('') }} onError={setError} />
-        <SegmentedControl label="Game type" options={GAME_OPTIONS} value={gameType}
-          onChange={setGameType} disabled={uploading} />
-        <SegmentedControl label="Analysis type" options={ANALYSIS_OPTIONS} value={analysisType}
-          onChange={setAnalysisType} tone={analysisType} disabled={uploading} />
-      </section>
-      {error && <p className="pickleiq-error" role="alert">{error}</p>}
-      <PrimaryButton className="pickleiq-start-button" disabled={!video || uploading} onClick={startAnalysis}
-        aria-busy={uploading}
-        aria-describedby={!video ? 'pickleiq-start-help' : undefined}>
-        {uploading ? 'Uploading…' : 'Start Analysis'}
-      </PrimaryButton>
-      <p id="pickleiq-start-help" className="pickleiq-visually-hidden">
-        Choose a video before starting analysis.
-      </p>
-    </main>
+        <div className="pickleiq-hero-toggles">
+          <SegmentedControl label="Game type" options={GAME_OPTIONS} value={gameType}
+            onChange={setGameType} tone="matchtype" disabled={uploading} />
+          <SegmentedControl label="Analysis type" options={ANALYSIS_OPTIONS} value={analysisType}
+            onChange={setAnalysisType} tone={analysisType} disabled={uploading} />
+        </div>
+        {error && <p className="pickleiq-error" role="alert">{error}</p>}
+        <div className="pickleiq-hero-actions">
+          <button type="button" className="pickleiq-secondary-button" onClick={openHistory}>Past Clips</button>
+          <PrimaryButton disabled={!video || uploading} onClick={startAnalysis} aria-busy={uploading}
+            aria-describedby={!video ? 'pickleiq-start-help' : undefined}>
+            {uploading ? 'Uploading…' : 'Start Analysis'}
+          </PrimaryButton>
+        </div>
+        <p id="pickleiq-start-help" className="pickleiq-visually-hidden">
+          Choose a video before starting analysis.
+        </p>
+      </main>
+    </div>
   )
 }
