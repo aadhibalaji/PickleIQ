@@ -243,17 +243,33 @@ function timestampLabel(seconds) {
 
 export function normalizeAnalysisResult(report, finalVideoUrl = null) {
   const safeReport = report && typeof report === 'object' ? report : {}
+  // {player_label: jpeg_b64} -> {player_label: "data:image/jpeg;base64,..."}
+  // once here, so every consumer just drops it straight into an <img src>.
+  const playerPhotos = Object.fromEntries(
+    Object.entries(safeReport.player_photos || {})
+      .filter(([, b64]) => typeof b64 === 'string' && b64)
+      .map(([label, b64]) => [label, `data:image/jpeg;base64,${b64}`]))
+
   const generalEntries = safeArray(safeReport.general_feedback).length
     ? safeArray(safeReport.general_feedback)
     : safeArray(safeReport.player_themes).map((entry) => ({ ...entry, theme: entry?.theme || '' }))
-  const generalFeedback = generalEntries.filter((entry) => entry && typeof entry === 'object').map((entry, index) => ({
-    id: `general-${entry.player_id ?? index}`,
-    playerId: entry.player_id ?? null,
-    playerLabel: entry.player_label || `Player ${index + 1}`,
-    praise: entry.praise || '',
-    improve: entry.improve || '',
-    theme: entry.theme || '',
-  }))
+  const generalFeedback = generalEntries.filter((entry) => entry && typeof entry === 'object').map((entry, index) => {
+    const playerLabel = entry.player_label || `Player ${index + 1}`
+    // Legacy shape (older cached reports, pre-Key-Takeaways): {praise,
+    // improve} instead of {summary, takeaways} — degrade rather than show
+    // nothing, same fallback the backend applies on its own legacy rows.
+    const takeaways = safeArray(entry.takeaways).length
+      ? safeArray(entry.takeaways).filter(Boolean)
+      : [entry.praise, entry.improve].filter(Boolean)
+    return {
+      id: `general-${entry.player_id ?? index}`,
+      playerId: entry.player_id ?? null,
+      playerLabel,
+      photo: playerPhotos[playerLabel] || null,
+      summary: entry.summary || entry.theme || '',
+      takeaways,
+    }
+  })
   const tipIdCounts = new Map()
   const timestampFeedback = safeArray(safeReport.tips)
     .filter((tip) => tip && typeof tip === 'object' && tip.timestamp_s !== null
@@ -264,6 +280,7 @@ export function normalizeAnalysisResult(report, finalVideoUrl = null) {
       const baseId = String(tip.contact_id || `tip-${index}`)
       const occurrence = tipIdCounts.get(baseId) || 0
       tipIdCounts.set(baseId, occurrence + 1)
+      const playerLabel = tip.player_label || null
       return {
         id: occurrence ? `${baseId}-${occurrence + 1}` : baseId,
         timestampSeconds: sourceTimestampSeconds,
@@ -276,7 +293,8 @@ export function normalizeAnalysisResult(report, finalVideoUrl = null) {
         category: tip.category || null,
         tone: tip.tone || null,
         playerId: tip.player_id ?? null,
-        playerLabel: tip.player_label || null,
+        playerLabel,
+        playerPhoto: playerLabel ? playerPhotos[playerLabel] || null : null,
       }
     })
     .sort((a, b) => a.sourceTimestampSeconds - b.sourceTimestampSeconds)
@@ -288,6 +306,7 @@ export function normalizeAnalysisResult(report, finalVideoUrl = null) {
     finalVideoTimeline: null,
     generalFeedback,
     timestampFeedback,
+    playerPhotos,
     resultId: safeReport.video_id || null,
     focus: safeReport.focus || null,
     players: safeArray(safeReport.players),
@@ -305,6 +324,83 @@ export async function generatePlayerAnalysis(videoId, finalVideoUrl, signal) {
     const cached = await api.getCoachingReport(videoId, { signal }).catch(() => null)
     if (cached?.report) return normalizeAnalysisResult(cached.report, finalVideoUrl)
     throw generationError
+  }
+}
+
+// ------------------------------------------------------------------
+// Home page "Past Clips" — browse every video this user has ever uploaded
+// and jump straight to its cached feedback, without replaying the
+// upload/Pass1/review/Pass2/analysis pipeline for a video that's already
+// done. Three states per clip: 'ready' (has a coaching report — jump to
+// results), 'needs-review' (Pass 1 finished but nobody ever submitted rally
+// selections for it — e.g. the tab was closed/refreshed mid-review, so
+// Pass 2 never got queued and never will on its own; jump back into
+// RallyReviewScreen), 'processing' (still waiting on Pass 1/2/contacts,
+// nothing to resume into yet). Each video costs a couple of extra requests
+// (report, and for non-ready ones, jobs + selections) since none of that
+// rides along with /videos; fine at the scale of one user's own history.
+export async function listPastClips() {
+  const videos = await api.listVideos().catch(() => [])
+  const withStatus = await Promise.all(safeArray(videos).map(async (v) => {
+    const base = { id: v.id, filename: v.filename || v.id, uploadedAt: Number(v.uploaded_at) || 0 }
+    const reportResp = await api.getCoachingReport(v.id).catch(() => null)
+    if (reportResp?.report) {
+      return { ...base, status: 'ready', ready: true, statusLabel: 'Feedback ready' }
+    }
+    const [videoDetail, selectionsResp] = await Promise.all([
+      api.getVideo(v.id).catch(() => null),
+      api.listSelections(v.id).catch(() => null),
+    ])
+    const pass1Job = (videoDetail?.jobs || []).find((job) => job.kind === 'pass1')
+    const hasSelections = safeArray(selectionsResp?.selections).length > 0
+    const needsReview = pass1Job?.status === 'done' && !hasSelections
+    return needsReview
+      ? { ...base, status: 'needs-review', ready: true, statusLabel: 'Needs review' }
+      : { ...base, status: 'processing', ready: false, statusLabel: 'Still processing' }
+  }))
+  return withStatus.sort((a, b) => b.uploadedAt - a.uploadedAt)
+}
+
+// Reconstructs a RallyReviewScreen-ready pass1Result for a clip whose Pass 1
+// finished but was never reviewed (see listPastClips' 'needs-review'
+// status) — same shape Pass1Screen hands off on live completion, plus a
+// previewUrl (api.streamUrl) since there's no local File object to fall
+// back on. That previewUrl rides along through pass1Result into
+// Pass2Screen/AnalysisScreen too (they already read pass1Result.previewUrl
+// the same way Pass1Screen does), so video playback keeps working for the
+// rest of the pipeline without any further wiring. Returns null if Pass 1
+// somehow isn't actually done/has no rallies after all (caller should
+// treat that as "nothing to resume").
+export async function resumeReviewState(videoId) {
+  const pass1State = await getPass1ProcessingState(videoId)
+  if (pass1State.status !== 'done' || !pass1State.retainedRallies.length) return null
+  return { ...pass1State, previewUrl: api.streamUrl(videoId) }
+}
+
+// Reconstructs a ResultsScreen-ready {analysisResult, pass2Result} pair for
+// a PAST clip directly from its id — no local File object, no live
+// upload/pass1/pass2 session needed. Video playback uses api.streamUrl
+// (works for any video regardless of session) rather than previewUrl/
+// localFile, which only exist during the tab that did the actual upload.
+// Returns null if this clip has no report yet (caller should keep it
+// non-clickable in the list rather than calling this at all, but this is
+// the authoritative check).
+export async function loadClipResults(videoId) {
+  const reportResp = await api.getCoachingReport(videoId).catch(() => null)
+  if (!reportResp?.report) return null
+  const streamUrl = api.streamUrl(videoId)
+  const pass2State = await getPass2ProcessingState(videoId, null).catch(() => null)
+  return {
+    // finalVideoTimeline: 'source' — ResultsScreen only treats tip
+    // timestamps as directly seekable when displayedTimeline matches each
+    // entry's own 'source' tag (see resolveFeedbackSeekSeconds); that match
+    // normally comes from playing straight off localFile with no server
+    // URL at all (displaysOriginalTimeline). streamUrl serves the exact
+    // same untrimmed original video, so it's on that same timeline too —
+    // without this, timestamp-feedback clicks would silently seek nowhere.
+    analysisResult: { ...normalizeAnalysisResult(reportResp.report, streamUrl), finalVideoTimeline: 'source' },
+    pass2Result: { ...(pass2State || { keptSections: [], rejectedSections: [], fps: 30 }),
+      previewUrl: streamUrl, previewKind: 'stream' },
   }
 }
 

@@ -60,6 +60,42 @@ echo "    instance at $IP"
 echo "==> restarting EC2 worker container"
 scp -i "$SSH_KEY" -o StrictHostKeyChecking=accept-new \
   scripts/restart-ec2.sh "$SSH_USER@$IP:/tmp/restart-ec2.sh"
+
+# Installs restart-ec2.sh to a permanent path (survives the ephemeral NVMe
+# wipe a stop/start does to /opt/dlami/nvme — /opt/picklecv lives on the
+# persistent root volume instead) plus a systemd unit that runs it on every
+# boot. Without this, self-stop followed by a Lambda-triggered start leaves
+# picklecv-worker permanently missing until someone manually re-runs this
+# script over SSH — see restart-ec2.sh's _ensure_docker_data_root comment
+# for the full story. Idempotent and safe to re-run every deploy; also
+# self-heals a brand-new/replaced instance with no separate setup step.
+ssh -i "$SSH_KEY" "$SSH_USER@$IP" '
+  sudo mkdir -p /opt/picklecv
+  sudo cp /tmp/restart-ec2.sh /opt/picklecv/restart-ec2.sh
+  sudo chmod +x /opt/picklecv/restart-ec2.sh
+  if [ ! -f /etc/systemd/system/picklecv-worker.service ]; then
+    cat <<EOF | sudo tee /etc/systemd/system/picklecv-worker.service > /dev/null
+[Unit]
+Description=PickleCV worker container bootstrap (recreates picklecv-worker on every boot)
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/picklecv/restart-ec2.sh
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    sudo systemctl daemon-reload
+    sudo systemctl enable picklecv-worker.service
+  fi
+'
 ssh -i "$SSH_KEY" "$SSH_USER@$IP" "bash /tmp/restart-ec2.sh"
 
 WORKER_ID="$(ssh -i "$SSH_KEY" "$SSH_USER@$IP" "docker inspect picklecv-worker --format '{{.Image}}'")"

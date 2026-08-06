@@ -57,6 +57,26 @@ assert.deepEqual(report.generalFeedback, [])
 assert.equal(resolveFeedbackSeekSeconds(report.timestampFeedback[0], 'source'), 12.4)
 assert.equal(resolveFeedbackSeekSeconds(report.timestampFeedback[0], 'trimmed'), null)
 
+// Key Takeaways (summary + takeaways) is the current shape; a legacy
+// {praise, improve} report (pre-dating this feature) degrades to a 2-item
+// takeaways list instead of showing nothing. Player photos attach by
+// player_label to both general feedback entries and matching timestamp tips.
+const withTakeaways = normalizeAnalysisResult({
+  general_feedback: [
+    { player_id: 1, player_label: 'Player 1', summary: 'Strong session overall.',
+      takeaways: ['Great footwork', 'Watch paddle prep', ''] },
+    { player_id: 2, player_label: 'Player 2', praise: 'Solid net play', improve: 'Move your feet' },
+  ],
+  player_photos: { 'Player 1': 'AAAA', 'Player 2': 'BBBB' },
+  tips: [{ contact_id: 't1', timestamp_s: 5, tip: 'Nice recovery', player_label: 'Player 1' }],
+})
+assert.deepEqual(withTakeaways.generalFeedback[0].takeaways, ['Great footwork', 'Watch paddle prep'])
+assert.equal(withTakeaways.generalFeedback[0].summary, 'Strong session overall.')
+assert.equal(withTakeaways.generalFeedback[0].photo, 'data:image/jpeg;base64,AAAA')
+assert.deepEqual(withTakeaways.generalFeedback[1].takeaways, ['Solid net play', 'Move your feet'])
+assert.equal(withTakeaways.generalFeedback[1].summary, '')
+assert.equal(withTakeaways.timestampFeedback[0].playerPhoto, 'data:image/jpeg;base64,AAAA')
+
 const failedAnalysis = normalizeAnalysisPreparationState({
   jobs: [{ kind: 'contacts', status: 'unexpected' }],
 })

@@ -195,6 +195,66 @@ def extract_for_candidates(video_path: str, candidates: list[dict], video_id: st
         cap.release()
 
 
+# Tighter than CROP_MARGIN (1.6, used for swing-context crops that need
+# court context) — an identity photo just needs to clearly show the person,
+# not their surroundings.
+IDENTITY_CROP_MARGIN = 0.5
+
+
+def _best_box_per_player(entries: list[dict]) -> dict[int, tuple[float, int, tuple]]:
+    """{player_id: (area, frame, box)} — each player's LARGEST box across
+    `entries` (closest to camera / most face-on), not their first sighting,
+    which is often small, far, or mid-stride."""
+    best: dict[int, tuple[float, int, tuple]] = {}
+    for e in entries:
+        for p in e.get("players", []):
+            pid, box = p.get("id"), p.get("box")
+            if pid is None or not box:
+                continue
+            x0, y0, x1, y1 = box
+            area = max(0.0, x1 - x0) * max(0.0, y1 - y0)
+            if pid not in best or area > best[pid][0]:
+                best[pid] = (area, e["f"], tuple(box))
+    return best
+
+
+def extract_identity_photos(video_path: str, video_id: str, overlay_source: str,
+                             frame_count: int) -> dict[int, str] | None:
+    """{player_id: jpeg_b64} — one representative photo per player who
+    appears in the overlays, so the coaching UI can show "this is who Player
+    1 is" instead of an unlabeled seat number (see _best_box_per_player for
+    the selection rule). Computed fresh per report generation — a couple of
+    frames, cheap next to extract_for_candidates' per-tip extraction — never
+    persisted as its own artifact; the coaching report row is the cache.
+    Degrades to None on any failure, same contract as extract_for_candidates."""
+    entries = overlays.read_range(video_id, overlay_source, 0, max(0, frame_count))
+    best = _best_box_per_player(entries)
+    if not best:
+        return None
+
+    cap = cv2.VideoCapture(video_path)
+    try:
+        if not cap.isOpened():
+            log.warning("identity photos: cannot open video %s — proceeding without them",
+                        video_path)
+            return None
+        frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        out: dict[int, str] = {}
+        for pid, (_, frame_idx, box) in sorted(best.items(), key=lambda kv: kv[1][1]):
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            x0, y0, x1, y1 = _crop_rect(box, frame_w, frame_h, margin=IDENTITY_CROP_MARGIN)
+            b64 = _encode_jpeg_b64(frame[y0:y1, x0:x1])
+            if b64 is not None:
+                out[pid] = b64
+        return out or None
+    finally:
+        cap.release()
+
+
 if __name__ == "__main__":
     # ponytail self-check: crop rect clamps to the frame, never inverts, and
     # expands around the box center; nearest-box respects the tolerance.
@@ -221,4 +281,17 @@ if __name__ == "__main__":
                                        "player_id": 1, "kind": "span"}, entries, fps=30.0)
     assert [j[2] for j in span_jobs] == ["before", "moment", "after"]
     assert span_jobs[1][3] is None and span_jobs[1][4] == (1, 2, 3, 4)
+
+    # _best_box_per_player: picks the LARGEST box per player, not the first
+    # or last sighting; ignores entries with no id/box.
+    identity_entries = [
+        {"f": 10, "players": [{"id": 1, "box": [0, 0, 50, 50]}]},   # area 2500
+        {"f": 20, "players": [{"id": 1, "box": [0, 0, 100, 100]}]},  # area 10000 -> wins
+        {"f": 30, "players": [{"id": 1, "box": [0, 0, 60, 60]}]},
+        {"f": 15, "players": [{"id": 2, "box": None}, {"id": None, "box": [0, 0, 999, 999]}]},
+    ]
+    best = _best_box_per_player(identity_entries)
+    assert set(best) == {1}
+    assert best[1] == (10000.0, 20, (0, 0, 100, 100))
+    assert _best_box_per_player([]) == {}
     print("keyframes self-check OK")

@@ -7,8 +7,9 @@ import RallyReviewScreen from './RallyReviewScreen.jsx'
 import Pass2Screen from './Pass2Screen.jsx'
 import AnalysisScreen from './AnalysisScreen.jsx'
 import ResultsScreen from './ResultsScreen.jsx'
+import PastClipsList from './PastClipsList.jsx'
 import SelfStopToggle from './components/SelfStopToggle.jsx'
-import { startPickleIQAnalysis } from './processingAdapter.js'
+import { loadClipResults, resumeReviewState, startPickleIQAnalysis } from './processingAdapter.js'
 
 const GAME_OPTIONS = [
   { value: 'singles', label: 'Singles' },
@@ -29,6 +30,8 @@ export default function PickleIQApp() {
   const [pass1Output, setPass1Output] = useState(null)
   const [pass2Output, setPass2Output] = useState(null)
   const [analysisOutput, setAnalysisOutput] = useState(null)
+  const [historyResult, setHistoryResult] = useState(null)
+  const [historyError, setHistoryError] = useState('')
   const [error, setError] = useState('')
   const sessionRef = useRef(0)
   const uploadControllerRef = useRef(null)
@@ -71,10 +74,49 @@ export default function PickleIQApp() {
     setPass1Output(null)
     setPass2Output(null)
     setAnalysisOutput(null)
+    setHistoryResult(null)
+    setHistoryError('')
     setGameType('singles')
     setAnalysisType('positioning')
     setUploading(false)
     setError('')
+  }
+
+  const openHistory = () => setStage('past-clips')
+
+  const selectPastClip = async (videoId, status) => {
+    setHistoryError('')
+    try {
+      if (status === 'needs-review') {
+        // Pass 1 already finished for this clip but nobody ever submitted
+        // rally selections for it (interrupted tab, refresh, etc.) — jump
+        // straight back into the same 'review' stage a live upload uses,
+        // reusing its whole downstream chain (review -> pass2 -> analysis
+        // -> results) unchanged. No local File object exists for a resumed
+        // clip; resumeReviewState seeds a streamed previewUrl instead,
+        // which RallyReviewScreen/Pass2Screen/AnalysisScreen already know
+        // how to fall back to.
+        const resumed = await resumeReviewState(videoId)
+        if (!resumed) {
+          setHistoryError('That clip has no detected rallies to review.')
+          return
+        }
+        setVideoRecord({ id: videoId })
+        setVideo(null)
+        setPass1Output(resumed)
+        setStage('review')
+        return
+      }
+      const result = await loadClipResults(videoId)
+      if (!result) {
+        setHistoryError('That clip has not finished generating feedback yet.')
+        return
+      }
+      setHistoryResult(result)
+      setStage('history-results')
+    } catch (loadError) {
+      setHistoryError(loadError.message || 'Could not load that clip.')
+    }
   }
 
   const finishPass1 = useCallback((output) => {
@@ -131,9 +173,23 @@ export default function PickleIQApp() {
       localFile={video} onHome={returnHome} />
   }
 
+  if (stage === 'past-clips') {
+    return <PastClipsList onSelect={selectPastClip} onHome={returnHome} selectError={historyError} />
+  }
+
+  if (stage === 'history-results') {
+    // ResultsScreen's button reads "Back to Home" — send it to the actual
+    // home screen, not back into the list, so the label stays honest.
+    return <ResultsScreen analysisResult={historyResult?.analysisResult} pass2Result={historyResult?.pass2Result}
+      localFile={null} onHome={returnHome} />
+  }
+
   return (
     <main className="pickleiq-page" aria-labelledby="pickleiq-title">
       <SelfStopToggle />
+      <button type="button" className="pickleiq-secondary-button pickleiq-history-link" onClick={openHistory}>
+        Past Clips
+      </button>
       <h1 className="pickleiq-wordmark" id="pickleiq-title">PickleIQ</h1>
       <section className="pickleiq-control-stack" aria-label="Analysis setup">
         <VideoUploadControl file={video} disabled={uploading}
