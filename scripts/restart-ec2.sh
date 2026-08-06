@@ -82,6 +82,27 @@ aws ecr get-login-password --region "$REGION" \
 echo "==> removing any existing $CONTAINER_NAME"
 sudo docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
+# Every deploy pushes a new :latest, which orphans the previous image as a
+# dangling layer set on the ROOT volume — docker's data-root points at the
+# NVMe, but containerd's own content store (/var/lib/containerd) does not
+# follow that setting, so those orphans accumulate on / until a pull dies
+# with "no space left on device" and this whole script fails, leaving the
+# box with NO worker container at all (observed: 14 dangling images, / at
+# 100%, worker down and every queued video silently unprocessed). Pruning
+# after the rm above (so the just-removed container isn't holding a
+# reference) and before the pull below (so the pull has room) keeps that
+# from ever building up again.
+echo "==> pruning dangling images (frees root-volume space before the pull)"
+sudo docker image prune -f 2>&1 | tail -2
+
+# Same story for downloaded video scratch copies: cleanup_scratch only runs
+# when a pass1->pass2->contacts chain finishes, so anything interrupted
+# leaves its (large) copy behind forever. Safe to drop here — no container
+# is running at this point, and storage_s3.download_to_scratch re-fetches
+# from S3 on demand.
+echo "==> clearing leftover scratch videos"
+sudo rm -f "$DATA_DIR"/scratch/*.mp4 2>/dev/null || true
+
 echo "==> pulling $IMAGE"
 sudo docker pull "$IMAGE"
 

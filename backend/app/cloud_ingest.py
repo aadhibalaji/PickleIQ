@@ -28,11 +28,12 @@ request/kill-request handlers below:
      *externally observable* — SQS's own ApproximateAgeOfOldestMessage
      metric tells you "there's unconsumed work" independent of whether this
      process is even alive, which nothing in the scan-only design could.
-  2. Bucket scan (backstop, always runs): the original list_objects_v2 diff
-     against the local DB, in _tick(). Once SQS is configured this exists
-     purely to catch a lost/never-delivered notification (bucket
-     notifications are at-least-once, not guaranteed-instant) — see
-     POLL_INTERVAL_S below for how its cadence changes once SQS is primary.
+  2. Bucket scan (backstop, always runs, unchanged cadence): the original
+     list_objects_v2 diff against the local DB, in _tick(). Once SQS is
+     configured its discovery role is just catching a lost/never-delivered
+     notification (bucket notifications are at-least-once, not
+     guaranteed-instant) — but the same tick also carries the config syncs,
+     so it keeps running at POLL_INTERVAL_S regardless.
 """
 from __future__ import annotations
 
@@ -50,10 +51,15 @@ from .refine.config import override_path
 
 log = logging.getLogger("cloud_ingest")
 
-# How often the backstop bucket scan runs. With SQS configured as the
-# primary path, this only needs to catch a rare lost notification, so it's
-# relaxed way down; without SQS it's still the only path, so it stays tight.
-POLL_INTERVAL_S = 300 if SQS_JOB_QUEUE_URL else 20
+# How often the backstop scan tick runs. Deliberately NOT relaxed when SQS
+# is enabled: this same tick also carries the calibration / refine-config /
+# tracknet / self-stop S3 syncs (see _tick), and those are "flip it and it
+# takes effect" controls — the self-stop toggle especially, which is flipped
+# mid-testing precisely to stop the instance disappearing. Slowing this tick
+# down would silently add minutes of latency to all of them to save a
+# handful of cheap S3 calls per minute. SQS's win is discovery latency and
+# observability, not fewer ticks.
+POLL_INTERVAL_S = 20
 
 _KEY_RE = re.compile(r"^" + re.escape(storage_s3.DEFAULT_USER_ID) + r"/([0-9a-f]{32})\.mp4$")
 _PASS2_REQUEST_RE = re.compile(r"^jobs/([0-9a-f]{32})/pass2_request\.json$")
