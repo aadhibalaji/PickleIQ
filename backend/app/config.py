@@ -128,5 +128,21 @@ JOB_TIMEOUT_DEFAULT_S = int(os.getenv("JOB_TIMEOUT_DEFAULT_S", str(3 * 3600)))
 SELF_STOP_ENABLED_DEFAULT = os.getenv("SELF_STOP_ENABLED_DEFAULT", "1").strip().lower() not in (
     "0", "false", "no", "")
 
+# After Pass 1 finishes, keep the instance up this long so the user can pick
+# rallies and trigger Pass 2 without paying the ~4 min cold-start. Applies
+# when self-stop is deciding whether an "empty queue" is safe to stop on.
+SELF_STOP_PASS1_GRACE_S = int(os.getenv("SELF_STOP_PASS1_GRACE_S", str(10 * 60)))
+
+# After Pass 2 finishes, keep the instance up this long so the user can
+# actually review clips and click "Generate coaching report" — that request
+# is a plain synchronous API call, never a queued job, so nothing else in
+# should_auto_stop's job-queue view knows to wait for it. Without this, the
+# instance stops the instant the queue empties post-Pass-2, before the user
+# ever gets a window to click the button. Only applies with the toggle ON
+# (OFF is a real kill switch — see self_stop.py). Longer than the Pass 1
+# grace: this gap includes actually watching/reviewing the clip, not just
+# picking rallies.
+SELF_STOP_COACHING_GRACE_S = int(os.getenv("SELF_STOP_COACHING_GRACE_S", str(20 * 60)))
+
 for _d in (DATA_DIR, VIDEO_DIR):
     _d.mkdir(parents=True, exist_ok=True)
