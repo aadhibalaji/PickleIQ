@@ -24,6 +24,15 @@ DB_PATH = DATA_DIR / "app.db"
 STORAGE_BACKEND = os.getenv("STORAGE_BACKEND", "local")
 S3_VIDEO_BUCKET = os.getenv("S3_VIDEO_BUCKET", "")
 
+# Optional: SQS queue that S3 pushes ObjectCreated events to (video uploads,
+# jobs/*/pass2_request.json, jobs/*/kill_request.json — see cloud_ingest.py).
+# When set, the worker long-polls this queue as its PRIMARY discovery path
+# instead of relying solely on a fixed-interval bucket scan — see
+# cloud_ingest.py's module docstring for why the scan-only design needed
+# this. Left unset, behavior is unchanged (scan-only, same as before this
+# was added) — this is additive, not a required migration.
+SQS_JOB_QUEUE_URL = os.getenv("SQS_JOB_QUEUE_URL", "")
+
 # Whether THIS container is allowed to run Pass 1/2 itself. Default True —
 # unchanged behavior for plain local dev and for the EC2 worker (which must
 # still process what it downloads). Set RUN_PROCESSING=0 on a UI-only

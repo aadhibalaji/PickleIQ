@@ -23,7 +23,7 @@ import logging
 import os
 from pathlib import Path
 
-from .config import DATA_DIR, S3_VIDEO_BUCKET
+from .config import DATA_DIR, S3_VIDEO_BUCKET, SQS_JOB_QUEUE_URL
 
 log = logging.getLogger("storage_s3")
 
@@ -37,6 +37,61 @@ def _client():
     profile = os.environ.get("AWS_PROFILE_OVERRIDE")
     session = boto3.Session(profile_name=profile) if profile else boto3.Session()
     return session.client("s3", region_name=_REGION)
+
+
+def _sqs_client():
+    import os
+    import boto3
+    profile = os.environ.get("AWS_PROFILE_OVERRIDE")
+    session = boto3.Session(profile_name=profile) if profile else boto3.Session()
+    return session.client("sqs", region_name=_REGION)
+
+
+def receive_job_events(wait_seconds: int = 20, max_messages: int = 10) -> list[dict]:
+    """Long-polls SQS_JOB_QUEUE_URL for S3 ObjectCreated notifications (video
+    uploads, pass2_request.json, kill_request.json — see the bucket
+    notification config), returning [{'receipt_handle': ..., 'keys': [...]}].
+    Each S3 event notification message can bundle multiple Records, hence
+    'keys' being a list. Empty list on an empty queue (normal — long-poll
+    just timed out) or if SQS_JOB_QUEUE_URL isn't configured (caller should
+    treat that as "SQS path disabled, rely on the bucket-scan backstop
+    instead" — see cloud_ingest.py)."""
+    if not SQS_JOB_QUEUE_URL:
+        return []
+    try:
+        resp = _sqs_client().receive_message(
+            QueueUrl=SQS_JOB_QUEUE_URL,
+            MaxNumberOfMessages=max_messages,
+            WaitTimeSeconds=wait_seconds,
+        )
+    except Exception as exc:
+        log.error("SQS receive_message failed: queue=%s (%s)", SQS_JOB_QUEUE_URL, exc)
+        raise RuntimeError(f"SQS receive failed for {SQS_JOB_QUEUE_URL!r}: {exc}") from exc
+    out = []
+    for msg in resp.get("Messages", []):
+        try:
+            body = json.loads(msg["Body"])
+            keys = [rec["s3"]["object"]["key"] for rec in body.get("Records", [])]
+        except Exception:
+            log.exception("SQS message body wasn't a parseable S3 event notification (skipping): %s",
+                          msg.get("Body"))
+            keys = []
+        out.append({"receipt_handle": msg["ReceiptHandle"], "keys": keys})
+    return out
+
+
+def delete_job_event(receipt_handle: str) -> None:
+    """Acks a message pulled via receive_job_events — call only once its
+    keys have been fully handled. Left un-called (message just becomes
+    visible again after the queue's visibility timeout) on any processing
+    failure, which is the self-healing redelivery this whole path exists
+    for — don't wrap call sites in a blanket try/except that acks anyway."""
+    if not SQS_JOB_QUEUE_URL:
+        return
+    try:
+        _sqs_client().delete_message(QueueUrl=SQS_JOB_QUEUE_URL, ReceiptHandle=receipt_handle)
+    except Exception:
+        log.exception("SQS delete_message failed (message will be redelivered — non-fatal)")
 
 
 def _require_bucket() -> None:

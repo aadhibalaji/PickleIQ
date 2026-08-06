@@ -36,6 +36,12 @@ PORT="8420"
 DATA_DIR="${PICKLECV_DATA_DIR:-/opt/picklecv/data}"
 BUCKET="${S3_VIDEO_BUCKET:-picklecv-videos-dev}"
 REGION="${AWS_REGION:-us-east-2}"
+# Empty = SQS fast path off, worker falls back to bucket-scan-only (see
+# cloud_ingest.py) — same "additive, not required" default as config.py.
+# Fill in the real queue URL here once, after creating it (see
+# scripts/README or the SQS setup commands) — same hardcode-it-here
+# convention as BUCKET above and deploy.sh's INSTANCE_ID.
+SQS_JOB_QUEUE_URL="${SQS_JOB_QUEUE_URL:-https://sqs.us-east-2.amazonaws.com/051404302327/picklecv-job-events}"
 
 sudo mkdir -p "$DATA_DIR"
 
@@ -87,6 +93,7 @@ sudo docker run -d --restart unless-stopped --gpus all -p "$PORT:8420" \
   -e CV_DEVICE=cuda \
   -e PASS2_BALL=1 \
   -e TRACKNET_ENABLED=1 \
+  ${SQS_JOB_QUEUE_URL:+-e SQS_JOB_QUEUE_URL="$SQS_JOB_QUEUE_URL"} \
   -v "$DATA_DIR:/app/data" \
   --name "$CONTAINER_NAME" \
   "$IMAGE"
