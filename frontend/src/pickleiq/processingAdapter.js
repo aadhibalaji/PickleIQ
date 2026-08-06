@@ -329,16 +329,17 @@ export async function generatePlayerAnalysis(videoId, finalVideoUrl, signal) {
 
 // ------------------------------------------------------------------
 // Home page "Past Clips" — browse every video this user has ever uploaded
-// and jump straight to its cached feedback, without replaying the
-// upload/Pass1/review/Pass2/analysis pipeline for a video that's already
-// done. Three states per clip: 'ready' (has a coaching report — jump to
-// results), 'needs-review' (Pass 1 finished but nobody ever submitted rally
-// selections for it — e.g. the tab was closed/refreshed mid-review, so
-// Pass 2 never got queued and never will on its own; jump back into
-// RallyReviewScreen), 'processing' (still waiting on Pass 1/2/contacts,
-// nothing to resume into yet). Each video costs a couple of extra requests
-// (report, and for non-ready ones, jobs + selections) since none of that
-// rides along with /videos; fine at the scale of one user's own history.
+// and jump straight back into it, without losing your place if you clicked
+// off mid-pipeline. Four states per clip: 'ready' (has a coaching report —
+// jump to results), 'needs-review' (Pass 1 finished but nobody ever
+// submitted rally selections for it — e.g. the tab was closed/refreshed
+// mid-review, so Pass 2 never got queued and never will on its own; jump
+// back into RallyReviewScreen), 'processing' (still mid-pipeline — clicking
+// it resumes the exact screen it's currently on; resumeStage says which:
+// 'pass1' | 'pass2' | 'analysis', see selectPastClip). Each video costs a
+// couple of extra requests (report, and for non-ready ones, jobs +
+// selections) since none of that rides along with /videos; fine at the
+// scale of one user's own history.
 export async function listPastClips() {
   const videos = await api.listVideos().catch(() => [])
   const withStatus = await Promise.all(safeArray(videos).map(async (v) => {
@@ -351,12 +352,23 @@ export async function listPastClips() {
       api.getVideo(v.id).catch(() => null),
       api.listSelections(v.id).catch(() => null),
     ])
-    const pass1Job = (videoDetail?.jobs || []).find((job) => job.kind === 'pass1')
+    const jobs = videoDetail?.jobs || []
+    const pass1Job = jobs.find((job) => job.kind === 'pass1')
     const hasSelections = safeArray(selectionsResp?.selections).length > 0
     const needsReview = pass1Job?.status === 'done' && !hasSelections
-    return needsReview
-      ? { ...base, status: 'needs-review', ready: true, statusLabel: 'Needs review' }
-      : { ...base, status: 'processing', ready: false, statusLabel: 'Still processing' }
+    if (needsReview) {
+      return { ...base, status: 'needs-review', ready: true, statusLabel: 'Needs review' }
+    }
+    // Pipeline stage this clip is currently sitting at, so re-clicking it
+    // lands on the same screen it was on rather than a dead "still
+    // processing" row — light heuristic from jobs already fetched above
+    // (no extra requests); selectPastClip double-checks Pass 2's actual
+    // classification state before committing to 'analysis', since job
+    // status alone can't see whether classification really finished.
+    const pass2Job = jobs.find((job) => job.kind === 'pass2')
+    const resumeStage = pass1Job?.status !== 'done' ? 'pass1'
+      : pass2Job?.status !== 'done' ? 'pass2' : 'analysis'
+    return { ...base, status: 'processing', ready: true, resumeStage, statusLabel: 'Still processing' }
   }))
   return withStatus.sort((a, b) => b.uploadedAt - a.uploadedAt)
 }
@@ -475,10 +487,16 @@ export function remainingAnalysisSeconds(totalSeconds, elapsedSeconds) {
   return Math.max(totalSeconds - elapsedSeconds, ANALYSIS_FLOOR_S)
 }
 
+// Seeking exactly to a flagged instant drops the viewer into the middle of
+// the moment with no lead-up. Back the SEEK target off by this much (never
+// the displayed label — that still names the actual instant) so there's a
+// beat to see the moment develop before it happens.
+const SEEK_BUFFER_S = 1.0
+
 export function resolveFeedbackSeekSeconds(entry, displayedTimeline) {
   if (!entry || !displayedTimeline || entry.timeline !== displayedTimeline) return null
   const seconds = displayedTimeline === 'trimmed'
     ? entry.displayTimestampSeconds
     : entry.sourceTimestampSeconds
-  return Number.isFinite(seconds) && seconds >= 0 ? seconds : null
+  return Number.isFinite(seconds) && seconds >= 0 ? Math.max(0, seconds - SEEK_BUFFER_S) : null
 }

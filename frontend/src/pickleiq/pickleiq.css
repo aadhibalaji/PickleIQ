@@ -545,6 +545,7 @@ button.pickleiq-timeline-span.is-rejected:hover { box-shadow: inset 0 0 0 1px va
 .pickleiq-clip-status::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
 .pickleiq-clip-status.is-ready { color: var(--pickleiq-green); }
 .pickleiq-clip-status.is-needs-review { color: var(--pickleiq-blue-light); }
+.pickleiq-clip-status.is-processing { color: var(--pickleiq-yellow); }
 .pickleiq-history-back { margin-top: 12px; }
 
 /* ---------- Results ---------- */
@@ -618,6 +619,19 @@ button.pickleiq-timeline-span.is-rejected:hover { box-shadow: inset 0 0 0 1px va
 .pickleiq-timestamp-list button.is-selected { border-color: var(--pickleiq-blue); background: rgba(47, 127, 214, 0.16); }
 .pickleiq-timestamp-list button:focus-visible { outline: 2px solid var(--pickleiq-blue-light); outline-offset: 3px; }
 .pickleiq-timestamp-list button:disabled { border-style: dashed; color: var(--pickleiq-dim); cursor: not-allowed; text-decoration: line-through; }
+/* Multi-player sessions: which player a flagged moment belongs to,
+   inline before the timestamp (from rohan-8-4-upgrades' coaching update). */
+.pickleiq-timestamp-player {
+  font: 700 10px/1 "JetBrains Mono", monospace;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--pickleiq-blue-light);
+}
+.pickleiq-selected-player {
+  margin-right: 8px;
+  color: var(--pickleiq-blue-light);
+  font-weight: 800;
+}
 .pickleiq-selected-feedback {
   margin-top: 16px;
   padding: 18px 20px;

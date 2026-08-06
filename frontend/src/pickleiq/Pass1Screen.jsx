@@ -5,6 +5,7 @@ import ProcessingError from './components/ProcessingError.jsx'
 import ProcessingProgress from './components/ProcessingProgress.jsx'
 import RallyTimeline from './components/RallyTimeline.jsx'
 import VideoPreview from './components/VideoPreview.jsx'
+import { api } from '../api.js'
 import { getPass1ProcessingState, retryPass1Processing } from './processingAdapter.js'
 import useProcessingPolling from './useProcessingPolling.js'
 
@@ -72,8 +73,12 @@ export default function Pass1Screen({ videoId, localFile, onComplete, onHome, on
           <section aria-label="Pass 1 clipping progress">
             <ProcessingProgress label="Pass 1 of 3 · detecting rallies" progress={processing.progress}
               message={processing.message} />
-            <VideoPreview previewUrl={processing.previewUrl} localFile={localFile}
-              previewKind={processing.previewKind} playerRef={playerRef} />
+            {/* normalizePass1ProcessingState always reports previewUrl:null
+                (the live-upload path relies on localFile's blob instead) —
+                only fall back to streaming from the server when there's no
+                localFile to show, i.e. a resumed Past Clips session. */}
+            <VideoPreview previewUrl={processing.previewUrl || (!localFile ? api.streamUrl(videoId) : null)}
+              localFile={localFile} previewKind={processing.previewKind} playerRef={playerRef} />
             <RallyTimeline
               sections={processing.retainedRallies.map((rally) => ({
                 id: rally.id, startFrame: rally.start_frame,

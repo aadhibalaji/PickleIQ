@@ -103,6 +103,12 @@ class ShotFeatureVector:
     # by definition, typical for that player and invisible to per-player
     # fences. Also the only metrics the LLM may coach as correct-form claims.
     reference_flagged_metrics: list = field(default_factory=list)
+    # {metric_field_name: deviation_or_None} for EVERY metric this shot was
+    # scored on, not just the one whose |deviation| picked the category —
+    # the diagnostic detail category/deviation_score alone throw away.
+    # Feeds coaching.debug_timeline (the per-metric-over-time chart); no
+    # selection/LLM logic reads this, only display/eval tooling.
+    all_metric_devs: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -140,6 +146,49 @@ class PositioningFeatureVector:
     # judged against absolute court geometry) — present only so the two
     # vector types stay field-compatible through _shot_summary.
     reference_flagged_metrics: list = field(default_factory=list)
+    # {metric_field_name: deviation_or_None} for EVERY metric this shot was
+    # scored on, not just the one whose |deviation| picked the category —
+    # the diagnostic detail category/deviation_score alone throw away.
+    # Feeds coaching.debug_timeline (the per-metric-over-time chart); no
+    # selection/LLM logic reads this, only display/eval tooling.
+    all_metric_devs: dict = field(default_factory=dict)
+
+
+@dataclass
+class FrameSpikeVector:
+    """One per detected SPIKE — a run of consecutive frames whose combined
+    per-metric deviation from an ABSOLUTE per-frame target (see
+    frame_metrics.py) crossed the flag threshold. This is the frame-by-frame
+    counterpart of ShotFeatureVector/PositioningFeatureVector and is
+    field-compatible with both through _shot_summary — coaching.py's
+    selection/salience/LLM pipeline treats a spike exactly like any other
+    scored moment (rendered downstream as a "span" pseudo-contact, same
+    mechanism positioning.py's span moments already use).
+
+    deviation_score is the SIGNED deviation of the spike's dominant metric
+    at its peak frame (the metric that decided the category) — not the
+    unsigned peak_sum, which callers can recover from all_metric_devs the
+    same way debug_timeline's metric_sum does for every other vector type.
+    There is no personal-baseline mode for a frame stream, so
+    reference_flagged_metrics/no_comparison_metrics/mixed_baseline_metrics
+    are always empty — every deviation here is already against an absolute
+    target by construction."""
+    contact_id: str
+    category: str
+    deviation_score: float
+    duration_s: float
+    low_confidence_metrics: list = field(default_factory=list)
+    no_comparison_metrics: list = field(default_factory=list)
+    shot_type: str | None = None
+    mixed_baseline_metrics: list = field(default_factory=list)
+    deviating_metrics: list = field(default_factory=list)
+    soft_deviation: float | None = None
+    reference_flagged_metrics: list = field(default_factory=list)
+    all_metric_devs: dict = field(default_factory=dict)
+    # Raw metric values at the spike's peak frame — all_metric_devs alone
+    # (deviations) can't reconstruct what the reading actually was; debug
+    # tooling and the LLM's feature_vector both need both.
+    all_metric_values: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -171,17 +220,16 @@ class PlayerTheme:
 
 @dataclass
 class GeneralFeedback:
-    """One per player per report: a one-sentence session summary plus 3-4
-    distinct takeaway bullets (mix of what's working and what to fix),
-    grounded in deterministic per-player metric aggregates
-    (coaching._general_context) and written by the same single LLM call as
-    the tips. Replaces PlayerTheme on new reports. Attribution rules match
-    PlayerTheme: player_id/player_label come from our own contact data, the
-    model's echoed label is only a join key."""
+    """One per player per report: exactly one positive and one negative piece
+    of session-wide feedback, grounded in deterministic per-player metric
+    aggregates (coaching._frame_general_context) and written by the same
+    single LLM call as the tips. Replaces PlayerTheme on new reports.
+    Attribution rules match PlayerTheme: player_id/player_label come from
+    our own contact data, the model's echoed label is only a join key."""
     player_id: int
     player_label: str
-    summary: str = ""             # one sentence: the session in a nutshell
-    takeaways: list = field(default_factory=list)  # list[str], 3-4 short bullets
+    praise: str = ""   # what's working — the strongest positive session pattern
+    improve: str = ""  # the one thing to fix — the strongest negative pattern
 
 
 @dataclass
@@ -197,9 +245,9 @@ class CoachingReport:
     # Which metric family this report evaluated — 'form' | 'positioning'.
     # None on reports generated before selectable focus existed (= form).
     focus: str | None = None
-    # list[GeneralFeedback] — per-player summary+takeaways. Empty on legacy
-    # reports (which carry player_themes instead) and on reports whose LLM
-    # call degraded.
+    # list[GeneralFeedback] — per-player praise+improve pairs. Empty on
+    # legacy reports (which carry player_themes instead) and on reports
+    # whose LLM call degraded.
     general: list = field(default_factory=list)
     # {player_label: jpeg_b64} — one representative photo per player (see
     # keyframes.extract_identity_photos), so the UI can show who's who

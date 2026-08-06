@@ -10,7 +10,10 @@ import AnalysisScreen from './AnalysisScreen.jsx'
 import ResultsScreen from './ResultsScreen.jsx'
 import PastClipsList from './PastClipsList.jsx'
 import SelfStopToggle from './components/SelfStopToggle.jsx'
-import { loadClipResults, resumeReviewState, startPickleIQAnalysis } from './processingAdapter.js'
+import { api } from '../api.js'
+import {
+  getPass2ProcessingState, loadClipResults, resumeReviewState, startPickleIQAnalysis,
+} from './processingAdapter.js'
 
 const GAME_OPTIONS = [
   { value: 'singles', label: 'Singles' },
@@ -85,7 +88,7 @@ export default function PickleIQApp({ onSwitchToTesting }) {
 
   const openHistory = () => setStage('past-clips')
 
-  const selectPastClip = async (videoId, status) => {
+  const selectPastClip = async (videoId, status, resumeStage) => {
     setHistoryError('')
     try {
       if (status === 'needs-review') {
@@ -106,6 +109,41 @@ export default function PickleIQApp({ onSwitchToTesting }) {
         setVideo(null)
         setPass1Output(resumed)
         setStage('review')
+        return
+      }
+      if (status === 'processing') {
+        // Clicked off mid-pipeline earlier (Home/Past Clips) — the backend
+        // job kept running regardless (see HomeLink's comment), so jump
+        // back to whichever screen it's actually on now instead of a dead
+        // end. resumeStage is listPastClips' light heuristic from job
+        // status alone; Pass 2's completion needs a real check here (below)
+        // since "job done" and "classification actually finished" aren't
+        // the same thing, and getting that wrong would strand the user on
+        // AnalysisScreen with no rallies to analyze.
+        setVideoRecord({ id: videoId })
+        setVideo(null)
+        // Clear any state left over from a different clip's abandoned
+        // session (e.g. clicked "Past Clips" mid-flow instead of "Home") —
+        // stale pass1Output/pass2Output would otherwise silently leak into
+        // this clip's flow, most dangerously via finishAnalysis, which
+        // reads pass2Output.keptSections for the FINAL results record.
+        setPass1Output(null)
+        setPass2Output(null)
+        setAnalysisOutput(null)
+        if (resumeStage === 'pass1') {
+          setStage('pass1')
+          return
+        }
+        setPass1Output({ previewUrl: api.streamUrl(videoId) })
+        const pass2State = await getPass2ProcessingState(videoId, null)
+        const pass2Ready = pass2State.status === 'done' && pass2State.classificationComplete
+          && pass2State.keptSections.length > 0
+        if (resumeStage === 'pass2' || !pass2Ready) {
+          setStage('pass2')
+          return
+        }
+        setPass2Output({ ...pass2State, previewUrl: api.streamUrl(videoId), previewKind: 'original-local' })
+        setStage('analysis')
         return
       }
       const result = await loadClipResults(videoId)
