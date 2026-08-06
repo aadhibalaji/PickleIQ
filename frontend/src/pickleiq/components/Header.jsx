@@ -1,5 +1,6 @@
 import React from 'react'
 import { TESTING_TAB_STYLE } from '../../AppRoot.jsx'
+import GlassFilterDefs from './GlassFilterDefs.jsx'
 
 // Persistent nav shown on every PickleIQ consumer screen (mirrors the design
 // reference, where this header sits above all four mocked screens
@@ -13,6 +14,7 @@ import { TESTING_TAB_STYLE } from '../../AppRoot.jsx'
 export default function Header({ active, onHome, onPastClips, onTesting }) {
   return (
     <header className="pickleiq-header">
+      <GlassFilterDefs />
       <button type="button" className="pickleiq-brand" onClick={onHome}>
         <span className="pickleiq-brand-pickle">PICKLE</span><span className="pickleiq-brand-iq">IQ</span>
       </button>
