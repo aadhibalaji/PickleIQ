@@ -486,7 +486,12 @@ button.pickleiq-timeline-span.is-rejected:hover {
 .pickleiq-results-left {
   min-height: 0;
   display: flex;
-  align-items: center;
+  /* flex-start, not center: a centered flex item that overflows its
+     container clips at the START edge even with overflow:auto (the browser
+     computes a negative start-offset that scrolling can never reach) — the
+     "general feedback clipped at the top" bug. flex-start keeps the whole
+     column reachable by scrolling down instead. */
+  align-items: flex-start;
   overflow: auto;
 }
 .pickleiq-general-feedback {
@@ -539,6 +544,10 @@ button.pickleiq-timeline-span.is-rejected:hover {
 }
 .pickleiq-timestamp-list button {
   min-width: 58px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
   padding: 6px 13px;
   border: 1px solid rgba(244, 239, 228, 0.62);
   border-radius: 999px;
@@ -566,6 +575,18 @@ button.pickleiq-timeline-span.is-rejected:hover {
   background: transparent;
   color: var(--pickleiq-muted);
   text-decoration: line-through;
+}
+.pickleiq-timestamp-player {
+  font: 600 10px/1.1 sans-serif;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  opacity: 0.72;
+}
+.pickleiq-selected-player {
+  margin-right: 8px;
+  color: var(--pickleiq-cream);
+  font-weight: 700;
+  letter-spacing: 0.04em;
 }
 .pickleiq-selected-feedback {
   margin-top: 13px;

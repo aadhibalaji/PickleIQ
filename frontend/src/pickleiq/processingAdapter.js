@@ -354,10 +354,16 @@ export function remainingAnalysisSeconds(totalSeconds, elapsedSeconds) {
   return Math.max(totalSeconds - elapsedSeconds, ANALYSIS_FLOOR_S)
 }
 
+// Seeking exactly to a flagged instant drops the viewer into the middle of
+// the moment with no lead-up. Back the SEEK target off by this much (never
+// the displayed label — that still names the actual instant) so there's a
+// beat to see the moment develop before it happens.
+const SEEK_BUFFER_S = 1.0
+
 export function resolveFeedbackSeekSeconds(entry, displayedTimeline) {
   if (!entry || !displayedTimeline || entry.timeline !== displayedTimeline) return null
   const seconds = displayedTimeline === 'trimmed'
     ? entry.displayTimestampSeconds
     : entry.sourceTimestampSeconds
-  return Number.isFinite(seconds) && seconds >= 0 ? seconds : null
+  return Number.isFinite(seconds) && seconds >= 0 ? Math.max(0, seconds - SEEK_BUFFER_S) : null
 }

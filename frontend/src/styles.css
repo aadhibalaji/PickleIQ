@@ -142,6 +142,26 @@ kbd { background: var(--panel2); border: 1px solid var(--border); border-radius:
 .shot-heatmap svg { background: var(--panel2); border: 1px solid var(--border); border-radius: 6px; }
 .shot-heatmap-legend { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--muted); }
 .shot-heatmap-legend .row { gap: 6px; }
+
+/* Decision breakdown: coaching.debug_timeline diagnostic view */
+.metrics-timeline-chart { display: block; background: var(--panel2); border: 1px solid var(--border); border-radius: 6px; margin-bottom: 4px; }
+.metrics-legend-item { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--muted); }
+.metrics-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; }
+.metrics-selected-detail { margin-top: 10px; padding: 10px; background: var(--panel2); border-radius: 6px; border-left: 3px solid var(--border); font-size: 13px; }
+.metrics-mini-grid { display: flex; flex-wrap: wrap; gap: 14px; }
+.metrics-mini-chart { background: var(--panel2); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; }
+
+.general-breakdown { display: flex; flex-direction: column; gap: 16px; }
+.general-breakdown-player { background: var(--panel2); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; }
+.general-breakdown-row { display: grid; grid-template-columns: 140px 1fr 150px; align-items: center; gap: 8px; margin-top: 6px; font-size: 12px; }
+.general-breakdown-label { text-transform: capitalize; }
+.general-breakdown-track { position: relative; height: 10px; border-radius: 4px; background: var(--panel); }
+.general-breakdown-band { position: absolute; top: 0; bottom: 0; border-radius: 4px; background: rgba(63, 185, 80, 0.18); }
+.general-breakdown-marker {
+  position: absolute; top: -3px; width: 4px; height: 16px; border-radius: 2px;
+  transform: translateX(-2px); box-shadow: 0 0 0 1px var(--panel2);
+}
+.general-breakdown-count { text-align: right; white-space: nowrap; }
 .shot-heatmap-swatch { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
 .shot-heatmap-serve-swatch {
   width: 10px; height: 10px; border-radius: 50%; display: inline-block;

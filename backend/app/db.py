@@ -198,6 +198,36 @@ CREATE TABLE IF NOT EXISTS tip_feedback (
   PRIMARY KEY (video_id, contact_id)
 );
 
+-- Expert ground-truth labels on coaching moments — the calibration baseline
+-- for frame_metrics' spike thresholds. Distinct from tip_feedback above:
+-- that rates TIP COPY (one binary per surfaced tip, so it can never say
+-- whether an UNSURFACED moment was actually bad); this rates the PLAY
+-- itself over a frame span, including moments the detector never flagged.
+--
+-- source='spike'    a detected spike the expert reviewed (spike_id set) —
+--                   yields true/false positives.
+-- source='freeform' a span the expert marked while scrubbing, independent of
+--                   detection — the ONLY way to measure what the detector
+--                   MISSES (false negatives), which is the whole point.
+--
+-- metric is the expert's attribution ('knee_bend_deg', ...) when they can name
+-- one, NULL when the moment is simply bad without a single clean cause.
+CREATE TABLE IF NOT EXISTS coaching_marks (
+  id TEXT PRIMARY KEY,
+  video_id TEXT NOT NULL,
+  rally_id TEXT,                    -- NULL on freeform marks outside a known rally
+  player_id INTEGER NOT NULL,
+  focus TEXT NOT NULL,              -- 'form' | 'positioning'
+  start_frame INTEGER NOT NULL,
+  end_frame INTEGER NOT NULL,
+  verdict TEXT NOT NULL,            -- 'bad' | 'fine' | 'good'
+  metric TEXT,
+  note TEXT,
+  source TEXT NOT NULL,             -- 'spike' | 'freeform'
+  spike_id TEXT,                    -- frame_metrics spike id when source='spike'
+  created_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS model_registry (
   version INTEGER PRIMARY KEY AUTOINCREMENT,
   kind TEXT NOT NULL,               -- 'rally_end' | 'serve_start' | 'tracknet'

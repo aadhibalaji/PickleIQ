@@ -2,6 +2,9 @@ import React, { useEffect, useRef, useState } from 'react'
 import { api } from '../api.js'
 import ShotHeatmap from './ShotHeatmap.jsx'
 import CoachingSetupSelector from './CoachingSetupSelector.jsx'
+import MetricsTimeline from './MetricsTimeline.jsx'
+import CoachingMarkPanel from './CoachingMarkPanel.jsx'
+import GeneralFeedbackBreakdown from './GeneralFeedbackBreakdown.jsx'
 import { buildPlayerColorMap, playerColor, labelToPlayerId } from './playerColors.js'
 
 const ALL_PLAYERS = 'all'
@@ -52,7 +55,7 @@ function assignLanes(blocks) {
   return { laneById, laneCount: laneEnds.length || 1 }
 }
 
-export default function RallyAnalysisPanel({ videoId, video, onUpdateVideo }) {
+export default function RallyAnalysisPanel({ videoId, video, onUpdateVideo, onSeek, frame }) {
   const [report, setReport] = useState(null)
   const [generating, setGenerating] = useState(false)
   const [selectedPlayer, setSelectedPlayer] = useState(ALL_PLAYERS)
@@ -62,6 +65,12 @@ export default function RallyAnalysisPanel({ videoId, video, onUpdateVideo }) {
   // {contact_id: 1 | -1} — per-tip thumbs feedback, persisted server-side so
   // tip-selection changes become a measurable hit-rate across reports.
   const [tipFeedback, setTipFeedback] = useState({})
+  // Decision-breakdown diagnostic (coaching.debug_timeline) — loaded on
+  // demand, not on every visit: it's a calibration/debugging view, not
+  // something a normal report-viewing pass needs.
+  const [debugTimeline, setDebugTimeline] = useState(null)
+  const [debugLoading, setDebugLoading] = useState(false)
+  const [debugError, setDebugError] = useState(false)
 
   useEffect(() => {
     api.getCoachingReport(videoId).then((r) => setReport(r.report)).catch(() => setReport(null))
@@ -72,7 +81,18 @@ export default function RallyAnalysisPanel({ videoId, video, onUpdateVideo }) {
     api.getTipFeedback(videoId).then((r) => setTipFeedback(r.ratings || {})).catch(() => {})
     setSelectedPlayer(ALL_PLAYERS)
     setSelectedTip(null)
+    setDebugTimeline(null)
+    setDebugError(false)
   }, [videoId])
+
+  const onLoadDebugTimeline = () => {
+    setDebugLoading(true)
+    setDebugError(false)
+    api.getCoachingDebug(videoId, video?.coaching_focus)
+      .then(setDebugTimeline)
+      .catch(() => setDebugError(true))
+      .finally(() => setDebugLoading(false))
+  }
 
   const onRateTip = (tip, rating) => {
     // Optimistic update; re-clicking the active rating keeps it (simplest
@@ -243,6 +263,41 @@ export default function RallyAnalysisPanel({ videoId, video, onUpdateVideo }) {
 
       <div className="panel">
         <ShotHeatmap videoId={videoId} />
+      </div>
+
+      <div className="panel">
+        <h2>Ground truth</h2>
+        <CoachingMarkPanel videoId={videoId} video={video} onSeek={onSeek} frame={frame} />
+      </div>
+
+      <div className="panel">
+        <div className="row spread">
+          <h2>Decision breakdown</h2>
+          <button onClick={onLoadDebugTimeline} disabled={debugLoading}>
+            {debugLoading ? 'Loading…' : debugTimeline ? 'Refresh' : 'Load'}
+          </button>
+        </div>
+        <div className="muted" style={{ fontSize: 12, marginBottom: 8 }}>
+          Every tracked frame's combined deviation for this focus, continuously — not just the
+          spikes that made the report — with the flag threshold and whether each spike was sent
+          to the LLM. Computed fresh (no LLM call); serve swing windows are never included.
+        </div>
+        {debugError && <div className="error">Failed to load decision breakdown.</div>}
+        {debugTimeline && (
+          <>
+            <MetricsTimeline debug={selectedPlayer === ALL_PLAYERS ? debugTimeline : {
+              ...debugTimeline,
+              shots: (debugTimeline.shots || []).filter((s) => s.player_label === selectedPlayer),
+              frame_series: Object.fromEntries(
+                Object.entries(debugTimeline.frame_series || {}).filter(([label]) => label === selectedPlayer)),
+            }} />
+            <div className="muted" style={{ fontSize: 12, margin: '20px 0 6px' }}>
+              General-feedback aggregates (what the praise/improve picks are grounded in)
+            </div>
+            <GeneralFeedbackBreakdown generalContext={debugTimeline.general_context}
+                                      targetBands={debugTimeline.target_bands} />
+          </>
+        )}
       </div>
     </div>
   )

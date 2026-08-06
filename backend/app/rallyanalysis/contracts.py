@@ -103,6 +103,12 @@ class ShotFeatureVector:
     # by definition, typical for that player and invisible to per-player
     # fences. Also the only metrics the LLM may coach as correct-form claims.
     reference_flagged_metrics: list = field(default_factory=list)
+    # {metric_field_name: deviation_or_None} for EVERY metric this shot was
+    # scored on, not just the one whose |deviation| picked the category —
+    # the diagnostic detail category/deviation_score alone throw away.
+    # Feeds coaching.debug_timeline (the per-metric-over-time chart); no
+    # selection/LLM logic reads this, only display/eval tooling.
+    all_metric_devs: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -140,6 +146,49 @@ class PositioningFeatureVector:
     # judged against absolute court geometry) — present only so the two
     # vector types stay field-compatible through _shot_summary.
     reference_flagged_metrics: list = field(default_factory=list)
+    # {metric_field_name: deviation_or_None} for EVERY metric this shot was
+    # scored on, not just the one whose |deviation| picked the category —
+    # the diagnostic detail category/deviation_score alone throw away.
+    # Feeds coaching.debug_timeline (the per-metric-over-time chart); no
+    # selection/LLM logic reads this, only display/eval tooling.
+    all_metric_devs: dict = field(default_factory=dict)
+
+
+@dataclass
+class FrameSpikeVector:
+    """One per detected SPIKE — a run of consecutive frames whose combined
+    per-metric deviation from an ABSOLUTE per-frame target (see
+    frame_metrics.py) crossed the flag threshold. This is the frame-by-frame
+    counterpart of ShotFeatureVector/PositioningFeatureVector and is
+    field-compatible with both through _shot_summary — coaching.py's
+    selection/salience/LLM pipeline treats a spike exactly like any other
+    scored moment (rendered downstream as a "span" pseudo-contact, same
+    mechanism positioning.py's span moments already use).
+
+    deviation_score is the SIGNED deviation of the spike's dominant metric
+    at its peak frame (the metric that decided the category) — not the
+    unsigned peak_sum, which callers can recover from all_metric_devs the
+    same way debug_timeline's metric_sum does for every other vector type.
+    There is no personal-baseline mode for a frame stream, so
+    reference_flagged_metrics/no_comparison_metrics/mixed_baseline_metrics
+    are always empty — every deviation here is already against an absolute
+    target by construction."""
+    contact_id: str
+    category: str
+    deviation_score: float
+    duration_s: float
+    low_confidence_metrics: list = field(default_factory=list)
+    no_comparison_metrics: list = field(default_factory=list)
+    shot_type: str | None = None
+    mixed_baseline_metrics: list = field(default_factory=list)
+    deviating_metrics: list = field(default_factory=list)
+    soft_deviation: float | None = None
+    reference_flagged_metrics: list = field(default_factory=list)
+    all_metric_devs: dict = field(default_factory=dict)
+    # Raw metric values at the spike's peak frame — all_metric_devs alone
+    # (deviations) can't reconstruct what the reading actually was; debug
+    # tooling and the LLM's feature_vector both need both.
+    all_metric_values: dict = field(default_factory=dict)
 
 
 @dataclass
