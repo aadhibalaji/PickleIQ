@@ -1079,7 +1079,20 @@ TIPS_SCHEMA = {
                                 "the session for this player in a nutshell. Grounded in "
                                 "general_context/session_context and the shots. Same "
                                 "no-raw-numbers/no-anatomy rules as tips."},
-                    "takeaways": {"type": "array", "minItems": 1, "maxItems": 4,
+                    "takeaways": {"type": "array",
+                                  # minItems/maxItems removed: Anthropic's
+                                  # output_config.format.schema rejects array
+                                  # length bounds outright (400 invalid_
+                                  # request_error, "property 'maxItems' is
+                                  # not supported") -- every coaching call
+                                  # failed on this from 2026-08-06 until this
+                                  # fix, degrading silently to zero tips AND
+                                  # zero general feedback (same failed
+                                  # response feeds both). The "3-4" bound
+                                  # lives in the description text below only
+                                  # now; build_report already drops any
+                                  # general_feedback entry with an empty
+                                  # takeaways list.
                                   "items": {"type": "string"},
                                   "description": "3-4 short, distinct bullet points (fewer only "
                                   "if the data genuinely doesn't support more — never pad with "
