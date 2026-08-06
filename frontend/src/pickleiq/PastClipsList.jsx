@@ -16,6 +16,7 @@ export default function PastClipsList({ onSelect, onHome, selectError, onTesting
   const [error, setError] = useState('')
   const [deletingId, setDeletingId] = useState(null)
   const [deleteError, setDeleteError] = useState('')
+  const [selectingId, setSelectingId] = useState(null)
 
   useEffect(() => {
     let cancelled = false
@@ -29,6 +30,21 @@ export default function PastClipsList({ onSelect, onHome, selectError, onTesting
   // an S3 relay, the EC2 worker — see api/media.py's DELETE /videos/{id})
   // and wipes every trace of the clip: DB rows and S3 data both. Real,
   // irreversible deletion, hence the confirm.
+  // onSelect (selectPastClip in PickleIQApp) resolves after 2-5 network
+  // round-trips (coaching report, pass2 state, sometimes a cloud sync) with
+  // no visual change until it lands on the next screen. Without a pending
+  // state here the click looks dropped, and a second impatient click would
+  // fire selectPastClip again concurrently — this guards both.
+  const selectClip = async (clip) => {
+    if (selectingId) return
+    setSelectingId(clip.id)
+    try {
+      await onSelect(clip.id, clip.status, clip.resumeStage)
+    } finally {
+      setSelectingId(null)
+    }
+  }
+
   const deleteClip = async (clip) => {
     if (!window.confirm(`Delete "${clip.filename}"? This can't be undone.`)) return
     setDeleteError('')
@@ -59,18 +75,19 @@ export default function PastClipsList({ onSelect, onHome, selectError, onTesting
             <ul className="pickleiq-clip-list">
               {clips.map((clip) => (
                 <li key={clip.id} className="pickleiq-clip-row">
-                  <button type="button" className="pickleiq-clip-row-main" disabled={!clip.ready}
-                    onClick={() => onSelect(clip.id, clip.status, clip.resumeStage)}>
+                  <button type="button" className="pickleiq-clip-row-main"
+                    disabled={!clip.ready || selectingId === clip.id}
+                    onClick={() => selectClip(clip)}>
                     <span className="pickleiq-clip-name">{clip.filename}</span>
                     <span className="pickleiq-clip-meta">
                       {formatDate(clip.uploadedAt)}
                       <span className={`pickleiq-clip-status${clip.ready ? ` is-${clip.status}` : ''}`}>
-                        {clip.statusLabel}
+                        {selectingId === clip.id ? 'Loading…' : clip.statusLabel}
                       </span>
                     </span>
                   </button>
                   <button type="button" className="pickleiq-clip-delete"
-                    disabled={deletingId === clip.id} aria-label={`Delete ${clip.filename}`}
+                    disabled={deletingId === clip.id || selectingId === clip.id} aria-label={`Delete ${clip.filename}`}
                     onClick={() => deleteClip(clip)}>
                     {deletingId === clip.id ? 'Deleting…' : 'Delete'}
                   </button>
