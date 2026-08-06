@@ -182,7 +182,153 @@ def _sync_self_stop() -> None:
     log.info("cloud ingest: synced self-stop toggle from S3: enabled=%s", enabled)
 
 
+def _ensure_selection_rows(video_id: str, selections: list[dict]) -> list[dict]:
+    """Upserts coaching_selections (+ user_drawn rally_labels) from an S3
+    Pass 2 work request onto this worker's local DB — the UI container that
+    created them has a separate DB, so without this the worker would have
+    nothing to process."""
+    out = []
+    with db.connect() as con:
+        for s in selections:
+            sid = s["id"]
+            existing = con.execute(
+                "SELECT id FROM coaching_selections WHERE id=?", (sid,)).fetchone()
+            if not existing:
+                con.execute(
+                    "INSERT INTO coaching_selections (id, video_id, start_frame, end_frame, source,"
+                    " status, rally_label_id, overlay_source, error_message, created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (sid, video_id, s["start_frame"], s["end_frame"], s.get("source") or "pass1_accepted",
+                     "pending", s.get("rally_label_id"), s.get("overlay_source"), None, db.now()))
+            if s.get("source") == "user_drawn" and not s.get("rally_label_id"):
+                rid = db.new_id()
+                con.execute(
+                    "INSERT INTO rally_labels (id, video_id, source, start_frame, end_frame, meta)"
+                    " VALUES (?,?,?,?,?,?)",
+                    (rid, video_id, "pass1", s["start_frame"], s["end_frame"],
+                     db.dumps({"user_drawn": True})))
+                con.execute("UPDATE coaching_selections SET rally_label_id=? WHERE id=?",
+                            (rid, sid))
+                s = {**s, "rally_label_id": rid}
+            row = con.execute("SELECT * FROM coaching_selections WHERE id=?", (sid,)).fetchone()
+            if row:
+                out.append(dict(row))
+    return out
+
+
+def _ingest_pass2_request(video_id: str, req: dict) -> None:
+    """Enqueues the matching Pass 2 job locally, then claims the S3 request
+    (overwrite marker — this role often lacks s3:DeleteObject). Claim-after-
+    enqueue means a crash between the two can double-submit once; JobRunner
+    supersedes same (video_id, kind), so that's safe."""
+    if req.get("claimed"):
+        return
+    mode = req.get("mode") or "selections"
+    from .learning import params as learned_params
+    from .jobs import runner
+    _version, params = learned_params.get_latest()
+    params = pipeline._with_hw_overrides(params)
+
+    if mode == "selections":
+        sels = _ensure_selection_rows(video_id, req.get("selections") or [])
+        if not sels:
+            log.warning("cloud ingest: pass2 request for %s had no selections", video_id)
+            storage_s3.claim_pass2_request(video_id)
+            return
+        job_id = runner.submit(
+            video_id, "pass2",
+            pipeline._build_do_pass2_selections(video_id, params, sels))
+        storage_s3.claim_pass2_request(video_id)
+        log.info("cloud ingest: Pass 2 selections queued for %s job=%s (%d ranges)",
+                 video_id, job_id, len(sels))
+        return
+
+    if mode == "single_range":
+        sel = req.get("selection") or {}
+        sels = _ensure_selection_rows(video_id, [sel])
+        if not sels:
+            log.warning("cloud ingest: pass2 single_range request for %s missing selection", video_id)
+            storage_s3.claim_pass2_request(video_id)
+            return
+        s = sels[0]
+        overlay_source = sel.get("overlay_source") or f"pass2_range_{s['id']}"
+        job_id = runner.submit(
+            video_id, f"pass2_range_{s['id']}",
+            pipeline._build_do_pass2_range(video_id, params, s["id"],
+                                            s["start_frame"], s["end_frame"], overlay_source))
+        storage_s3.claim_pass2_request(video_id)
+        log.info("cloud ingest: Pass 2 single_range queued for %s job=%s", video_id, job_id)
+        return
+
+    if mode == "full_pass2":
+        job_id = runner.submit(video_id, "pass2", pipeline._build_do_pass2(video_id, params))
+        storage_s3.claim_pass2_request(video_id)
+        log.info("cloud ingest: full Pass 2 queued for %s job=%s", video_id, job_id)
+        return
+
+    log.warning("cloud ingest: unknown pass2 request mode %r for %s", mode, video_id)
+    storage_s3.claim_pass2_request(video_id)
+
+
+def _tick_pass2_requests() -> None:
+    try:
+        video_ids = storage_s3.list_pass2_request_video_ids()
+    except Exception:
+        log.exception("cloud ingest: pass2-request S3 list failed (non-fatal, retrying next tick)")
+        return
+    known = _known_video_ids()
+    for video_id in video_ids:
+        if video_id not in known:
+            # Pass 1 may still be mid-ingest this tick; retry next cycle.
+            log.info("cloud ingest: pass2 request for unknown video %s — waiting until ingested",
+                     video_id)
+            continue
+        try:
+            req = storage_s3.download_pass2_request(video_id)
+            if req is None:
+                continue
+            _ingest_pass2_request(video_id, req)
+        except Exception:
+            log.exception("cloud ingest: failed to ingest pass2 request for %s "
+                          "(non-fatal, retrying next tick)", video_id)
+
+
+def _tick_kill_requests() -> None:
+    """Handles api/media.py's DELETE /videos/{id} for a video that's actively
+    processing on THIS worker — that endpoint's own JobRunner.cancel_video
+    can only stop a job its own container started, so it relays a kill
+    request here instead of reaching into this process directly. This is
+    the only piece that can actually stop the computation (deleting S3
+    files doesn't touch an already-downloaded local scratch copy a job is
+    mid-read on — see storage_s3.download_to_scratch); the UI container
+    deliberately leaves the video/results S3 objects alone until this runs,
+    so cancel always happens before delete, never racing it.
+
+    Checked before _tick_pass2_requests in _tick() — no point starting new
+    work for a video that's about to be killed."""
+    from .jobs import runner  # local import: same reasoning as _ingest_pass2_request's
+    try:
+        video_ids = storage_s3.list_kill_request_video_ids()
+    except Exception:
+        log.exception("cloud ingest: kill-request S3 list failed (non-fatal, retrying next tick)")
+        return
+    for video_id in video_ids:
+        try:
+            cancelled = runner.cancel_video(video_id)
+            with db.connect() as con:
+                db.delete_video_rows(video_id, con=con)
+            storage_s3.delete_video_data(video_id)
+            storage_s3.cleanup_scratch(video_id)
+            storage_s3.delete_kill_request(video_id)
+            log.info("cloud ingest: killed %s (%d local job(s) cancelled), S3 data removed",
+                     video_id, cancelled)
+        except Exception:
+            log.exception("cloud ingest: failed to process kill request for %s "
+                          "(non-fatal, retrying next tick)", video_id)
+
+
 def _tick() -> None:
+    _tick_kill_requests()
     _sync_calibration()
     _sync_tracknet_weights()
     _sync_refine_config()

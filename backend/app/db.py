@@ -330,6 +330,42 @@ def init_db() -> None:
             con.executescript(SCHEMA)
 
 
+# Every table that keys off video_id via a NOT NULL column — no FK cascade
+# is declared (see SCHEMA above), so a video delete has to clear each of
+# these explicitly. Single source of truth for that list: it used to live
+# inline in api/media.py's delete_video and drifted out of sync with the
+# schema twice (coaching_selections, coaching_marks both went live without
+# ever being added here) — a video "deleted" from the UI kept orphaned rows
+# in both until this got centralized. cloud_ingest.py's kill-request handler
+# (the EC2-worker-side half of a delete) uses this same list for the same
+# reason: one place decides what "belongs to a video," not two lists that
+# can silently disagree. Tables with only a nullable/contextual video_id
+# (pending_changes, calibrations' clip-local rows) are deliberately excluded
+# — those rows don't exclusively belong to one video the way these do.
+VIDEO_SCOPED_TABLES = (
+    "jobs", "rally_labels", "overlays", "calibrations", "user_notes",
+    "discrepancies", "reports", "ball_corrections", "ball_tracks",
+    "window_grades", "contact_events", "coaching_reports",
+    "coaching_selections", "coaching_marks",
+)
+
+
+def delete_video_rows(video_id: str, con: sqlite3.Connection | None = None) -> None:
+    """Deletes every row keyed to this video across VIDEO_SCOPED_TABLES, plus
+    the videos row itself. Pass an open connection to fold this into a
+    caller's own transaction; opens/commits its own otherwise."""
+    def _run(c: sqlite3.Connection) -> None:
+        for table in VIDEO_SCOPED_TABLES:
+            c.execute(f"DELETE FROM {table} WHERE video_id=?", (video_id,))
+        c.execute("DELETE FROM videos WHERE id=?", (video_id,))
+
+    if con is not None:
+        _run(con)
+    else:
+        with connect() as con:
+            _run(con)
+
+
 def new_id() -> str:
     return uuid.uuid4().hex
 

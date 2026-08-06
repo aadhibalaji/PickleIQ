@@ -157,23 +157,33 @@ def update_video(video_id: str, body: VideoUpdateIn):
 
 @router.delete("/videos/{video_id}")
 def delete_video(video_id: str):
+    """Kills and fully removes a video: cancels any job for it on THIS
+    container's own runner, wipes every DB row keyed to it (see
+    db.VIDEO_SCOPED_TABLES), and deletes its S3 data.
+
+    In the hybrid RUN_PROCESSING=0 setup, this container and the EC2 worker
+    each run their own separate JobRunner — runner.cancel_video here can
+    only ever stop a job THIS container started (true when RUN_PROCESSING=1,
+    a no-op otherwise). To actually stop a job running ON THE WORKER, an S3
+    kill-request marker is written first — cloud_ingest._tick_kill_requests
+    picks it up on its next ~20s poll, cancels it there, deletes the
+    worker's own local rows for this video, and finishes the S3 cleanup
+    (video file + results). That's why the video/results S3 objects are
+    deliberately NOT deleted from here when STORAGE_BACKEND=s3 — deleting
+    them before the worker has actually stopped would just orphan a job
+    still writing to files that no longer exist; the worker does that step
+    itself, after it confirms the cancel. Local DB rows ARE deleted
+    immediately either way, so the clip disappears from Past Clips right
+    away regardless of how long the worker takes to notice."""
     with db.connect() as con:
         row = con.execute("SELECT path, s3_key FROM videos WHERE id=?", (video_id,)).fetchone()
         if row is None:
             raise HTTPException(404, "video not found")
         runner.cancel_video(video_id)
-        # Every table that keys off video_id — no FK cascade is declared
-        # (see db.py SCHEMA), so each has to be cleared explicitly.
-        for table in (
-            "jobs", "rally_labels", "overlays", "calibrations", "user_notes",
-            "discrepancies", "reports", "ball_corrections", "ball_tracks",
-            "window_grades", "contact_events", "coaching_reports",
-        ):
-            con.execute(f"DELETE FROM {table} WHERE video_id=?", (video_id,))
-        con.execute("DELETE FROM videos WHERE id=?", (video_id,))
+        db.delete_video_rows(video_id, con=con)
 
     if STORAGE_BACKEND == "s3":
-        storage_s3.delete_video_data(video_id)
+        storage_s3.upload_kill_request(video_id)
         storage_s3.cleanup_scratch(video_id)
     else:
         path = Path(row["path"])
