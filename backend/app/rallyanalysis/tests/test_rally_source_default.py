@@ -22,6 +22,28 @@ from ..contact_detect import detect_contacts_for_video
 
 VIDEO = "vid1"
 FPS = 30.0
+RALLY_END = 60
+
+STRAIGHT_KNEE_KP = [[0.0, 0.0]] * 17
+STRAIGHT_KNEE_KP[11], STRAIGHT_KNEE_KP[13], STRAIGHT_KNEE_KP[15] = [100.0, 100.0], [100.0, 150.0], [100.0, 200.0]
+STRAIGHT_KNEE_KP[12], STRAIGHT_KNEE_KP[14], STRAIGHT_KNEE_KP[16] = [140.0, 100.0], [140.0, 150.0], [140.0, 200.0]
+
+BENT_KNEE_KP = [[0.0, 0.0]] * 17
+BENT_KNEE_KP[11], BENT_KNEE_KP[13], BENT_KNEE_KP[15] = [100.0, 100.0], [90.0, 150.0], [130.0, 180.0]
+BENT_KNEE_KP[12], BENT_KNEE_KP[14], BENT_KNEE_KP[16] = [140.0, 100.0], [150.0, 150.0], [110.0, 180.0]
+
+# Frames 30-50 carry a locked-straight knee (crosses frame_metrics'
+# continuous target -> a genuine spike) so generate_coaching_report has a
+# real frame-by-frame moment to find; the wrist swing at frame 10 is
+# unrelated -- it's what detect_contacts_for_video (a separate feature) finds.
+STRAIGHT_KNEE_RANGE = range(30, 51)
+
+
+def _kp_for_frame(f):
+    kp = [list(pt) for pt in (STRAIGHT_KNEE_KP if f in STRAIGHT_KNEE_RANGE else BENT_KNEE_KP)]
+    kp[9] = [50.0, 50.0]
+    kp[10] = [300.0, 50.0] if f == 10 else [50.0, 50.0]
+    return kp
 
 
 @pytest.fixture(autouse=True)
@@ -35,23 +57,19 @@ def _isolated_db(tmp_path, monkeypatch):
         con.execute(
             "INSERT INTO rally_labels (id, video_id, source, start_frame, end_frame)"
             " VALUES (?,?,?,?,?)",
-            ("r1", VIDEO, "pass1", 0, 20))
+            ("r1", VIDEO, "pass1", 0, RALLY_END))
         con.execute(
             "INSERT INTO jobs (id, video_id, kind, status, created_at, updated_at)"
             " VALUES (?,?,?,?,?,?)",
             (db.new_id(), VIDEO, "pass2", "done", 1.0, 1.0))
-    # Pass 2 overlay covering the rally, with a clear wrist swing at frame 10
-    # so detect_contacts_for_video has something to find.
-    entries = []
-    for f in range(0, 21):
-        rw = [300.0, 50.0] if f == 10 else [50.0, 50.0]
-        kp = [[100.0, 100.0]] * 17
-        kp[9] = [50.0, 50.0]
-        kp[10] = rw
-        entries.append({"f": f, "players": [
-            {"id": 1, "box": [0, 0, 50, 200], "cxy": [1.0, 3.0], "team": "near", "kp": kp},
-        ]})
-    overlays.write_entries(VIDEO, "pass2", entries)
+    # Pass 2 overlay covering the rally: a clear wrist swing at frame 10 (for
+    # detect_contacts_for_video) plus a sustained straight-knee stretch at
+    # frames 30-50 (for the frame-by-frame coaching pipeline).
+    overlays.write_entries(VIDEO, "pass2", [
+        {"f": f, "players": [{"id": 1, "box": [0, 0, 50, 200], "cxy": [1.0, 3.0],
+                               "team": "near", "kp": _kp_for_frame(f)}]}
+        for f in range(0, RALLY_END + 1)
+    ])
     yield
 
 
@@ -65,27 +83,17 @@ def test_detect_contacts_for_video_finds_pass1_only_rallies_by_default():
 
 
 def test_generate_coaching_report_finds_pass1_only_rallies_by_default(monkeypatch):
-    events = detect_contacts_for_video(VIDEO)
-    from ..contact_detect import save_events
-    save_events(VIDEO, events)
-
-    # Stub the adaptive selection (its own worst/best cap logic is covered by
-    # test_coaching.py) and the Anthropic call (no ANTHROPIC_API_KEY in the
-    # test env) so this test isolates what it actually guards: that the
-    # pass1-only rally was found and its contact reached feature-vector
-    # extraction and tip generation at all. This fixture only produces one
-    # contact total, and per-player relative scoring needs >= MIN_SAMPLES_FOR_
-    # DISTRIBUTION of a player's own shots to judge anything against -- lower
-    # it to 1 here since this test isn't about relative-scoring behavior.
-    monkeypatch.setattr(coaching, "MIN_SAMPLES_FOR_DISTRIBUTION", 1)
-    monkeypatch.setattr(coaching, "select_tip_candidates",
-                         lambda vectors_meta, limit=None, **_kwargs: [
-                             coaching._shot_summary(vec, c) for vec, c in vectors_meta])
+    # Stub only the Anthropic call (no ANTHROPIC_API_KEY in the test env) so
+    # this test isolates what it actually guards: that the pass1-only rally
+    # was found and its overlay frames reached spike detection and tip
+    # generation at all. The real select_tip_candidates/detect_spikes run
+    # unmodified.
     monkeypatch.setattr(coaching, "generate_llm_tips",
-                         lambda shots: {s["contact_id"]: {"tip": "t", "tone": "praise"} for s in shots})
+                         lambda shots: {s["contact_id"]: {"tip": "t", "tone": "improve"} for s in shots})
 
     report = generate_coaching_report(VIDEO)
     assert len(report.tips) == 1
+    assert report.tips[0].category == "footwork"
 
 
 if __name__ == "__main__":

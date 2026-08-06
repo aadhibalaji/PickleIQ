@@ -198,6 +198,36 @@ CREATE TABLE IF NOT EXISTS coaching_selections (
   created_at REAL NOT NULL
 );
 
+-- Expert ground-truth labels on coaching moments — the calibration baseline
+-- for frame_metrics' spike thresholds. Distinct from tip_feedback above:
+-- that rates TIP COPY (one binary per surfaced tip, so it can never say
+-- whether an UNSURFACED moment was actually bad); this rates the PLAY
+-- itself over a frame span, including moments the detector never flagged.
+--
+-- source='spike'    a detected spike the expert reviewed (spike_id set) —
+--                   yields true/false positives.
+-- source='freeform' a span the expert marked while scrubbing, independent of
+--                   detection — the ONLY way to measure what the detector
+--                   MISSES (false negatives), which is the whole point.
+--
+-- metric is the expert's attribution ('knee_bend_deg', ...) when they can name
+-- one, NULL when the moment is simply bad without a single clean cause.
+CREATE TABLE IF NOT EXISTS coaching_marks (
+  id TEXT PRIMARY KEY,
+  video_id TEXT NOT NULL,
+  rally_id TEXT,                    -- NULL on freeform marks outside a known rally
+  player_id INTEGER NOT NULL,
+  focus TEXT NOT NULL,              -- 'form' | 'positioning'
+  start_frame INTEGER NOT NULL,
+  end_frame INTEGER NOT NULL,
+  verdict TEXT NOT NULL,            -- 'bad' | 'fine' | 'good'
+  metric TEXT,
+  note TEXT,
+  source TEXT NOT NULL,             -- 'spike' | 'freeform'
+  spike_id TEXT,                    -- frame_metrics spike id when source='spike'
+  created_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS model_registry (
   version INTEGER PRIMARY KEY AUTOINCREMENT,
   kind TEXT NOT NULL,               -- 'rally_end' | 'serve_start' | 'tracknet'
@@ -298,6 +328,42 @@ def init_db() -> None:
         if cols and "tips_json" not in cols:
             con.execute("DROP TABLE coaching_reports")
             con.executescript(SCHEMA)
+
+
+# Every table that keys off video_id via a NOT NULL column — no FK cascade
+# is declared (see SCHEMA above), so a video delete has to clear each of
+# these explicitly. Single source of truth for that list: it used to live
+# inline in api/media.py's delete_video and drifted out of sync with the
+# schema twice (coaching_selections, coaching_marks both went live without
+# ever being added here) — a video "deleted" from the UI kept orphaned rows
+# in both until this got centralized. cloud_ingest.py's kill-request handler
+# (the EC2-worker-side half of a delete) uses this same list for the same
+# reason: one place decides what "belongs to a video," not two lists that
+# can silently disagree. Tables with only a nullable/contextual video_id
+# (pending_changes, calibrations' clip-local rows) are deliberately excluded
+# — those rows don't exclusively belong to one video the way these do.
+VIDEO_SCOPED_TABLES = (
+    "jobs", "rally_labels", "overlays", "calibrations", "user_notes",
+    "discrepancies", "reports", "ball_corrections", "ball_tracks",
+    "window_grades", "contact_events", "coaching_reports",
+    "coaching_selections", "coaching_marks",
+)
+
+
+def delete_video_rows(video_id: str, con: sqlite3.Connection | None = None) -> None:
+    """Deletes every row keyed to this video across VIDEO_SCOPED_TABLES, plus
+    the videos row itself. Pass an open connection to fold this into a
+    caller's own transaction; opens/commits its own otherwise."""
+    def _run(c: sqlite3.Connection) -> None:
+        for table in VIDEO_SCOPED_TABLES:
+            c.execute(f"DELETE FROM {table} WHERE video_id=?", (video_id,))
+        c.execute("DELETE FROM videos WHERE id=?", (video_id,))
+
+    if con is not None:
+        _run(con)
+    else:
+        with connect() as con:
+            _run(con)
 
 
 def new_id() -> str:

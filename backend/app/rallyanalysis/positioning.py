@@ -480,7 +480,8 @@ def _score(raw: dict, match_type: str | None) -> PositioningFeatureVector | None
         # keys off this list.
         low_confidence_metrics=[f for f in METRIC_FIELDS if raw[f] is None],
         deviating_metrics=[f for f, d in devs.items() if d is not None and d != 0.0],
-        soft_deviation=max(softs, key=abs) if softs else None)
+        soft_deviation=max(softs, key=abs) if softs else None,
+        all_metric_devs=dict(devs))
 
 
 def build_vectors(contacts: list[dict], rallies: list[dict],

@@ -12,12 +12,14 @@ export default function TimestampFeedback({ entries, selectedId, onSelect }) {
         {entries.map((entry) => {
           const active = entry.id === selectedId
           const available = Boolean(entry.feedback)
+          const label = entry.playerLabel ? `${entry.playerLabel} · ${entry.displayLabel}` : entry.displayLabel
           return (
             <button key={entry.id} type="button" aria-pressed={active}
               disabled={!available} className={active ? 'is-selected' : ''}
               onClick={() => onSelect(entry.id)}
-              aria-label={`${entry.displayLabel}${entry.playerLabel ? `, ${entry.playerLabel}` : ''}. ${available ? 'Show coaching feedback' : 'Feedback unavailable'}`}>
+              aria-label={`${label}. ${available ? 'Show coaching feedback' : 'Feedback unavailable'}`}>
               {entry.playerPhoto && <img className="pickleiq-player-photo pickleiq-player-photo--tiny" src={entry.playerPhoto} alt="" />}
+              {entry.playerLabel && <span className="pickleiq-timestamp-player">{entry.playerLabel}</span>}
               {entry.displayLabel}
             </button>
           )
@@ -27,7 +29,10 @@ export default function TimestampFeedback({ entries, selectedId, onSelect }) {
         <section className="pickleiq-selected-feedback" aria-live="polite" aria-atomic="true">
           <div className="pickleiq-player-heading">
             {selected.playerPhoto && <img className="pickleiq-player-photo" src={selected.playerPhoto} alt="" />}
-            <p>{selected.displayLabel}{selected.playerLabel ? ` — ${selected.playerLabel}` : ''}</p>
+            <p>
+              {selected.playerLabel && <span className="pickleiq-selected-player">{selected.playerLabel}</span>}
+              {selected.displayLabel}
+            </p>
           </div>
           <div>{selected.feedback}</div>
         </section>

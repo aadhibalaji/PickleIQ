@@ -1,11 +1,13 @@
 import React, { useMemo, useRef, useState } from 'react'
+import Header from './components/Header.jsx'
+import Footer from './components/Footer.jsx'
 import GeneralFeedback from './components/GeneralFeedback.jsx'
 import PrimaryButton from './components/PrimaryButton.jsx'
 import TimestampFeedback from './components/TimestampFeedback.jsx'
 import VideoPreview from './components/VideoPreview.jsx'
 import { buildRallySegments, resolveFeedbackSeekSeconds } from './processingAdapter.js'
 
-export default function ResultsScreen({ analysisResult, pass2Result, localFile, onHome }) {
+export default function ResultsScreen({ analysisResult, pass2Result, localFile, onHome, onPastClips, onTesting }) {
   const [selectedFeedbackId, setSelectedFeedbackId] = useState(null)
   const playerRef = useRef(null)
   const timestampFeedback = useMemo(
@@ -38,22 +40,31 @@ export default function ResultsScreen({ analysisResult, pass2Result, localFile, 
     if (seekSeconds !== null) playerRef.current.currentTime = seekSeconds
   }
 
+  const playerCount = analysisResult?.generalFeedback?.length || 0
+
   return (
-    <main className="pickleiq-page pickleiq-results-page" aria-labelledby="pickleiq-results-title">
-      <h1 id="pickleiq-results-title">Results</h1>
-      <div className="pickleiq-results-layout">
-        <div className="pickleiq-results-left">
-          <GeneralFeedback feedback={analysisResult?.generalFeedback} />
+    <div className="pickleiq-page">
+      <Header onHome={onHome} onPastClips={onPastClips} onTesting={onTesting} />
+      <main className="pickleiq-results-main" aria-labelledby="pickleiq-results-title">
+        <h1 id="pickleiq-results-title">Results</h1>
+        <div className="pickleiq-results-divider" />
+        <div className="pickleiq-results-layout">
+          <div className="pickleiq-results-left">
+            <GeneralFeedback feedback={analysisResult?.generalFeedback} />
+          </div>
+          <div className="pickleiq-results-right">
+            <VideoPreview previewUrl={videoUrl} localFile={localFile}
+              previewKind={videoKind} playerRef={playerRef}
+              skipSegments={displaysOriginalTimeline ? skipSegments : null} />
+            <TimestampFeedback entries={timestampFeedback} selectedId={selectedFeedbackId}
+              onSelect={selectFeedback} />
+          </div>
         </div>
-        <div className="pickleiq-results-right">
-          <VideoPreview previewUrl={videoUrl} localFile={localFile}
-            previewKind={videoKind} playerRef={playerRef}
-            skipSegments={displaysOriginalTimeline ? skipSegments : null} />
-          <TimestampFeedback entries={timestampFeedback} selectedId={selectedFeedbackId}
-            onSelect={selectFeedback} />
+        <div className="pickleiq-results-cta">
+          <PrimaryButton onClick={onHome}>Back to Home</PrimaryButton>
         </div>
-      </div>
-      <PrimaryButton className="pickleiq-results-home" onClick={onHome}>Back to Home</PrimaryButton>
-    </main>
+      </main>
+      <Footer left="ANALYSIS COMPLETE" right={`${playerCount} PLAYERS`} />
+    </div>
   )
 }

@@ -17,3 +17,4 @@ opencv-python
 ultralytics          # YOLO11-pose + ByteTrack (weights auto-download)
 lapx                 # assignment solver used by the tracker
 anthropic            # discrepancy-analysis report only
+pyflakes             # undefined-name check, run by scripts/deploy.sh before every deploy

@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import HomeLink from './components/HomeLink.jsx'
+import Header from './components/Header.jsx'
+import Footer from './components/Footer.jsx'
 import ProcessingError from './components/ProcessingError.jsx'
 import ProcessingProgress from './components/ProcessingProgress.jsx'
 import TimeRemaining from './components/TimeRemaining.jsx'
@@ -23,7 +24,7 @@ const GENERATION_INITIAL = {
 }
 
 export default function AnalysisScreen({ videoId, localFile, pass2Result, finalVideoUrl,
-  onComplete, onHome }) {
+  onComplete, onHome, onPastClips, onTesting }) {
   const headingRef = useRef(null)
   const generationStartedRef = useRef(false)
   const generationControllerRef = useRef(null)
@@ -115,22 +116,28 @@ export default function AnalysisScreen({ videoId, localFile, pass2Result, finalV
       ? 'Waiting to analyze players' : 'Analyzing player movement')
 
   return (
-    <main className="pickleiq-page pickleiq-processing-page pickleiq-analysis-page"
-      aria-labelledby="pickleiq-analysis-title">
-      <HomeLink onHome={onHome} />
-      <h1 ref={headingRef} tabIndex="-1" id="pickleiq-analysis-title">Analyzing players</h1>
-      <section className="pickleiq-processing-content" aria-label="Player analysis progress">
-        <TimeRemaining seconds={estimate} />
-        <ProcessingProgress label="Analysis" progress={progress} message={message}
-          inactive={Boolean(error)} />
-        <VideoPreview previewUrl={preservedVideoUrl} localFile={localFile}
-          previewKind={previewKind}
-          skipSegments={previewKind === 'original-local' ? skipSegments : null} />
-        {error && (
-          <ProcessingError inline title="Analysis stopped" message={error}
-            onRetry={retry} onHome={onHome} retryLabel="Retry analysis" />
-        )}
-      </section>
-    </main>
+    <div className="pickleiq-page">
+      <Header onHome={onHome} onPastClips={onPastClips} onTesting={onTesting} />
+      <main className="pickleiq-processing-main" aria-labelledby="pickleiq-analysis-title">
+        <div className="pickleiq-processing-header">
+          <button type="button" className="pickleiq-processing-back" onClick={onHome}>&larr; Home</button>
+          <h1 ref={headingRef} tabIndex="-1" id="pickleiq-analysis-title">Analyzing players</h1>
+        </div>
+        <div className="pickleiq-processing-divider" />
+        <section aria-label="Player analysis progress">
+          <TimeRemaining seconds={estimate} />
+          <ProcessingProgress label="Pass 3 of 3 · analyzing players" progress={progress} message={message}
+            inactive={Boolean(error)} />
+          <VideoPreview previewUrl={preservedVideoUrl} localFile={localFile}
+            previewKind={previewKind}
+            skipSegments={previewKind === 'original-local' ? skipSegments : null} />
+          {error && (
+            <ProcessingError inline title="Analysis stopped" message={error}
+              onRetry={retry} onHome={onHome} retryLabel="Retry analysis" />
+          )}
+        </section>
+      </main>
+      <Footer left="PROCESSING" right="PASS 3 OF 3" />
+    </div>
   )
 }

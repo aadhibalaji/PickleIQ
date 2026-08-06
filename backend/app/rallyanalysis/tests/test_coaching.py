@@ -237,8 +237,8 @@ def test_build_report_warns_when_llm_drops_all_real_flagged_candidates(caplog):
     # worth a log line -- it's the model's own discretion landing on
     # discard-everything, not a session with nothing to say.
     def fake_llm(shots, stats=None, ctx=None):
-        return ({}, [{"player_label": "Player 1", "summary": "quiet session",
-                      "takeaways": ["nothing stood out"]}])
+        return ({}, [{"player_label": "Player 1", "praise": "quiet session",
+                      "improve": "nothing stood out"}])
 
     with caplog.at_level("WARNING"):
         report = build_report("vid1", [(_vec("bad", "footwork", -3.0), _contact("bad"))],
@@ -269,10 +269,10 @@ def test_build_report_attaches_validated_general_feedback():
     # from our own contact data.
     def fake_llm(shots, stats=None, ctx=None):
         return ({s["contact_id"]: {"tip": "t", "tone": "improve"} for s in shots},
-                [{"player_label": "Player 1", "summary": "solid at the line",
-                  "takeaways": ["keep working the feet", "good paddle prep"]},
-                 {"player_label": "Player 99", "summary": "hallucinated", "takeaways": ["player"]},
-                 {"player_label": "Player 1", "summary": "duplicate", "takeaways": ["dropped"]}])
+                [{"player_label": "Player 1", "praise": "solid at the line",
+                  "improve": "keep working the feet"},
+                 {"player_label": "Player 99", "praise": "hallucinated", "improve": "player"},
+                 {"player_label": "Player 1", "praise": "duplicate", "improve": "dropped"}])
 
     vectors_meta = [(_vec("bad", "footwork", -3.0), _contact("bad"))]
     report = build_report("vid1", vectors_meta, llm_fn=fake_llm)
@@ -280,14 +280,14 @@ def test_build_report_attaches_validated_general_feedback():
     fb = report.general[0]
     assert fb.player_label == "Player 1"
     assert fb.player_id == 1
-    assert fb.summary == "solid at the line"
-    assert fb.takeaways == ["keep working the feet", "good paddle prep"]
+    assert fb.praise == "solid at the line"
+    assert fb.improve == "keep working the feet"
     assert report.player_themes == []  # replaced by general_feedback on new reports
 
 
 def test_build_report_drops_general_entries_missing_either_piece():
     def fake_llm(shots, stats=None, ctx=None):
-        return ({}, [{"player_label": "Player 1", "summary": "only a summary, no takeaways"}])
+        return ({}, [{"player_label": "Player 1", "praise": "only praise, no improve"}])
 
     report = build_report("vid1", [(_vec("bad", "footwork", -3.0), _contact("bad"))],
                            llm_fn=fake_llm)
@@ -343,22 +343,55 @@ def test_general_context_ranks_up_to_two_categories_each_side():
 
 def test_general_feedback_from_row_reads_current_shape():
     row = coaching._general_feedback_from_row(
-        {"player_id": 1, "player_label": "Player 1", "summary": "solid session",
-         "takeaways": ["a", "b", "c"]})
-    assert row.summary == "solid session"
-    assert row.takeaways == ["a", "b", "c"]
-
-
-def test_general_feedback_from_row_degrades_legacy_praise_improve_shape():
-    # Rows saved before this feature existed carry {praise, improve} instead
-    # of {summary, takeaways} — must not crash on load, and must not lose
-    # the two pieces of feedback that row actually has.
-    row = coaching._general_feedback_from_row(
-        {"player_id": 2, "player_label": "Player 2",
+        {"player_id": 1, "player_label": "Player 1",
          "praise": "great footwork", "improve": "watch your paddle prep"})
-    assert row.summary == ""
-    assert row.takeaways == ["great footwork", "watch your paddle prep"]
+    assert row.praise == "great footwork"
+    assert row.improve == "watch your paddle prep"
+
+
+def test_general_feedback_from_row_degrades_legacy_summary_takeaways_shape():
+    # A brief window on this branch saved GeneralFeedback as {summary,
+    # takeaways} instead of {praise, improve} (since reverted to match the
+    # coaching engine's current shape) — rows saved under that shape must
+    # not crash on load, and must not silently lose their content.
+    row = coaching._general_feedback_from_row(
+        {"player_id": 2, "player_label": "Player 2", "summary": "solid session",
+         "takeaways": ["good footwork", "watch your paddle prep"]})
+    assert row.praise == "solid session"
+    assert row.improve == "good footwork; watch your paddle prep"
     assert row.player_id == 2 and row.player_label == "Player 2"
+
+
+# --------------------------------- frame-level general context (impact-based)
+
+
+def _fs(frame, knee, elbow=None):
+    values = {"knee_bend_deg": knee, "elbow_extension_deg": elbow}
+    devs = coaching.frame_metrics.frame_deviations(values, coaching.frame_metrics.FORM_TARGETS, None)
+    return {"frame": frame, "values": values, "devs": devs}
+
+
+def test_frame_general_context_never_fabricates_a_negative_pick_when_genuinely_clean():
+    # Every tracked metric stays inside its target band the whole session --
+    # there is nothing to legitimately criticize. The old design would still
+    # have picked SOME category as "strongest_negative" (max() over a dict
+    # always returns something); this must instead come back None.
+    clean_series = [_fs(f, 130.0) for f in range(50)]  # in-band knee every frame
+    ctx = coaching._frame_general_context({1: clean_series}, focus="form", match_type=None)
+    p1 = ctx["Player 1"]
+    assert p1["strongest_negative_category"] is None
+    assert p1["by_category"]["footwork"]["impact_score"] == 0.0
+    # A genuinely clean category is still eligible to be the POSITIVE pick --
+    # only the negative pick is suppressed when there's no real evidence.
+    assert p1["strongest_positive_category"] == "footwork"
+
+
+def test_frame_general_context_still_picks_a_real_negative_when_evidence_exists():
+    series = [_fs(f, 180.0) for f in range(50)]  # every frame flags
+    ctx = coaching._frame_general_context({1: series}, focus="form", match_type=None)
+    p1 = ctx["Player 1"]
+    assert p1["strongest_negative_category"] == "footwork"
+    assert p1["by_category"]["footwork"]["impact_score"] > 0.0
 
 
 def test_build_report_frames_fn_runs_on_candidates_only_and_feeds_llm_fn():
@@ -639,13 +672,11 @@ def test_llm_shot_payload_renames_all_four_metric_name_lists():
 
 
 def test_system_prompt_gives_llm_the_final_cut_with_a_budget():
-    # Phase 2: the model receives a wider shortlist and must (a) know it can
-    # skip pose-noise shots, (b) never exceed the tip budget, (c) treat
-    # exemplar praise as connected to the player's flaws.
+    # The model receives a wider shortlist and must (a) know it can skip
+    # tracking-noise moments, (b) never exceed the tip budget.
     assert "THE FINAL CUT IS YOURS" in SYSTEM
-    assert f"AT MOST {MAX_TIPS} shots" in SYSTEM
-    assert "SKIP a shot entirely" in SYSTEM
-    assert "exemplar_of_category" in SYSTEM
+    assert f"MOST {MAX_TIPS} moments total" in SYSTEM
+    assert "SKIP a moment entirely" in SYSTEM
 
 
 # --------------------------------------------------------- serve exclusion
@@ -1009,21 +1040,21 @@ def test_system_prompt_keeps_null_safety_and_no_raw_numbers_rules():
     assert "no known reading for it — never fabricate a claim about it" in SYSTEM
 
 
-def test_system_prompt_frames_deviation_as_relative_with_reference_exception():
-    # Deviations stay per-player-relative BY DEFAULT; the one sanctioned
-    # exception is the conservative universal reference check (gross
-    # fundamentals only — REFERENCE_BANDS), which is what lets a habitual
-    # flaw a player repeats on every shot get coached at all. Correct-form
-    # claims are allowed for reference_flagged_metrics and nothing else.
-    assert "relative to THIS PLAYER" in SYSTEM
-    assert "reference_flagged_metrics" in SYSTEM
-    assert "deliberately conservative universal check" in SYSTEM
-    assert "no validated universal range" in SYSTEM
+def test_system_prompt_frames_deviation_as_an_absolute_standard():
+    # 2026-08-05 redesign: detection is continuous frame-by-frame (see
+    # frame_metrics.py), so deviation is judged against an ABSOLUTE
+    # standard for every metric now, never the player's own session — the
+    # old per-player-relative Tukey-fence framing must not leak back in.
+    assert "measured against an ABSOLUTE standard" in SYSTEM
+    assert "against this player's own habits" in SYSTEM
+    assert "relative to THIS PLAYER" not in SYSTEM
+    assert "reference_flagged_metrics" not in SYSTEM
 
 
-def test_system_prompt_bans_comparison_claims_without_enough_of_players_own_shots():
-    assert "no_comparison_metrics" in SYSTEM
-    assert "You must NEVER claim or imply a comparison" in SYSTEM
+def test_system_prompt_describes_every_moment_as_a_span_not_an_instant():
+    assert "Every moment you receive is a SPAN, not an instant" in SYSTEM
+    assert "duration_s" in SYSTEM
+    assert "never assert either" in SYSTEM
 
 
 def test_system_prompt_encodes_three_beat_supportive_framing():
@@ -1033,13 +1064,12 @@ def test_system_prompt_encodes_three_beat_supportive_framing():
     assert "NOT a compliment sandwich that pads or dilutes" in SYSTEM
 
 
-def test_system_prompt_describes_distance_from_net_never_height():
-    # The LLM-facing name is the honest one, and the prompt must forbid
-    # reading any vertical/contact-height meaning into it (the pipeline has
-    # no vertical measurement at all).
-    assert "distance_from_net_m" in SYSTEM
-    assert "NOTHING about how high or low" in SYSTEM
-    assert "contact_height_m" not in SYSTEM
+def test_system_prompt_form_describes_knee_and_elbow_metrics():
+    sp = coaching.system_prompt(coaching.FOCUS_FORM)
+    assert "knee_bend_deg" in sp
+    assert "elbow_extension_deg" in sp
+    assert "contact_height_m" not in sp
+    assert "distance_from_net_m" not in sp
 
 
 def test_system_prompt_covers_session_context_general_feedback_and_severity_bands():
@@ -1054,15 +1084,24 @@ def test_system_prompt_covers_session_context_general_feedback_and_severity_band
     assert "Calibrate how strongly you word a critique" in SYSTEM
 
 
-def test_system_prompt_covers_shot_types_mixed_baselines_and_rally_outcome():
-    # shot_type is a stratification key, never a verified stroke label...
-    assert "shot_type" in SYSTEM
-    assert "NOT a verified stroke" in SYSTEM
-    # ...cross-type comparisons are labeled and must be softened...
-    assert "mixed_baseline_metrics" in SYSTEM
-    # ...and rally-ending shots must never be asserted as winners OR errors.
-    assert "is_rally_ending" in SYSTEM
-    assert "does NOT say whether that shot" in SYSTEM
+def test_system_prompt_demands_layman_language():
+    assert "never had a coach and doesn't know coaching" in SYSTEM
+    assert "plain-English translation" in SYSTEM
+
+
+def test_system_prompt_bans_fabricating_a_criticism_when_genuinely_clean():
+    assert "genuinely clean" in SYSTEM
+    assert "Never manufacture a flaw" in SYSTEM
+
+
+def test_system_prompt_no_longer_references_retired_shot_type_or_rally_context():
+    # 2026-08-05 redesign: shot_type stratification, mixed_baseline_metrics,
+    # and rally_shot_index/is_rally_ending were all part of the retired
+    # per-contact pipeline and never appear on a FrameSpikeVector — the
+    # prompt must not describe fields that no longer exist.
+    assert "shot_type" not in SYSTEM
+    assert "mixed_baseline_metrics" not in SYSTEM
+    assert "is_rally_ending" not in SYSTEM
 
 
 def test_system_prompt_makes_frames_primary_evidence_without_breaking_voice():
@@ -1071,7 +1110,7 @@ def test_system_prompt_makes_frames_primary_evidence_without_breaking_voice():
     # ...visible evidence may override a null metric (but never fabrication)...
     assert "not describing what is visibly in front of you" in SYSTEM
     # ...and the coach voice never breaks the fourth wall about images/AI.
-    assert "never mention frames, images, crops, cameras" in SYSTEM
+    assert "never mention frames, images, crops," in SYSTEM
 
 
 # ------------------------------------------------- focus-composed prompts
@@ -1083,23 +1122,25 @@ def test_module_level_system_is_the_form_composition():
     assert SYSTEM == coaching.system_prompt(coaching.FOCUS_FORM)
 
 
-def test_system_prompt_positioning_frames_deviation_as_court_geometry():
+def test_system_prompt_positioning_describes_its_own_metrics():
     sp = coaching.system_prompt(coaching.FOCUS_POSITIONING)
-    assert "measured against the COURT ITSELF" in sp
-    # The form framing is FALSE for absolute bands and must not leak in.
-    assert "relative to THIS PLAYER" not in sp
-    assert 'no validated "correct" biomechanical range' not in sp
-    assert "contact_height_m" not in sp
+    assert "kitchen_distance_m" in sp
+    assert "transition_zone_occupancy" in sp
+    assert "lateral_offset_m" in sp
+    assert "partner_depth_stagger_m" in sp
+    # Retired per-contact positioning metrics must not reappear.
+    assert "kitchen_distance_at_contact_m" not in sp
+    assert "return_depth_m" not in sp
+    assert "kitchen_approach_after_return_s" not in sp
 
 
-def test_system_prompt_positioning_explains_span_moments_and_metrics():
-    sp = coaching.system_prompt(coaching.FOCUS_POSITIONING)
-    assert '"kind": "span"' in sp
-    assert "Never describe a span moment as a shot" in sp
-    for metric in ("kitchen_distance_at_contact_m", "return_depth_m", "transition_dwell_s",
-                    "kitchen_approach_after_return_s", "recovery_offset_m",
-                    "partner_depth_stagger_m"):
-        assert metric in sp, metric
+def test_both_focus_prompts_share_the_same_absolute_deviation_framing():
+    # Both foci now use identical absolute-target framing (2026-08-05
+    # redesign) — no focus-specific deviation semantics to diverge anymore.
+    form = coaching.system_prompt(coaching.FOCUS_FORM)
+    positioning = coaching.system_prompt(coaching.FOCUS_POSITIONING)
+    assert "measured against an ABSOLUTE standard" in form
+    assert "measured against an ABSOLUTE standard" in positioning
 
 
 def test_both_focus_prompts_keep_null_discipline_no_raw_numbers_and_final_cut():
@@ -1108,7 +1149,6 @@ def test_both_focus_prompts_keep_null_discipline_no_raw_numbers_and_final_cut():
         assert "NEVER mention degrees, angles, confidence/certainty scores" in sp
         assert "must NEVER state or\nimply a specific claim about a joint/measurement" in sp
         assert "THE FINAL CUT IS YOURS" in sp
-        assert "below_threshold" in sp
 
 
 def test_system_prompt_rejects_unknown_focus():
@@ -1316,18 +1356,17 @@ def test_capped_out_flags_never_reappear_as_below_threshold_filler():
             raise AssertionError(f"flagged shot mislabeled as filler: {c['contact_id']}")
 
 
-# --------------------------------------------- ball / feedback prompt pins
+# ------------------------------------------------- feedback-history pins
 
 
-def test_both_focus_prompts_cover_ball_evidence_and_feedback_history():
+def test_both_focus_prompts_cover_feedback_history():
+    # ball_context.py's tempo_verified/rally_end_ball fields are not wired
+    # into the frame-spike pipeline (2026-08-05 redesign) — spikes carry
+    # neither, so the prompt must not describe them.
     for focus in (coaching.FOCUS_FORM, coaching.FOCUS_POSITIONING):
         sp = coaching.system_prompt(focus)
-        assert "tempo_verified" in sp
-        assert "rally_end_ball" in sp
-        # Measured ball outcome is the ONE exception to the winner/error ban,
-        # which itself must stay in force for ball-less shots.
-        assert "ONE exception to the winner/error rule" in sp
-        assert "does NOT say whether that shot" in sp
+        assert "tempo_verified" not in sp
+        assert "rally_end_ball" not in sp
         assert "tip_feedback_history" in sp
         assert "NEVER\nsuppress a clearly severe moment" in sp
 

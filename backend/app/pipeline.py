@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from . import db, results_export, storage_s3
-from .config import STORAGE_BACKEND
+from .config import RUN_PROCESSING, STORAGE_BACKEND
 from .cv import overlays
 from .cv.court import CameraModel
 from .cv.pass1 import run_pass1

@@ -9,18 +9,38 @@
 #      base image are amd64-only — a plain `docker build` defaults to the
 #      HOST platform and produces an image that silently never runs anywhere
 #      real. Always pass --platform linux/amd64 explicitly.
+#   3. A bad merge can delete a function's DEFINITION while leaving its CALL
+#      SITE untouched — git's 3-way merge doesn't always flag that as a
+#      conflict if the surrounding lines look unmodified on the losing side.
+#      That code then imports fine (Python doesn't check names inside a
+#      function body until it actually runs) and passes `docker build`
+#      clean, so nothing catches it until the exact code path executes in
+#      production — which is exactly how cloud_ingest.py's Pass 2 poller
+#      thread silently died on every worker boot for two merges running.
+#      pyflakes' undefined-name check catches this class of bug in under a
+#      second, so it's a hard gate below, before any image gets built.
 # Verification at the end is generic (compares the image ID actually running
 # in each container against the ID we just pushed) rather than grepping for
 # any specific fix, so it stays useful for whatever you changed this time.
 set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+echo "==> checking for undefined names (catches a merge that drops a function"
+echo "    body but leaves its call site — see point 3 above)"
+UNDEFINED="$(backend/.venv/bin/python -m pyflakes backend/app 2>&1 | grep -i "undefined name" || true)"
+if [ -n "$UNDEFINED" ]; then
+  echo "!! pyflakes found undefined names — refusing to deploy:" >&2
+  echo "$UNDEFINED" >&2
+  exit 1
+fi
+echo "    OK — no undefined names"
 
 IMAGE="051404302327.dkr.ecr.us-east-2.amazonaws.com/picklecv-pipeline:latest"
 REGION="us-east-2"
 INSTANCE_ID="i-0daa6a28d07139de9"   # pickleCvEC2
 SSH_KEY="$HOME/.ssh/picklecv/picklecv-key.pem"
 SSH_USER="ubuntu"
-
-cd "$(dirname "$0")/.."
 
 echo "==> logging in to ECR"
 aws ecr get-login-password --region "$REGION" \

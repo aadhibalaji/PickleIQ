@@ -426,6 +426,51 @@ def claim_pass2_request(video_id: str) -> None:
     })
 
 
+def kill_request_key(video_id: str) -> str:
+    """Work-request object api/media.py's DELETE /videos/{id} writes so the
+    EC2 worker's cloud_ingest poller can cancel a job actually running
+    there — same reachability gap as pass2_request_key: a RUN_PROCESSING=0
+    UI container has no direct way to touch the worker's own in-process
+    JobRunner. Lives under jobs/ for the same reason pass2_request does
+    (never mistaken for a video upload by the Lambda's prefix filter)."""
+    return f"jobs/{video_id}/kill_request.json"
+
+
+def upload_kill_request(video_id: str) -> str:
+    import time
+    key = kill_request_key(video_id)
+    _put_json(key, {"video_id": video_id, "requested_at": time.time()})
+    return key
+
+
+def list_kill_request_video_ids() -> list[str]:
+    """video_ids with a kill_request.json in S3 — cloud_ingest deletes the
+    object itself once handled (unlike pass2_request's overwrite-claim
+    pattern, a kill request has nothing left to preserve once processed, so
+    a real delete is fine even on a role that generally avoids relying on
+    s3:DeleteObject elsewhere)."""
+    _require_bucket()
+    try:
+        resp = _client().list_objects_v2(Bucket=S3_VIDEO_BUCKET, Prefix="jobs/")
+    except Exception as exc:
+        log.error("S3 list_objects_v2 failed: bucket=%s prefix=jobs/ (%s)", S3_VIDEO_BUCKET, exc)
+        raise RuntimeError(f"S3 list failed for prefix 'jobs/' in bucket {S3_VIDEO_BUCKET!r}: {exc}") from exc
+    out: list[str] = []
+    for obj in resp.get("Contents", []):
+        parts = obj["Key"].split("/")
+        if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "kill_request.json":
+            out.append(parts[1])
+    return out
+
+
+def delete_kill_request(video_id: str) -> None:
+    _require_bucket()
+    try:
+        _client().delete_object(Bucket=S3_VIDEO_BUCKET, Key=kill_request_key(video_id))
+    except Exception:
+        log.exception("cloud ingest: failed to delete kill_request marker for %s (non-fatal)", video_id)
+
+
 def refine_config_key() -> str:
     return "refine/config.override.yaml.json"
 
@@ -450,21 +495,25 @@ def download_refine_config() -> dict | None:
 
 
 def delete_video_data(video_id: str) -> None:
-    """Removes everything this video wrote to S3: the uploaded video object
-    and every results/{video_id}/* object (result.json, window_N.json,
-    status.json). Best-effort per key — a missing object is not an error,
-    but a client/network failure is (same discipline as the rest of this
-    module: loud failures, not silent no-ops)."""
+    """Removes everything this video wrote to S3: the uploaded video object,
+    every results/{video_id}/* object (result.json, window_N.json,
+    status.json), and every jobs/{video_id}/* object (pass2_request.json,
+    kill_request.json — the latter is normally already gone via
+    delete_kill_request by the time this runs, so this is just a backstop).
+    Best-effort per key — a missing object is not an error, but a
+    client/network failure is (same discipline as the rest of this module:
+    loud failures, not silent no-ops)."""
     _require_bucket()
     client = _client()
     keys = [video_key(video_id)]
-    try:
-        resp = client.list_objects_v2(Bucket=S3_VIDEO_BUCKET, Prefix=f"results/{video_id}/")
-    except Exception as exc:
-        log.error("S3 list_objects_v2 failed: bucket=%s prefix=results/%s/ (%s)",
-                  S3_VIDEO_BUCKET, video_id, exc)
-        raise RuntimeError(f"S3 list failed for results/{video_id}/: {exc}") from exc
-    keys += [obj["Key"] for obj in resp.get("Contents", [])]
+    for prefix in (f"results/{video_id}/", f"jobs/{video_id}/"):
+        try:
+            resp = client.list_objects_v2(Bucket=S3_VIDEO_BUCKET, Prefix=prefix)
+        except Exception as exc:
+            log.error("S3 list_objects_v2 failed: bucket=%s prefix=%s (%s)",
+                      S3_VIDEO_BUCKET, prefix, exc)
+            raise RuntimeError(f"S3 list failed for {prefix}: {exc}") from exc
+        keys += [obj["Key"] for obj in resp.get("Contents", [])]
     try:
         client.delete_objects(
             Bucket=S3_VIDEO_BUCKET,

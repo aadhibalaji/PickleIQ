@@ -1,7 +1,7 @@
 """Rally Analysis & Coaching endpoints. Read-only against rally_labels,
 overlays, ball_corrections/ball_tracks and calibration data — never writes
 to those tables. New tables only: contact_events, coaching_reports,
-coaching_selections.
+coaching_selections, coaching_marks.
 
 Endpoints:
   GET  /rally-analysis/health                       liveness check
@@ -10,6 +10,10 @@ Endpoints:
   GET  /rally-analysis/{video_id}/readiness          per-rally Pass 2 readiness (waiting/stale/ready)
   POST /rally-analysis/{video_id}/coaching-report    generate report (1 Anthropic call) -> coaching_reports
   GET  /rally-analysis/{video_id}/coaching-report    cached report, or {"report": null}
+  GET  /rally-analysis/{video_id}/coaching-debug     per-metric decision timeline (no LLM call, nothing persisted)
+  GET  /rally-analysis/{video_id}/coaching-marks     expert ground-truth moment labels
+  POST /rally-analysis/{video_id}/coaching-marks     store one expert verdict over a frame span
+  DEL  /rally-analysis/coaching-marks/{mark_id}      remove a mark
   GET  /rally-analysis/{video_id}/report-stats       forward-momentum / kitchen-arrival / shot-zone aggregate stats
   GET  /rally-analysis/{video_id}/trajectories       per-rally 3D ball trajectory samples (ballistic reconstruction)
   GET  /rally-analysis/{video_id}/pass1-candidates   Pass 1 rally_labels rows, as acceptable candidates
@@ -25,6 +29,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from .. import db, pipeline
+from ..config import RUN_PROCESSING
 from ..cv import overlays
 from ..jobs import runner
 from ..learning import params as learned_params
@@ -141,6 +146,20 @@ def get_coaching_report(video_id: str):
     return {"video_id": video_id, "report": _report_payload(report) if report else None}
 
 
+@router.get("/rally-analysis/{video_id}/coaching-debug")
+def get_coaching_debug(video_id: str, source: str | None = None, focus: str | None = None):
+    """Diagnostic view into HOW a coaching decision gets made: every scored
+    moment (not just the ones that made a report), each metric's raw value
+    and deviation, the flag threshold, and which moments were selected as
+    LLM candidates. Never calls the LLM — pure deterministic computation,
+    safe to call repeatedly while iterating on thresholds/bands. See
+    coaching.debug_timeline for the payload shape."""
+    if focus is not None and focus not in (coaching.FOCUS_FORM, coaching.FOCUS_POSITIONING):
+        raise HTTPException(status_code=422,
+                            detail="focus must be 'form' or 'positioning'")
+    return coaching.debug_timeline(video_id, rally_source=source, focus=focus)
+
+
 @router.post("/rally-analysis/{video_id}/tip-feedback")
 def submit_tip_feedback(video_id: str, payload: dict):
     """Stores one thumbs verdict for one tip: {contact_id, rating: 1|-1,
@@ -178,6 +197,90 @@ def get_tip_feedback(video_id: str):
     return {"video_id": video_id, "ratings": ratings,
             "summary": {"helpful": sum(1 for v in ratings.values() if v == 1),
                          "not_helpful": sum(1 for v in ratings.values() if v == -1)}}
+
+
+# --------------------------------------------------- expert coaching marks ---
+# Ground-truth labels on coaching MOMENTS (see db.coaching_marks). Deliberately
+# separate from tip_feedback above: that rates tip COPY for tips the LLM chose
+# to surface, so it can never tell us about a moment the detector missed. These
+# marks rate the PLAY over a frame span, including spans nothing flagged, which
+# is what makes precision AND recall measurable (backend/scripts/eval_coaching.py).
+#
+# Spikes to review come from the existing coaching-debug endpoint (its shots[]
+# carry contact_id + start_frame/end_frame) — no separate listing endpoint.
+
+_VERDICTS = ("bad", "fine", "good")
+_SOURCES = ("spike", "freeform")
+_FOCUSES = ("form", "positioning")
+
+
+@router.get("/rally-analysis/{video_id}/coaching-marks")
+def list_coaching_marks(video_id: str, focus: str | None = None):
+    """All expert marks for this clip, optionally one focus. Ordered by start
+    frame so the UI can render them along the timeline directly."""
+    sql = "SELECT * FROM coaching_marks WHERE video_id=?"
+    args: list = [video_id]
+    if focus is not None:
+        if focus not in _FOCUSES:
+            raise HTTPException(status_code=422, detail=f"focus must be one of {_FOCUSES}")
+        sql += " AND focus=?"
+        args.append(focus)
+    with db.connect() as con:
+        rows = con.execute(sql + " ORDER BY start_frame", args).fetchall()
+    return {"video_id": video_id, "marks": db.rows_to_dicts(rows)}
+
+
+@router.post("/rally-analysis/{video_id}/coaching-marks")
+def add_coaching_mark(video_id: str, payload: dict):
+    """Stores one expert verdict over a frame span:
+    {player_id, focus, start_frame, end_frame, verdict, source,
+     rally_id?, metric?, note?, spike_id?}.
+
+    A spike-sourced mark re-marked later REPLACES the earlier verdict for that
+    spike (one expert opinion per spike), while freeform marks always append —
+    an expert may legitimately mark several distinct spans in one stretch."""
+    try:
+        player_id = int(payload["player_id"])
+        start_frame = int(payload["start_frame"])
+        end_frame = int(payload["end_frame"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(status_code=422,
+                            detail="player_id, start_frame and end_frame are required integers")
+    focus, verdict = payload.get("focus"), payload.get("verdict")
+    source = payload.get("source", "freeform")
+    if focus not in _FOCUSES:
+        raise HTTPException(status_code=422, detail=f"focus must be one of {_FOCUSES}")
+    if verdict not in _VERDICTS:
+        raise HTTPException(status_code=422, detail=f"verdict must be one of {_VERDICTS}")
+    if source not in _SOURCES:
+        raise HTTPException(status_code=422, detail=f"source must be one of {_SOURCES}")
+    spike_id = payload.get("spike_id")
+    if source == "spike" and not spike_id:
+        raise HTTPException(status_code=422, detail="a spike-sourced mark needs spike_id")
+    if end_frame < start_frame:
+        raise HTTPException(status_code=422, detail="end_frame must be >= start_frame")
+
+    mark_id = db.new_id()
+    with db.connect() as con:
+        if source == "spike":
+            con.execute("DELETE FROM coaching_marks WHERE video_id=? AND spike_id=?",
+                        (video_id, spike_id))
+        con.execute(
+            "INSERT INTO coaching_marks (id, video_id, rally_id, player_id, focus,"
+            " start_frame, end_frame, verdict, metric, note, source, spike_id, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (mark_id, video_id, payload.get("rally_id"), player_id, focus,
+             start_frame, end_frame, verdict, payload.get("metric"),
+             payload.get("note"), source, spike_id if source == "spike" else None,
+             db.now()))
+    return {"id": mark_id, "video_id": video_id, "verdict": verdict, "source": source}
+
+
+@router.delete("/rally-analysis/coaching-marks/{mark_id}")
+def delete_coaching_mark(mark_id: str):
+    with db.connect() as con:
+        con.execute("DELETE FROM coaching_marks WHERE id=?", (mark_id,))
+    return {"deleted": True}
 
 
 @router.get("/rally-analysis/{video_id}/report-stats")
@@ -313,3 +416,63 @@ def process_selection(video_id: str, selection_id: str):
                                         sel["start_frame"], sel["end_frame"], overlay_source))
     return {"video_id": video_id, "selection_id": selection_id, "job_id": job_id,
             "status": "queued", "reused_existing_pass2": False}
+
+
+@router.post("/rally-analysis/{video_id}/process-selections")
+def process_selections(video_id: str):
+    """Enqueues Pass 2 for every 'pending'/'failed' coaching_selections row on
+    this video in ONE job (pipeline._build_do_pass2_selections), instead of
+    the one-job-per-selection path above — a video with a dozen accepted
+    rallies used to queue a dozen separate Pass 2 jobs.
+
+    User-drawn selections get backfilled with a rally_labels row here (once,
+    if missing) so contacts/coaching-report/readiness — all keyed off
+    rally_labels — see them exactly like an accepted Pass 1 candidate.
+    Tagged meta.user_drawn=True so refine/keep-drop (which grades Pass 1's
+    OWN confidence in a candidate) skips them — see
+    refine/io_loaders.load_pass1_windows."""
+    with db.connect() as con:
+        sels = db.rows_to_dicts(con.execute(
+            "SELECT * FROM coaching_selections WHERE video_id=? AND status IN ('pending','failed')"
+            " ORDER BY start_frame", (video_id,)).fetchall())
+    if not sels:
+        raise HTTPException(400, "no pending selections to process")
+
+    with db.connect() as con:
+        for s in sels:
+            if s["source"] == "user_drawn" and not s["rally_label_id"]:
+                rid = db.new_id()
+                con.execute(
+                    "INSERT INTO rally_labels (id, video_id, source, start_frame, end_frame, meta)"
+                    " VALUES (?,?,?,?,?,?)",
+                    (rid, video_id, "pass1", s["start_frame"], s["end_frame"],
+                     db.dumps({"user_drawn": True})))
+                con.execute("UPDATE coaching_selections SET rally_label_id=? WHERE id=?",
+                            (rid, s["id"]))
+                s["rally_label_id"] = rid
+
+    if not RUN_PROCESSING:
+        # Must not runner.submit on a UI-only container — that was running
+        # Pass 2 on the Mac (CPU) while EC2 sat idle. Hand the selection
+        # payloads to the worker via S3; cloud_ingest rebuilds the rows and
+        # enqueues the real job there.
+        cloud = pipeline.queue_pass2_on_cloud(video_id, {
+            "mode": "selections",
+            "selections": [
+                {"id": s["id"], "source": s["source"],
+                 "start_frame": s["start_frame"], "end_frame": s["end_frame"],
+                 "rally_label_id": s["rally_label_id"]}
+                for s in sels
+            ],
+        })
+        with db.connect() as con:
+            con.executemany(
+                "UPDATE coaching_selections SET status='processing', error_message=NULL"
+                " WHERE id=?", [(s["id"],) for s in sels])
+        return {"video_id": video_id, "selection_ids": [s["id"] for s in sels], **cloud}
+
+    version, params = learned_params.get_latest()
+    job_id = runner.submit(video_id, "pass2",
+                           pipeline._build_do_pass2_selections(video_id, params, sels))
+    return {"video_id": video_id, "job_id": job_id,
+            "selection_ids": [s["id"] for s in sels]}

@@ -126,8 +126,12 @@ export const api = {
     }).then(j),
   processSelection: (id, selectionId) =>
     fetch(`/api/rally-analysis/${id}/selections/${selectionId}/process`, { method: 'POST' }).then(j),
+  processSelections: (id) =>
+    fetch(`/api/rally-analysis/${id}/process-selections`, { method: 'POST' }).then(j),
 
   getCoachingReport: (id, options) => fetch(`/api/rally-analysis/${id}/coaching-report`, options).then(j),
+  getCoachingDebug: (id, focus) =>
+    fetch(`/api/rally-analysis/${id}/coaching-debug${focus ? `?focus=${focus}` : ''}`).then(j),
   getContactEvents: (id) => fetch(`/api/rally-analysis/${id}/contact-events`).then(j),
   getReportStats: (id) => fetch(`/api/rally-analysis/${id}/report-stats`).then(j),
   getTrajectories: (id) => fetch(`/api/rally-analysis/${id}/trajectories`).then(j),
@@ -137,6 +141,19 @@ export const api = {
     fetch(`/api/rally-analysis/${id}/detect-contacts`, { ...options, method: 'POST' }).then(j),
   processSingleRally: (id) =>
     fetch(`/api/rally-analysis/${id}/process-single-rally`, { method: 'POST' }).then(j),
+  // Expert ground-truth labels on coaching moments (see db.coaching_marks).
+  // Distinct from tip-feedback below: that rates tip COPY, these rate the PLAY
+  // — and unlike tip feedback they can be recorded for moments no tip covered,
+  // which is what makes detector recall measurable.
+  listCoachingMarks: (id, focus) =>
+    fetch(`/api/rally-analysis/${id}/coaching-marks${focus ? `?focus=${focus}` : ''}`).then(j),
+  addCoachingMark: (id, body) =>
+    fetch(`/api/rally-analysis/${id}/coaching-marks`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    }).then(j),
+  deleteCoachingMark: (markId) =>
+    fetch(`/api/rally-analysis/coaching-marks/${markId}`, { method: 'DELETE' }).then(j),
+
   getTipFeedback: (id) => fetch(`/api/rally-analysis/${id}/tip-feedback`).then(j),
   sendTipFeedback: (id, body) =>
     fetch(`/api/rally-analysis/${id}/tip-feedback`, {
