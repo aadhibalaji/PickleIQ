@@ -18,9 +18,9 @@
   min-height: 100vh;
   display: flex;
   flex-direction: column;
-  background: var(--pickleiq-ink);
   color: var(--pickleiq-text);
   font-family: "Manrope", sans-serif;
+  background: var(--pickleiq-ink);
 }
 .pickleiq-page ::selection { background: rgba(47, 127, 214, 0.4); }
 .pickleiq-visually-hidden {
