@@ -388,7 +388,24 @@
   from { transform: translateX(-110%); }
   to { transform: translateX(370%); }
 }
-.pickleiq-video-preview { margin: 20px 0 0; }
+.pickleiq-video-preview { position: relative; margin: 20px 0 0; }
+/* left/top (not inset:0) so overlayDraw's layoutCanvas sizing wins cleanly —
+   it matches the video's letterboxed content box, which object-fit:contain
+   makes narrower than the 16/9 element for non-16/9 clips. */
+.pickleiq-video-overlay { position: absolute; left: 0; top: 0; pointer-events: none; }
+.pickleiq-video-overlay-toggle {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  padding: 6px 12px;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.6);
+  color: #fff;
+  font: 700 12px/1 "Manrope", sans-serif;
+  cursor: pointer;
+}
+.pickleiq-video-overlay-toggle:hover { background: rgba(0, 0, 0, 0.85); }
 .pickleiq-video-preview video,
 .pickleiq-video-placeholder {
   display: block;

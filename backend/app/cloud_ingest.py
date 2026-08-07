@@ -17,6 +17,23 @@ Runs as a background thread, started from main.py's startup() ONLY when
 RUN_PROCESSING is true AND STORAGE_BACKEND=='s3' (see config.py) — a
 RUN_PROCESSING=0 UI-only container has no business discovering and starting
 CV work; it only uploads, displays, and syncs.
+
+Two discovery paths, both landing on the same _ingest_video/_ingest_pass2_
+request/kill-request handlers below:
+
+  1. SQS (primary, when config.SQS_JOB_QUEUE_URL is set): S3 pushes
+     ObjectCreated events straight to an SQS queue; _sqs_loop() long-polls
+     it, so new work is noticed in seconds, not up to POLL_INTERVAL_S later.
+     More importantly, this is what makes an idle worker's health
+     *externally observable* — SQS's own ApproximateAgeOfOldestMessage
+     metric tells you "there's unconsumed work" independent of whether this
+     process is even alive, which nothing in the scan-only design could.
+  2. Bucket scan (backstop, always runs, unchanged cadence): the original
+     list_objects_v2 diff against the local DB, in _tick(). Once SQS is
+     configured its discovery role is just catching a lost/never-delivered
+     notification (bucket notifications are at-least-once, not
+     guaranteed-instant) — but the same tick also carries the config syncs,
+     so it keeps running at POLL_INTERVAL_S regardless.
 """
 from __future__ import annotations
 
@@ -28,19 +45,25 @@ import time
 import yaml
 
 from . import db, pipeline, self_stop, storage_s3
-from .config import DATA_DIR, S3_VIDEO_BUCKET
+from .config import DATA_DIR, S3_VIDEO_BUCKET, SQS_JOB_QUEUE_URL
 from .cv.video_io import probe
 from .refine.config import override_path
 
 log = logging.getLogger("cloud_ingest")
 
-# How often this instance checks S3 for videos it hasn't started yet.
-# Cheap by design (one list_objects_v2 call per tick, skipped entirely once
-# a video_id is already known locally) — no need for anything tighter than
-# this while a human is waiting on the other end for Pass 1 to even start.
+# How often the backstop scan tick runs. Deliberately NOT relaxed when SQS
+# is enabled: this same tick also carries the calibration / refine-config /
+# tracknet / self-stop S3 syncs (see _tick), and those are "flip it and it
+# takes effect" controls — the self-stop toggle especially, which is flipped
+# mid-testing precisely to stop the instance disappearing. Slowing this tick
+# down would silently add minutes of latency to all of them to save a
+# handful of cheap S3 calls per minute. SQS's win is discovery latency and
+# observability, not fewer ticks.
 POLL_INTERVAL_S = 20
 
 _KEY_RE = re.compile(r"^" + re.escape(storage_s3.DEFAULT_USER_ID) + r"/([0-9a-f]{32})\.mp4$")
+_PASS2_REQUEST_RE = re.compile(r"^jobs/([0-9a-f]{32})/pass2_request\.json$")
+_KILL_REQUEST_RE = re.compile(r"^jobs/([0-9a-f]{32})/kill_request\.json$")
 
 
 def _known_video_ids() -> set[str]:
@@ -270,6 +293,27 @@ def _ingest_pass2_request(video_id: str, req: dict) -> None:
     storage_s3.claim_pass2_request(video_id)
 
 
+def _handle_pass2_request_video(video_id: str, known: set[str]) -> None:
+    """One pass2_request.json's worth of work — shared by the bucket-scan
+    backstop (_tick_pass2_requests) and the SQS fast path (_sqs_loop) so
+    there's exactly one place that knows how to act on this event."""
+    if video_id not in known:
+        # Pass 1 may still be mid-ingest this tick/message; retry next cycle
+        # (backstop) or next delivery (SQS redelivers on visibility timeout
+        # since the message is never ack'd for this case — see _sqs_loop).
+        log.info("cloud ingest: pass2 request for unknown video %s — waiting until ingested",
+                 video_id)
+        return
+    try:
+        req = storage_s3.download_pass2_request(video_id)
+        if req is None:
+            return
+        _ingest_pass2_request(video_id, req)
+    except Exception:
+        log.exception("cloud ingest: failed to ingest pass2 request for %s "
+                      "(non-fatal, retrying next tick)", video_id)
+
+
 def _tick_pass2_requests() -> None:
     try:
         video_ids = storage_s3.list_pass2_request_video_ids()
@@ -278,53 +322,79 @@ def _tick_pass2_requests() -> None:
         return
     known = _known_video_ids()
     for video_id in video_ids:
-        if video_id not in known:
-            # Pass 1 may still be mid-ingest this tick; retry next cycle.
-            log.info("cloud ingest: pass2 request for unknown video %s — waiting until ingested",
-                     video_id)
-            continue
-        try:
-            req = storage_s3.download_pass2_request(video_id)
-            if req is None:
-                continue
-            _ingest_pass2_request(video_id, req)
-        except Exception:
-            log.exception("cloud ingest: failed to ingest pass2 request for %s "
-                          "(non-fatal, retrying next tick)", video_id)
+        _handle_pass2_request_video(video_id, known)
+
+
+def _handle_kill_request_video(video_id: str) -> None:
+    """One kill_request.json's worth of work — shared by the bucket-scan
+    backstop (_tick_kill_requests) and the SQS fast path (_sqs_loop).
+
+    This is the only piece that can actually stop the computation (deleting
+    S3 files doesn't touch an already-downloaded local scratch copy a job is
+    mid-read on — see storage_s3.download_to_scratch); the UI container
+    deliberately leaves the video/results S3 objects alone until this runs,
+    so cancel always happens before delete, never racing it."""
+    from .jobs import runner  # local import: same reasoning as _ingest_pass2_request's
+    try:
+        cancelled = runner.cancel_video(video_id)
+        with db.connect() as con:
+            db.delete_video_rows(video_id, con=con)
+        storage_s3.delete_video_data(video_id)
+        storage_s3.cleanup_scratch(video_id)
+        storage_s3.delete_kill_request(video_id)
+        log.info("cloud ingest: killed %s (%d local job(s) cancelled), S3 data removed",
+                 video_id, cancelled)
+    except Exception:
+        log.exception("cloud ingest: failed to process kill request for %s "
+                      "(non-fatal, retrying next tick)", video_id)
 
 
 def _tick_kill_requests() -> None:
-    """Handles api/media.py's DELETE /videos/{id} for a video that's actively
-    processing on THIS worker — that endpoint's own JobRunner.cancel_video
-    can only stop a job its own container started, so it relays a kill
-    request here instead of reaching into this process directly. This is
-    the only piece that can actually stop the computation (deleting S3
-    files doesn't touch an already-downloaded local scratch copy a job is
-    mid-read on — see storage_s3.download_to_scratch); the UI container
-    deliberately leaves the video/results S3 objects alone until this runs,
-    so cancel always happens before delete, never racing it.
-
-    Checked before _tick_pass2_requests in _tick() — no point starting new
+    """Checked before _tick_pass2_requests in _tick() — no point starting new
     work for a video that's about to be killed."""
-    from .jobs import runner  # local import: same reasoning as _ingest_pass2_request's
     try:
         video_ids = storage_s3.list_kill_request_video_ids()
     except Exception:
         log.exception("cloud ingest: kill-request S3 list failed (non-fatal, retrying next tick)")
         return
     for video_id in video_ids:
-        try:
-            cancelled = runner.cancel_video(video_id)
-            with db.connect() as con:
-                db.delete_video_rows(video_id, con=con)
-            storage_s3.delete_video_data(video_id)
-            storage_s3.cleanup_scratch(video_id)
-            storage_s3.delete_kill_request(video_id)
-            log.info("cloud ingest: killed %s (%d local job(s) cancelled), S3 data removed",
-                     video_id, cancelled)
-        except Exception:
-            log.exception("cloud ingest: failed to process kill request for %s "
-                          "(non-fatal, retrying next tick)", video_id)
+        _handle_kill_request_video(video_id)
+
+
+def _handle_video_key(key: str, known: set[str]) -> None:
+    """One newly-discovered video object's worth of work — shared by the
+    bucket-scan backstop (_tick) and the SQS fast path (_sqs_loop)."""
+    m = _KEY_RE.match(key)
+    if not m:
+        return
+    video_id = m.group(1)
+    if video_id in known:
+        return
+    try:
+        # Defense against re-processing an already-finished video: the
+        # dedup above relies entirely on THIS instance's own local DB
+        # (videos it has ever ingested), which only protects against
+        # duplicate work as long as that DB survives across this instance's
+        # stop/start cycles. If it doesn't — e.g. the container is
+        # recreated fresh on each boot rather than reusing a persistent
+        # volume for DATA_DIR — every video ever uploaded would look "new"
+        # again on the next boot, including ones fully completed long ago.
+        # Checking S3 directly for a final result.json is independent of
+        # this instance's own DB state, so it still catches that case even
+        # if the root persistence issue (outside this codebase — check how
+        # the container is launched on boot) isn't fixed.
+        if storage_s3.results_exist(video_id):
+            log.info("cloud ingest: %s already has a final result.json in S3 (from a "
+                      "prior run) — registering locally without reprocessing", video_id)
+            _register_without_processing(video_id, key)
+            return
+        _ingest_video(video_id, key)
+    except Exception:
+        # Must not kill the poller thread — a bad object today shouldn't
+        # block every future video from ever being noticed. Retried next
+        # tick (backstop) or next delivery (SQS — see _sqs_loop).
+        log.exception("cloud ingest: failed to start %s (non-fatal, retrying next tick)",
+                      key)
 
 
 def _tick() -> None:
@@ -341,43 +411,53 @@ def _tick() -> None:
 
     known = _known_video_ids()
     for key in keys:
-        m = _KEY_RE.match(key)
-        if not m:
-            continue
-        video_id = m.group(1)
-        if video_id in known:
-            continue
-        try:
-            # Defense against re-processing an already-finished video: the
-            # dedup above relies entirely on THIS instance's own local DB
-            # (videos it has ever ingested), which only protects against
-            # duplicate work as long as that DB survives across this
-            # instance's stop/start cycles. If it doesn't — e.g. the
-            # container is recreated fresh on each boot rather than reusing
-            # a persistent volume for DATA_DIR — every video ever uploaded
-            # would look "new" again on the next boot, including ones fully
-            # completed long ago. Checking S3 directly for a final
-            # result.json is independent of this instance's own DB state,
-            # so it still catches that case even if the root persistence
-            # issue (outside this codebase — check how the container is
-            # launched on boot) isn't fixed.
-            if storage_s3.results_exist(video_id):
-                log.info("cloud ingest: %s already has a final result.json in S3 (from a "
-                          "prior run) — registering locally without reprocessing", video_id)
-                _register_without_processing(video_id, key)
-                continue
-            _ingest_video(video_id, key)
-        except Exception:
-            # Must not kill the poller thread — a bad object today shouldn't
-            # block every future video from ever being noticed. Retried
-            # next tick since the video_id still won't be in `known`.
-            log.exception("cloud ingest: failed to start %s (non-fatal, retrying next tick)",
-                          video_id)
+        _handle_video_key(key, known)
 
     # After video discovery so a request that arrived with a brand-new
     # upload can resolve once the video row exists (same tick if ingest
     # succeeded above; otherwise next tick).
     _tick_pass2_requests()
+
+
+def _sqs_loop() -> None:
+    """Primary discovery path when config.SQS_JOB_QUEUE_URL is set (see
+    module docstring) — long-polls for S3 ObjectCreated notifications and
+    routes each key to the same handlers _tick()'s backstop scan uses, so
+    behavior is identical either way, just faster and externally observable
+    via the queue's own CloudWatch metrics.
+
+    A message is only ack'd (deleted) once every key in it has been routed
+    without raising — a partial failure leaves the whole message for
+    redelivery after the queue's visibility timeout rather than silently
+    dropping half of it."""
+    log.info("cloud ingest: SQS fast path started — queue %s", SQS_JOB_QUEUE_URL)
+    while True:
+        try:
+            messages = storage_s3.receive_job_events()
+        except Exception:
+            log.exception("cloud ingest: SQS receive failed (non-fatal, retrying)")
+            time.sleep(20)
+            continue
+        for msg in messages:
+            known = _known_video_ids()
+            ok = True
+            for key in msg["keys"]:
+                try:
+                    if _PASS2_REQUEST_RE.match(key):
+                        _handle_pass2_request_video(_PASS2_REQUEST_RE.match(key).group(1), known)
+                    elif _KILL_REQUEST_RE.match(key):
+                        _handle_kill_request_video(_KILL_REQUEST_RE.match(key).group(1))
+                    elif _KEY_RE.match(key):
+                        _handle_video_key(key, known)
+                    # Anything else (calibration/refine-config/self-stop/
+                    # tracknet writes) isn't in the bucket notification
+                    # filter rules at all — see the deploy notes — so it
+                    # never reaches here; no branch needed for it.
+                except Exception:
+                    log.exception("cloud ingest: SQS-routed key %s failed (message left for redelivery)", key)
+                    ok = False
+            if ok:
+                storage_s3.delete_job_event(msg["receipt_handle"])
 
 
 def _loop() -> None:
@@ -387,6 +467,11 @@ def _loop() -> None:
 
 
 def start() -> None:
-    threading.Thread(target=_loop, daemon=True, name="cloud-ingest-poller").start()
-    log.info("cloud ingest poller started — checking s3://%s/%s/ every %ds",
+    threading.Thread(target=_loop, daemon=True, name="cloud-ingest-scan-backstop").start()
+    log.info("cloud ingest backstop scan started — checking s3://%s/%s/ every %ds",
               S3_VIDEO_BUCKET, storage_s3.DEFAULT_USER_ID, POLL_INTERVAL_S)
+    if SQS_JOB_QUEUE_URL:
+        threading.Thread(target=_sqs_loop, daemon=True, name="cloud-ingest-sqs").start()
+    else:
+        log.info("cloud ingest: SQS_JOB_QUEUE_URL not set — running scan-only "
+                 "(set it to switch on the fast/observable SQS path)")

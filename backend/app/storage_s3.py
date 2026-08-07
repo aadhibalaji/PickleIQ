@@ -23,7 +23,7 @@ import logging
 import os
 from pathlib import Path
 
-from .config import DATA_DIR, S3_VIDEO_BUCKET
+from .config import DATA_DIR, S3_VIDEO_BUCKET, SQS_JOB_QUEUE_URL
 
 log = logging.getLogger("storage_s3")
 
@@ -39,9 +39,84 @@ def _client():
     return session.client("s3", region_name=_REGION)
 
 
+def _sqs_client():
+    import os
+    import boto3
+    profile = os.environ.get("AWS_PROFILE_OVERRIDE")
+    session = boto3.Session(profile_name=profile) if profile else boto3.Session()
+    return session.client("sqs", region_name=_REGION)
+
+
+def receive_job_events(wait_seconds: int = 20, max_messages: int = 10) -> list[dict]:
+    """Long-polls SQS_JOB_QUEUE_URL for S3 ObjectCreated notifications (video
+    uploads, pass2_request.json, kill_request.json — see the bucket
+    notification config), returning [{'receipt_handle': ..., 'keys': [...]}].
+    Each S3 event notification message can bundle multiple Records, hence
+    'keys' being a list. Empty list on an empty queue (normal — long-poll
+    just timed out) or if SQS_JOB_QUEUE_URL isn't configured (caller should
+    treat that as "SQS path disabled, rely on the bucket-scan backstop
+    instead" — see cloud_ingest.py)."""
+    if not SQS_JOB_QUEUE_URL:
+        return []
+    try:
+        resp = _sqs_client().receive_message(
+            QueueUrl=SQS_JOB_QUEUE_URL,
+            MaxNumberOfMessages=max_messages,
+            WaitTimeSeconds=wait_seconds,
+        )
+    except Exception as exc:
+        log.error("SQS receive_message failed: queue=%s (%s)", SQS_JOB_QUEUE_URL, exc)
+        raise RuntimeError(f"SQS receive failed for {SQS_JOB_QUEUE_URL!r}: {exc}") from exc
+    out = []
+    for msg in resp.get("Messages", []):
+        try:
+            body = json.loads(msg["Body"])
+            keys = [rec["s3"]["object"]["key"] for rec in body.get("Records", [])]
+        except Exception:
+            log.exception("SQS message body wasn't a parseable S3 event notification (skipping): %s",
+                          msg.get("Body"))
+            keys = []
+        out.append({"receipt_handle": msg["ReceiptHandle"], "keys": keys})
+    return out
+
+
+def delete_job_event(receipt_handle: str) -> None:
+    """Acks a message pulled via receive_job_events — call only once its
+    keys have been fully handled. Left un-called (message just becomes
+    visible again after the queue's visibility timeout) on any processing
+    failure, which is the self-healing redelivery this whole path exists
+    for — don't wrap call sites in a blanket try/except that acks anyway."""
+    if not SQS_JOB_QUEUE_URL:
+        return
+    try:
+        _sqs_client().delete_message(QueueUrl=SQS_JOB_QUEUE_URL, ReceiptHandle=receipt_handle)
+    except Exception:
+        log.exception("SQS delete_message failed (message will be redelivered — non-fatal)")
+
+
 def _require_bucket() -> None:
     if not S3_VIDEO_BUCKET:
         raise RuntimeError("STORAGE_BACKEND=s3 but S3_VIDEO_BUCKET is not set")
+
+
+def _list_all_keys(prefix: str) -> list[str]:
+    """Every object key under prefix, following S3's pagination — a plain
+    list_objects_v2 call silently caps at 1000 keys per response
+    (IsTruncated + NextContinuationToken, easy to miss since nothing errors),
+    so anything scanning a prefix that can grow past that — like the
+    cloud_ingest poller's video/job-marker discovery — needs this instead or
+    it starts silently missing objects once the bucket passes 1000 entries."""
+    _require_bucket()
+    client = _client()
+    out: list[str] = []
+    try:
+        for page in client.get_paginator("list_objects_v2").paginate(
+                Bucket=S3_VIDEO_BUCKET, Prefix=prefix):
+            out.extend(obj["Key"] for obj in page.get("Contents", []))
+    except Exception as exc:
+        log.error("S3 list_objects_v2 failed: bucket=%s prefix=%s (%s)", S3_VIDEO_BUCKET, prefix, exc)
+        raise RuntimeError(f"S3 list failed for prefix {prefix!r} in bucket {S3_VIDEO_BUCKET!r}: {exc}") from exc
+    return out
 
 
 def video_key(video_id: str, user_id: str = DEFAULT_USER_ID) -> str:
@@ -54,14 +129,7 @@ def list_video_keys(user_id: str = DEFAULT_USER_ID) -> list[str]:
     its own DB and discover videos it hasn't started processing yet. Scoped
     to this prefix specifically so it never picks up results/*.json
     objects, which live under a separate top-level prefix."""
-    _require_bucket()
-    prefix = f"{user_id}/"
-    try:
-        resp = _client().list_objects_v2(Bucket=S3_VIDEO_BUCKET, Prefix=prefix)
-    except Exception as exc:
-        log.error("S3 list_objects_v2 failed: bucket=%s prefix=%s (%s)", S3_VIDEO_BUCKET, prefix, exc)
-        raise RuntimeError(f"S3 list failed for prefix {prefix!r} in bucket {S3_VIDEO_BUCKET!r}: {exc}") from exc
-    return [obj["Key"] for obj in resp.get("Contents", [])]
+    return _list_all_keys(f"{user_id}/")
 
 
 def upload_video(local_path: Path, video_id: str, user_id: str = DEFAULT_USER_ID) -> str:
@@ -398,15 +466,9 @@ def list_pass2_request_video_ids() -> list[str]:
     """video_ids with an *unclaimed* pass2_request.json in S3. Claimed
     requests stay as overwrite markers (this role often lacks
     s3:DeleteObject) so we must open each object."""
-    _require_bucket()
-    try:
-        resp = _client().list_objects_v2(Bucket=S3_VIDEO_BUCKET, Prefix="jobs/")
-    except Exception as exc:
-        log.error("S3 list_objects_v2 failed: bucket=%s prefix=jobs/ (%s)", S3_VIDEO_BUCKET, exc)
-        raise RuntimeError(f"S3 list failed for prefix 'jobs/' in bucket {S3_VIDEO_BUCKET!r}: {exc}") from exc
+    keys = _list_all_keys("jobs/")
     out: list[str] = []
-    for obj in resp.get("Contents", []):
-        key = obj["Key"]
+    for key in keys:
         parts = key.split("/")
         if len(parts) != 3 or parts[0] != "jobs" or parts[2] != "pass2_request.json":
             continue
@@ -449,15 +511,10 @@ def list_kill_request_video_ids() -> list[str]:
     pattern, a kill request has nothing left to preserve once processed, so
     a real delete is fine even on a role that generally avoids relying on
     s3:DeleteObject elsewhere)."""
-    _require_bucket()
-    try:
-        resp = _client().list_objects_v2(Bucket=S3_VIDEO_BUCKET, Prefix="jobs/")
-    except Exception as exc:
-        log.error("S3 list_objects_v2 failed: bucket=%s prefix=jobs/ (%s)", S3_VIDEO_BUCKET, exc)
-        raise RuntimeError(f"S3 list failed for prefix 'jobs/' in bucket {S3_VIDEO_BUCKET!r}: {exc}") from exc
+    keys = _list_all_keys("jobs/")
     out: list[str] = []
-    for obj in resp.get("Contents", []):
-        parts = obj["Key"].split("/")
+    for key in keys:
+        parts = key.split("/")
         if len(parts) == 3 and parts[0] == "jobs" and parts[2] == "kill_request.json":
             out.append(parts[1])
     return out

@@ -36,6 +36,12 @@ PORT="8420"
 DATA_DIR="${PICKLECV_DATA_DIR:-/opt/picklecv/data}"
 BUCKET="${S3_VIDEO_BUCKET:-picklecv-videos-dev}"
 REGION="${AWS_REGION:-us-east-2}"
+# Empty = SQS fast path off, worker falls back to bucket-scan-only (see
+# cloud_ingest.py) — same "additive, not required" default as config.py.
+# Fill in the real queue URL here once, after creating it (see
+# scripts/README or the SQS setup commands) — same hardcode-it-here
+# convention as BUCKET above and deploy.sh's INSTANCE_ID.
+SQS_JOB_QUEUE_URL="${SQS_JOB_QUEUE_URL:-https://sqs.us-east-2.amazonaws.com/051404302327/picklecv-job-events}"
 
 sudo mkdir -p "$DATA_DIR"
 
@@ -76,6 +82,27 @@ aws ecr get-login-password --region "$REGION" \
 echo "==> removing any existing $CONTAINER_NAME"
 sudo docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
+# Every deploy pushes a new :latest, which orphans the previous image as a
+# dangling layer set on the ROOT volume — docker's data-root points at the
+# NVMe, but containerd's own content store (/var/lib/containerd) does not
+# follow that setting, so those orphans accumulate on / until a pull dies
+# with "no space left on device" and this whole script fails, leaving the
+# box with NO worker container at all (observed: 14 dangling images, / at
+# 100%, worker down and every queued video silently unprocessed). Pruning
+# after the rm above (so the just-removed container isn't holding a
+# reference) and before the pull below (so the pull has room) keeps that
+# from ever building up again.
+echo "==> pruning dangling images (frees root-volume space before the pull)"
+sudo docker image prune -f 2>&1 | tail -2
+
+# Same story for downloaded video scratch copies: cleanup_scratch only runs
+# when a pass1->pass2->contacts chain finishes, so anything interrupted
+# leaves its (large) copy behind forever. Safe to drop here — no container
+# is running at this point, and storage_s3.download_to_scratch re-fetches
+# from S3 on demand.
+echo "==> clearing leftover scratch videos"
+sudo rm -f "$DATA_DIR"/scratch/*.mp4 2>/dev/null || true
+
 echo "==> pulling $IMAGE"
 sudo docker pull "$IMAGE"
 
@@ -87,6 +114,7 @@ sudo docker run -d --restart unless-stopped --gpus all -p "$PORT:8420" \
   -e CV_DEVICE=cuda \
   -e PASS2_BALL=1 \
   -e TRACKNET_ENABLED=1 \
+  ${SQS_JOB_QUEUE_URL:+-e SQS_JOB_QUEUE_URL="$SQS_JOB_QUEUE_URL"} \
   -v "$DATA_DIR:/app/data" \
   --name "$CONTAINER_NAME" \
   "$IMAGE"

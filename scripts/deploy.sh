@@ -39,6 +39,7 @@ echo "    OK — no undefined names"
 IMAGE="051404302327.dkr.ecr.us-east-2.amazonaws.com/picklecv-pipeline:latest"
 REGION="us-east-2"
 INSTANCE_ID="i-0daa6a28d07139de9"   # pickleCvEC2
+SG_ID="sg-01e32da73c812008f"        # launch-wizard-1 — SSH/API allowlist, see below
 SSH_KEY="$HOME/.ssh/picklecv/picklecv-key.pem"
 SSH_USER="ubuntu"
 
@@ -62,6 +63,38 @@ if [ "$LOCAL_ID" != "$NEW_ID" ]; then
   exit 1
 fi
 echo "    OK — picklecv-local is on the image we just pushed"
+
+# The security group pins SSH (and the 8420 API port) to a single /32. On a
+# laptop that means every ISP re-assignment — or just deploying from a
+# different network, e.g. a demo venue — silently breaks the SSH leg below,
+# while the ECR push and local-container restart still succeed. That
+# half-applied state is genuinely confusing: on the next instance boot
+# systemd re-pulls :latest, so CODE changes land while anything that lives
+# in restart-ec2.sh (env vars like SQS_JOB_QUEUE_URL) does not. Re-point the
+# rule at wherever we are now, every run, so the two can't drift.
+echo "==> syncing SSH allowlist to this machine's current public IP"
+MY_IP="$(curl -s --max-time 10 https://checkip.amazonaws.com | tr -d '[:space:]')"
+if [ -z "$MY_IP" ]; then
+  echo "!! could not determine public IP — skipping allowlist sync (SSH may fail below)" >&2
+else
+  for PORT_N in 22 8420; do
+    # Drop any stale /32 rules for this port, then re-add just ours. Existing
+    # rule absent/already-correct both surface as errors here, hence the
+    # || true — this is a convergence step, not a gate.
+    STALE="$(aws ec2 describe-security-groups --group-ids "$SG_ID" --region "$REGION" \
+      --query "SecurityGroups[0].IpPermissions[?FromPort==\`$PORT_N\`].IpRanges[].CidrIp" \
+      --output text 2>/dev/null || true)"
+    for CIDR in $STALE; do
+      [ "$CIDR" = "$MY_IP/32" ] && continue
+      aws ec2 revoke-security-group-ingress --group-id "$SG_ID" --region "$REGION" \
+        --protocol tcp --port "$PORT_N" --cidr "$CIDR" >/dev/null 2>&1 || true
+      echo "    revoked stale $CIDR on port $PORT_N"
+    done
+    aws ec2 authorize-security-group-ingress --group-id "$SG_ID" --region "$REGION" \
+      --protocol tcp --port "$PORT_N" --cidr "$MY_IP/32" >/dev/null 2>&1 || true
+  done
+  echo "    OK — SSH/API allowed from $MY_IP/32"
+fi
 
 echo "==> ensuring EC2 instance is running"
 STATE="$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --region "$REGION" \

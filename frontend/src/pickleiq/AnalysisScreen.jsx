@@ -128,9 +128,11 @@ export default function AnalysisScreen({ videoId, localFile, pass2Result, finalV
           <TimeRemaining seconds={estimate} />
           <ProcessingProgress label="Pass 3 of 3 · analyzing players" progress={progress} message={message}
             inactive={Boolean(error)} />
+          {/* preservedVideoUrl is always the untrimmed original (api.streamUrl
+              serves the upload itself), so rally-only playback applies here
+              too — see ResultsScreen for why previewKind can't gate this. */}
           <VideoPreview previewUrl={preservedVideoUrl} localFile={localFile}
-            previewKind={previewKind}
-            skipSegments={previewKind === 'original-local' ? skipSegments : null} />
+            previewKind={previewKind} skipSegments={skipSegments} />
           {error && (
             <ProcessingError inline title="Analysis stopped" message={error}
               onRetry={retry} onHome={onHome} retryLabel="Retry analysis" />

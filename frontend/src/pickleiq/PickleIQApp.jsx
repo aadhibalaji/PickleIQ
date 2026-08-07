@@ -208,7 +208,7 @@ export default function PickleIQApp({ onSwitchToTesting }) {
   }
 
   if (stage === 'results') {
-    return <ResultsScreen analysisResult={analysisOutput} pass2Result={pass2Output}
+    return <ResultsScreen videoId={videoRecord?.id} analysisResult={analysisOutput} pass2Result={pass2Output}
       localFile={video} onHome={returnHome} onPastClips={openHistory} onTesting={onSwitchToTesting} />
   }
 
@@ -220,7 +220,8 @@ export default function PickleIQApp({ onSwitchToTesting }) {
   if (stage === 'history-results') {
     // ResultsScreen's button reads "Back to Home" — send it to the actual
     // home screen, not back into the list, so the label stays honest.
-    return <ResultsScreen analysisResult={historyResult?.analysisResult} pass2Result={historyResult?.pass2Result}
+    return <ResultsScreen videoId={historyResult?.videoId}
+      analysisResult={historyResult?.analysisResult} pass2Result={historyResult?.pass2Result}
       localFile={null} onHome={returnHome} onPastClips={openHistory} onTesting={onSwitchToTesting} />
   }
 
