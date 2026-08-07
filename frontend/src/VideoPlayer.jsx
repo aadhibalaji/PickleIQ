@@ -1,15 +1,6 @@
 import React, { useEffect, useImperativeHandle, useRef, useState, forwardRef } from 'react'
 import { api } from './api.js'
-
-const CHUNK = 900 // must match backend overlays.CHUNK_FRAMES
-
-// COCO-17 skeleton edges (YOLO11-pose keypoint indices)
-const SKELETON = [
-  [5, 7], [7, 9], [6, 8], [8, 10],          // arms
-  [5, 6], [5, 11], [6, 12], [11, 12],       // torso
-  [11, 13], [13, 15], [12, 14], [14, 16],   // legs
-  [0, 5], [0, 6],                           // head to shoulders
-]
+import { drawBall, drawPlayers, ensureChunks, entryAt, layoutCanvas, newCache } from './overlayDraw.js'
 
 // Renders the ORIGINAL video with all annotation drawn from stored metadata
 // onto a canvas overlay — the video file is never edited.
@@ -44,42 +35,11 @@ const VideoPlayer = forwardRef(function VideoPlayer(
     video: () => videoRef.current,
   }))
 
-  const ensureChunks = (source, frame) => {
+  const fetchChunks = (source, frame) => {
     if (!source) return
     let c = cacheRef.current[source]
-    if (!c) c = cacheRef.current[source] = { fetched: new Set(), byFrame: new Map() }
-    const ci = Math.floor(frame / CHUNK)
-    for (const idx of [ci, ci + 1]) {
-      if (c.fetched.has(idx)) continue
-      c.fetched.add(idx)
-      api.getOverlays(videoId, source, idx * CHUNK, (idx + 1) * CHUNK - 1)
-        .then((r) => r.entries.forEach((e) => c.byFrame.set(e.f, e)))
-        .catch(() => c.fetched.delete(idx))
-    }
-  }
-
-  // Size/position the overlay canvas to EXACTLY cover the video's rendered
-  // (letterboxed) content box. Court lines + player boxes are all drawn on this
-  // one canvas, so this is what keeps them aligned with the video in EVERY mode
-  // — especially fullscreen, where the video is object-fit:contain and the
-  // wrapper is larger than the video, so a canvas that merely filled the wrapper
-  // would stretch the overlay (visible first on the long, precise court lines).
-  const layoutCanvas = () => {
-    const v = videoRef.current
-    const cv = canvasRef.current
-    if (!v || !cv || !v.videoWidth || !v.clientWidth) return
-    const scale = Math.min(v.clientWidth / v.videoWidth, v.clientHeight / v.videoHeight)
-    const dw = Math.round(v.videoWidth * scale)
-    const dh = Math.round(v.videoHeight * scale)
-    const left = Math.round(v.offsetLeft + (v.clientWidth - dw) / 2)
-    const top = Math.round(v.offsetTop + (v.clientHeight - dh) / 2)
-    const box = `${left},${top},${dw},${dh}`
-    if (box === lastBoxRef.current) return   // avoid reflow when unchanged
-    lastBoxRef.current = box
-    cv.style.left = `${left}px`
-    cv.style.top = `${top}px`
-    cv.style.width = `${dw}px`
-    cv.style.height = `${dh}px`
+    if (!c) c = cacheRef.current[source] = newCache()
+    ensureChunks(c, videoId, source, frame)
   }
 
   const draw = () => {
@@ -87,7 +47,7 @@ const VideoPlayer = forwardRef(function VideoPlayer(
     const cv = canvasRef.current
     if (!v || !cv || !v.videoWidth) return
     if (cv.width !== v.videoWidth) { cv.width = v.videoWidth; cv.height = v.videoHeight }
-    layoutCanvas()
+    layoutCanvas(v, cv, lastBoxRef)
     const g = cv.getContext('2d')
     g.clearRect(0, 0, cv.width, cv.height)
     const { overlaySource: src, courtLines: lines } = stateRef.current
@@ -127,47 +87,10 @@ const VideoPlayer = forwardRef(function VideoPlayer(
     const c = cacheRef.current[src]
     if (!c) return
 
-    // Nearest entry at or just before the current frame (pass1 is subsampled).
-    let entry = null
-    for (let d = 0; d <= 8; d++) {
-      entry = c.byFrame.get(frame - d)
-      if (entry) break
-    }
+    const entry = entryAt(c, frame)
 
-    // Ball trail from recent entries — red so it contrasts with the (often
-    // yellow) pickleball itself; current position gets a white outline.
-    // Toggleable from the player controls (🎾).
-    if (stateRef.current.showBall) for (let d = 24; d >= 0; d--) {
-      const e = c.byFrame.get(frame - d)
-      if (e?.ball) {
-        const a = 1 - d / 28
-        const isNow = d === 0 || (entry && e.f === entry.f)
-        g.fillStyle = isNow ? 'rgba(255,45,60,0.95)' : `rgba(255,45,60,${0.4 * a})`
-        g.beginPath()
-        g.arc(e.ball[0], e.ball[1], Math.max(4, (e.ball[2] || 7) / 2 + 1), 0, Math.PI * 2)
-        g.fill()
-        if (isNow) {
-          g.strokeStyle = 'rgba(255,255,255,0.9)'
-          g.lineWidth = 2
-          g.stroke()
-        }
-      }
-      // Event markers linger a few frames so they're visible at speed.
-      if (e?.evt && frame - e.f <= 45) {
-        const { evt } = e
-        g.strokeStyle = evt.kind === 'bounce'
-          ? (evt.in ? 'rgba(0,229,255,0.95)' : 'rgba(255,255,255,0.95)')
-          : 'rgba(229,165,58,0.95)'
-        g.lineWidth = 4
-        if (e.ball) {
-          g.beginPath(); g.arc(e.ball[0], e.ball[1], 16, 0, Math.PI * 2); g.stroke()
-          g.fillStyle = g.strokeStyle
-          g.font = 'bold 17px system-ui'
-          g.fillText(evt.kind === 'bounce' ? (evt.in ? 'bounce' : 'bounce OUT') : 'hit',
-                     e.ball[0] + 20, e.ball[1] - 10)
-        }
-      }
-    }
+    // Ball trail + bounce/hit markers. Toggleable from the controls (🎾).
+    if (stateRef.current.showBall) drawBall(g, c, frame, entry)
 
     // Ground-truth ball marks (marking mode): diamonds at their exact frame,
     // faded within +/-2 frames so a nearby mark is visible while stepping.
@@ -213,50 +136,7 @@ const VideoPlayer = forwardRef(function VideoPlayer(
       g.beginPath(); g.arc(pm.x, pm.y, 7, 0, Math.PI * 2); g.stroke()
     }
 
-    // Players: pass2 has them every frame; pass1 only at sparse spot-checks,
-    // so fall back to the most recent entry that carried players (faded).
-    let pentry = entry
-    let stale = false
-    if (!pentry?.players) {
-      for (let d = 1; d <= 90; d++) {
-        const e = c.byFrame.get(frame - d)
-        if (e?.players) { pentry = e; stale = true; break }
-      }
-    }
-    if (pentry?.players) {
-      g.globalAlpha = stale ? 0.45 : 1.0
-      g.font = 'bold 14px system-ui'
-      for (const p of pentry.players) {
-        const [x1, y1, x2, y2] = p.box
-        const color = p.team === 'near' ? 'rgba(88,166,255,0.9)' : 'rgba(240,136,62,0.9)'
-        g.strokeStyle = color
-        g.lineWidth = 3
-        g.strokeRect(x1, y1, x2 - x1, y2 - y1)
-        g.fillStyle = color
-        g.fillText(p.num != null ? `P${p.num}` : `#${p.id}`, x1 + 3, y1 - 5)
-        // Pose skeleton (YOLO11-pose keypoints; [0,0] = joint not detected)
-        if (p.kp?.length >= 17) {
-          const ok = (i) => p.kp[i][0] > 1 && p.kp[i][1] > 1
-          g.lineWidth = 3
-          for (const [a, b] of SKELETON) {
-            if (ok(a) && ok(b)) {
-              g.beginPath()
-              g.moveTo(p.kp[a][0], p.kp[a][1])
-              g.lineTo(p.kp[b][0], p.kp[b][1])
-              g.stroke()
-            }
-          }
-          for (let i = 0; i < 17; i++) {
-            if (ok(i)) {
-              g.beginPath()
-              g.arc(p.kp[i][0], p.kp[i][1], 3, 0, Math.PI * 2)
-              g.fill()
-            }
-          }
-        }
-      }
-      g.globalAlpha = 1.0
-    }
+    drawPlayers(g, c, frame, entry)
     // Reconstructed ball height above the court plane (Pass 2 only).
     if (stateRef.current.showBall && entry?.world && entry.world[2] != null && entry.ball) {
       g.fillStyle = 'rgba(255,255,255,0.95)'
@@ -280,7 +160,7 @@ const VideoPlayer = forwardRef(function VideoPlayer(
         stateRef.current.frame = f
         onFrame?.(f)
       }
-      ensureChunks(stateRef.current.overlaySource, f)
+      fetchChunks(stateRef.current.overlaySource, f)
       draw()
       raf = requestAnimationFrame(tick)
     }

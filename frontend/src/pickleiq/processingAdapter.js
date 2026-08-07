@@ -403,13 +403,11 @@ export async function loadClipResults(videoId) {
   const streamUrl = api.streamUrl(videoId)
   const pass2State = await getPass2ProcessingState(videoId, null).catch(() => null)
   return {
-    // finalVideoTimeline: 'source' — ResultsScreen only treats tip
-    // timestamps as directly seekable when displayedTimeline matches each
-    // entry's own 'source' tag (see resolveFeedbackSeekSeconds); that match
-    // normally comes from playing straight off localFile with no server
-    // URL at all (displaysOriginalTimeline). streamUrl serves the exact
-    // same untrimmed original video, so it's on that same timeline too —
-    // without this, timestamp-feedback clicks would silently seek nowhere.
+    videoId,   // ResultsScreen fetches this clip's pass2 overlays with it
+    // finalVideoTimeline: 'source' — streamUrl serves the exact same
+    // untrimmed original video, so tip timestamps land where they should
+    // (see resolveFeedbackSeekSeconds). ResultsScreen now defaults to
+    // 'source' anyway; this stays explicit about which cut this URL is.
     analysisResult: { ...normalizeAnalysisResult(reportResp.report, streamUrl), finalVideoTimeline: 'source' },
     pass2Result: { ...(pass2State || { keptSections: [], rejectedSections: [], fps: 30 }),
       previewUrl: streamUrl, previewKind: 'stream' },
